@@ -50,6 +50,14 @@ All external sends go through the durable Outbox path and pre-send revalidation.
 
 Implement one modular monolith `agent-app` for v1. Exactly one active app instance is supported. Model servers and Beeper Desktop are separate processes.
 
+## One-shot evaluation mode
+
+Normal implementation follows `docs/implementation-plan.md` phase-by-phase with human review between meaningful phases.
+
+When the user explicitly requests the **one-shot Codex evaluation**, read `docs/one-shot-eval.md` in addition to the normal source-of-truth files. In that mode, Codex is authorized to implement phases 1 through 13 sequentially in one continuous run, advancing only after the current phase's relevant tests pass. The one-shot contract does not authorize architectural redesign, real-message side effects during tests, commits, or pushes.
+
+If `docs/one-shot-eval.md` conflicts with `docs/invariants.md` or `docs/architecture.md`, the invariant/architecture documents win.
+
 ## Commit and push approval
 
 - After completing and verifying every repository change, provide the user with an appropriate, scoped commit message for approval.
