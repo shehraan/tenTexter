@@ -1,0 +1,7 @@
+/.venv/
+/.pytest_cache/
+*.db
+*.db-shm
+*.db-wal
+__pycache__/
+*.egg-info/
