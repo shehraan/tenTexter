@@ -260,12 +260,14 @@ class OutboxWorker:
         validator: IndependentTextValidator,
         adapters: dict[Transport, TransportAdapter],
         lease_duration: timedelta = timedelta(seconds=30),
+        raise_validation_errors: bool = False,
     ):
         self.sessions = sessions
         self.revalidator = revalidator
         self.validator = validator
         self.adapters = adapters
         self.lease_duration = lease_duration
+        self.raise_validation_errors = raise_validation_errors
 
     def process(self, outbox_id: int) -> OutboxStatus:
         snapshot = self._snapshot(outbox_id)
@@ -273,11 +275,21 @@ class OutboxWorker:
             raise DomainError("outbox message not found")
         if snapshot["status"] is not OutboxStatus.PENDING:
             return snapshot["status"]
+        policy_token: object | None = None
+        token_builder = getattr(self.revalidator, "context_token", None)
+        if token_builder is not None:
+            with self.sessions() as session:
+                message = session.get(OutboxMessage, outbox_id)
+                if message is None or message.status is not OutboxStatus.PENDING:
+                    return message.status if message is not None else OutboxStatus.CANCELLED
+                policy_token = token_builder(session, message)
         try:
             valid = self.validator.validate(
                 text=snapshot["text"], message_kind=snapshot["kind"], outbox_id=outbox_id
             )
         except Exception:
+            if self.raise_validation_errors:
+                raise
             return OutboxStatus.PENDING
         if not valid:
             return OutboxStatus.PENDING
@@ -288,6 +300,12 @@ class OutboxWorker:
             if message.status is not OutboxStatus.PENDING or message.final_text != snapshot["text"]:
                 return message.status
             decision = self.revalidator.check(session, message)
+            if (
+                decision is PreSendDecision.READY
+                and token_builder is not None
+                and token_builder(session, message) != policy_token
+            ):
+                decision = PreSendDecision.POLICY_BLOCKED
             if decision is PreSendDecision.UNAVAILABLE:
                 return OutboxStatus.PENDING
             if decision in {PreSendDecision.STALE, PreSendDecision.POLICY_BLOCKED}:

@@ -16,6 +16,7 @@ from ten_texter.enums import (
 )
 from ten_texter.model_clients import MessageGenerator, ModelBackend, StrictOutput, _validate
 from ten_texter.models import DecisionRequest, OutboxMessage
+from ten_texter.policy import DatabaseContextProvider
 
 
 class ValidatorOutput(StrictOutput):
@@ -84,6 +85,43 @@ class MinimalValidatorContextProvider:
             constraints=self.constraints,
             allowed_disclosure_scopes=self.allowed_disclosure_scopes,
         )
+
+
+class DatabaseValidatorContextProvider:
+    """Recomputes the validator's exact allowed claims at pre-send time."""
+
+    def __init__(
+        self,
+        sessions: sessionmaker[Session],
+        *,
+        facts: DatabaseContextProvider,
+    ):
+        self.sessions = sessions
+        self.facts = facts
+
+    def context_for(self, outbox_id: int, message_kind: MessageKind) -> ValidatorContext:
+        with self.sessions() as session:
+            message = session.get(OutboxMessage, outbox_id)
+            if message is None:
+                return ValidatorContext(
+                    message_kind=message_kind,
+                    constraints=("Outbox message no longer exists; reject.",),
+                )
+            disclosed = self.facts.facts_for(session, message)
+            allowed_claims = self.facts.task_claims(session, message) + tuple(
+                str(fact.value) for fact in disclosed
+            )
+            scopes = tuple(sorted({fact.scope.value for fact in disclosed}))
+            return ValidatorContext(
+                message_kind=message_kind,
+                allowed_claims=allowed_claims,
+                constraints=(
+                    "Use only the enumerated allowed claims.",
+                    "Do not make commitments on the owner's behalf.",
+                    "Reject any private fact not present in allowed_claims.",
+                ),
+                allowed_disclosure_scopes=scopes,
+            )
 
 
 class OutboxValidatorGate:
