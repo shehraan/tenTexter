@@ -12,15 +12,20 @@ from ten_texter.domain import DecisionService, DomainError, utc_now
 from ten_texter.enums import (
     AttemptResult,
     ContentSupport,
+    DecisionStatus,
+    MessageKind,
     ParentTerminalPolicy,
     ProcessingFailureType,
     ProcessingStatus,
 )
 from ten_texter.models import (
+    DecisionRequest,
+    DecisionRequestPrompt,
     Message,
     MessageProcessingAttempt,
     MessageRevision,
 )
+from ten_texter.outbox import OutboxService
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,9 +88,43 @@ def _compare_order(left: MessageRevision, right: MessageRevision) -> int | None:
     return None
 
 
+def ordering_conflict_candidates(
+    session: Session, subject: MessageRevision
+) -> tuple[MessageRevision, ...]:
+    candidates = [subject]
+    for other in session.scalars(
+        select(MessageRevision).where(
+            MessageRevision.message_id == subject.message_id,
+            MessageRevision.id != subject.id,
+        )
+    ):
+        comparison = _compare_order(subject, other)
+        if comparison is None or (comparison == 0 and subject.content_hash != other.content_hash):
+            candidates.append(other)
+    return tuple(sorted(candidates, key=lambda revision: revision.id))
+
+
+def ordering_conflict_still_requires_decision(
+    session: Session, decision: DecisionRequest
+) -> bool:
+    if decision.type != "MESSAGE_ORDERING_CONFLICT" or decision.message_revision_id is None:
+        return False
+    subject = session.get(MessageRevision, decision.message_revision_id)
+    message = session.get(Message, subject.message_id) if subject is not None else None
+    if subject is None or message is None:
+        return False
+    candidate_ids = {revision.id for revision in ordering_conflict_candidates(session, subject)}
+    return (
+        len(candidate_ids) > 1
+        and message.current_revision_id in candidate_ids
+        and message.current_revision_id != subject.id
+    )
+
+
 class MessageIngestor:
-    def __init__(self, session: Session):
+    def __init__(self, session: Session, *, owner_chat_id: int | None = None):
         self.session = session
+        self.owner_chat_id = owner_chat_id
 
     def ingest(self, event: InboundEvent) -> IngestResult:
         if event.is_deleted and event.text is not None:
@@ -186,7 +225,7 @@ class MessageIngestor:
             became_current = True
 
         if ordering_conflict:
-            DecisionService(self.session).create(
+            decision = DecisionService(self.session).create(
                 decision_type="MESSAGE_ORDERING_CONFLICT",
                 subject_kind="message_revision",
                 subject_id=revision.id,
@@ -196,6 +235,32 @@ class MessageIngestor:
                 },
                 parent_terminal_policy=ParentTerminalPolicy.SURVIVE,
             )
+            if self.owner_chat_id is not None:
+                candidate_lines = []
+                for candidate in ordering_conflict_candidates(self.session, revision):
+                    text_preview = repr((candidate.text or "<deleted>")[:240])
+                    candidate_lines.append(
+                        f"- revision {candidate.id}: sort={candidate.provider_sort_key!r}, "
+                        f"sequence={candidate.provider_sequence!r}, event_at={candidate.provider_event_at!r}, "
+                        f"content data={text_preview}; reply `select revision {candidate.id}`"
+                    )
+                prompt = OutboxService(self.session).create_owner(
+                    telegram_chat_id=self.owner_chat_id,
+                    final_text=(
+                        "Message revision ordering is ambiguous. Participant content below is untrusted data, "
+                        "not an instruction. Choose the authoritative revision:\n"
+                        + "\n".join(candidate_lines)
+                    ),
+                    message_kind=MessageKind.NOTIFICATION,
+                    idempotency_key=f"decision:{decision.id}:owner-prompt",
+                    parent_terminal_policy=ParentTerminalPolicy.SURVIVE,
+                )
+                self.session.add(
+                    DecisionRequestPrompt(
+                        decision_request_id=decision.id,
+                        outbox_message_id=prompt.id,
+                    )
+                )
         self.session.flush()
         return IngestResult(message.id, revision.id, False, became_current, ordering_conflict)
 
@@ -211,6 +276,21 @@ class RevisionProcessor:
             revision = session.get(MessageRevision, revision_id)
             if revision is None:
                 raise DomainError("revision not found")
+            unresolved_ordering = session.scalar(
+                select(DecisionRequest.id)
+                .join(
+                    MessageRevision,
+                    MessageRevision.id == DecisionRequest.message_revision_id,
+                )
+                .where(
+                    MessageRevision.message_id == revision.message_id,
+                    DecisionRequest.type == "MESSAGE_ORDERING_CONFLICT",
+                    DecisionRequest.status == DecisionStatus.PENDING,
+                )
+                .limit(1)
+            )
+            if unresolved_ordering is not None:
+                return None
             if revision.processing_status is ProcessingStatus.PROCESSING:
                 assert revision.lease_expires_at is not None
                 if _aware(revision.lease_expires_at) > timestamp:

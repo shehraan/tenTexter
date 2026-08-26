@@ -564,6 +564,7 @@ def build_runtime(
         base_url=settings.beeper_base_url,
         access_token=settings.beeper_token,
         enabled=True,
+        owner_chat_id=settings.owner_chat_id,
     )
     control = TelegramControlGateway(
         sessions,

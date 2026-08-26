@@ -7,9 +7,21 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from ten_texter.enums import ContentSupport, ProcessingStatus
+from ten_texter.enums import AvailabilityEvidence, AvailabilityStatus, ContentSupport, ProcessingStatus
 from ten_texter.inbound import InboundEvent, MessageIngestor, RevisionProcessor
-from ten_texter.models import DecisionRequest, Message, MessageProcessingAttempt, MessageRevision, TaskEvent
+from ten_texter.models import (
+    AwaitedResponse,
+    DecisionRequest,
+    DecisionRequestPrompt,
+    Message,
+    MessageProcessingAttempt,
+    MessageRevision,
+    TaskEvent,
+)
+from ten_texter.correlation import Classification
+from ten_texter.control import ProductionOwnerCommandHandler
+from ten_texter.enums import AwaitedResponseStatus
+from ten_texter.telegram import TelegramControlGateway
 from tests.test_schema import NOW, seed_core
 
 
@@ -85,6 +97,120 @@ def test_conflicting_same_order_is_preserved_and_requires_reconciliation(db_sess
         select(DecisionRequest).where(DecisionRequest.message_revision_id == conflict.revision_id)
     )
     assert decision is not None
+
+
+class AvailabilityClassifier:
+    def classify(self, *_: object) -> Classification:
+        return Classification(kind="AVAILABILITY", availability=AvailabilityStatus.UNAVAILABLE)
+
+
+def test_ordering_conflict_owner_selects_exact_revision_then_only_current_mutates(db_session: Session) -> None:
+    core = seed_core(db_session)
+    awaited = AwaitedResponse(
+        task_participant_id=core["participant"].id,
+        expected_response_type="availability",
+        status=AwaitedResponseStatus.OPEN,
+    )
+    db_session.add(awaited)
+    db_session.flush()
+    ingestor = MessageIngestor(db_session, owner_chat_id=99)
+    first = ingestor.ingest(event(core, text="yes"))
+    conflict = ingestor.ingest(
+        event(core, provider_revision_key="revision:conflict", provider_sequence=10, text="no")
+    )
+    decision = db_session.scalar(
+        select(DecisionRequest).where(DecisionRequest.message_revision_id == conflict.revision_id)
+    )
+    assert decision is not None and decision.type == "MESSAGE_ORDERING_CONFLICT"
+    assert db_session.scalar(
+        select(DecisionRequestPrompt).where(DecisionRequestPrompt.decision_request_id == decision.id)
+    ) is not None
+    db_session.commit()
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    assert RevisionProcessor(factory).claim(first.revision_id, now=NOW) is None
+    assert RevisionProcessor(factory).claim(conflict.revision_id, now=NOW) is None
+    handler = ProductionOwnerCommandHandler(
+        factory,
+        owner_chat_id=99,
+        resolver=object(),  # type: ignore[arg-type]
+        generation=object(),  # type: ignore[arg-type]
+        classifier=AvailabilityClassifier(),
+    )
+    control = TelegramControlGateway(factory, owner_id=7, parser=object(), handler=handler)  # type: ignore[arg-type]
+    raw = {
+        "update_id": 900,
+        "callback_query": {
+            "id": "ordering",
+            "from": {"id": 7},
+            "message": {"message_id": 1, "chat": {"id": 99, "type": "private"}},
+            "data": f"decision:{decision.id}:message_revision:{conflict.revision_id}",
+        },
+    }
+    received = control.receive(raw)
+    control.process(received.telegram_update_row_id)
+    duplicate = control.receive(raw)
+    assert duplicate.outcome == "DUPLICATE"
+    control.process(duplicate.telegram_update_row_id)
+    repeated_raw = dict(raw)
+    repeated_raw["update_id"] = 901
+    repeated = control.receive(repeated_raw)
+    control.process(repeated.telegram_update_row_id)
+    worker = RevisionProcessor(factory)
+    selected_claim = worker.claim(conflict.revision_id, now=NOW)
+    stale_claim = worker.claim(first.revision_id, now=NOW)
+    assert selected_claim is not None and stale_claim is not None
+
+    def semantics(session: Session, revision: MessageRevision) -> None:
+        participant = session.get(type(core["participant"]), core["participant"].id)
+        participant.availability_status = AvailabilityStatus.UNAVAILABLE
+        participant.availability_evidence = AvailabilityEvidence.FIRST_PARTY
+        participant.availability_source_revision_id = revision.id
+
+    assert worker.commit(selected_claim, semantics)
+    assert not worker.commit(stale_claim, semantics)
+    with factory() as session:
+        assert session.get(Message, first.message_id).current_revision_id == conflict.revision_id
+        participant = session.get(type(core["participant"]), core["participant"].id)
+        assert participant.availability_source_revision_id == conflict.revision_id
+
+
+def test_ordering_conflict_rejects_non_candidate_and_stale_answer_has_no_effect(db_session: Session) -> None:
+    core = seed_core(db_session)
+    ingestor = MessageIngestor(db_session, owner_chat_id=99)
+    first = ingestor.ingest(event(core))
+    conflict = ingestor.ingest(
+        event(core, provider_revision_key="revision:conflict", provider_sequence=10, text="no")
+    )
+    unrelated = core["revision"]
+    decision = db_session.scalar(
+        select(DecisionRequest).where(DecisionRequest.message_revision_id == conflict.revision_id)
+    )
+    db_session.commit()
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    handler = ProductionOwnerCommandHandler(
+        factory, owner_chat_id=99, resolver=object(), generation=object()
+    )  # type: ignore[arg-type]
+    update = type("Update", (), {})()
+    with pytest.raises(Exception, match="candidate"):
+        handler.prepare_decision(
+            decision.id,
+            {"callback_query": {"data": f"decision:{decision.id}:message_revision:{unrelated.id}"}},
+            update,  # type: ignore[arg-type]
+        )
+    with factory.begin() as session:
+        message = session.get(Message, first.message_id)
+        message.current_revision_id = conflict.revision_id
+    prepared = handler.prepare_decision(
+        decision.id,
+        {"callback_query": {"data": f"decision:{decision.id}:message_revision:{first.revision_id}"}},
+        update,  # type: ignore[arg-type]
+    )
+    with factory.begin() as session:
+        handler.apply_decision(session, decision.id, prepared, update)  # type: ignore[arg-type]
+    with factory() as session:
+        stored = session.get(DecisionRequest, decision.id)
+        assert stored.close_reason.value == "SUBJECT_RESOLVED"
+        assert session.get(Message, first.message_id).current_revision_id == conflict.revision_id
 
 
 def test_stale_revision_processing_succeeds_without_semantic_mutation(db_session: Session) -> None:

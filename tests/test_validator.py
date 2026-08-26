@@ -3,7 +3,8 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
-from ten_texter.enums import MessageKind, OutboxStatus, Transport, ValidatorCategory
+from ten_texter.enums import MessageKind, OutboxCancelReason, OutboxStatus, Transport, ValidatorCategory
+from ten_texter.control import ProductionOwnerCommandHandler
 from ten_texter.model_clients import MessageGenerator, ModelOutputError, ModelUnavailable
 from ten_texter.models import DecisionRequest, DecisionRequestPrompt, OutboxMessage
 from ten_texter.outbox import (
@@ -21,6 +22,7 @@ from ten_texter.validator import (
     ValidatedGenerationPipeline,
     ValidatorContext,
 )
+from ten_texter.telegram import TelegramControlGateway
 from tests.test_schema import seed_core
 
 
@@ -184,6 +186,79 @@ def test_invalid_outbox_text_cannot_send_and_creates_owner_decision(db_session) 
     assert db_session.get(OutboxMessage, message.id).final_text == "I booked it for us."
     assert worker.process(message.id) is OutboxStatus.PENDING
     assert transport.calls == 0
+
+
+def test_keep_blocked_durably_cancels_exact_immutable_message(db_session) -> None:
+    core = seed_core(db_session)
+    original_text = "I booked it for us."
+    message = OutboxService(db_session).create_beeper(
+        task_instance_id=core["task"].id,
+        conversation_id=core["conversation"].id,
+        participant_ids=[core["participant"].id],
+        final_text=original_text,
+        message_kind=MessageKind.INITIAL,
+        idempotency_key="validator-durable-block",
+    )
+    db_session.commit()
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    backend = Backend(
+        [
+            {"category": "UNAUTHORIZED_COMMITMENT", "critique": "No authority."},
+            {"category": "VALID", "critique": None},
+        ]
+    )
+    gate = OutboxValidatorGate(
+        factory,
+        validator=IndependentMessageValidator(backend),
+        contexts=MinimalValidatorContextProvider(),
+        owner_chat_id=99,
+    )
+    transport = FakeTransport()
+    worker = OutboxWorker(
+        factory,
+        revalidator=AllowingRevalidator(),
+        validator=gate,
+        adapters={Transport.BEEPER: transport},
+    )
+    assert worker.process(message.id) is OutboxStatus.PENDING
+    with factory() as session:
+        decision = session.scalar(
+            select(DecisionRequest).where(DecisionRequest.outbox_message_id == message.id)
+        )
+        assert decision is not None
+        decision_id = decision.id
+    handler = ProductionOwnerCommandHandler(
+        factory, owner_chat_id=99, resolver=object(), generation=object()
+    )  # type: ignore[arg-type]
+    control = TelegramControlGateway(factory, owner_id=7, parser=object(), handler=handler)  # type: ignore[arg-type]
+
+    def callback(update_id: int) -> dict[str, object]:
+        return {
+            "update_id": update_id,
+            "callback_query": {
+                "id": str(update_id),
+                "from": {"id": 7},
+                "message": {"message_id": 1, "chat": {"id": 99, "type": "private"}},
+                "data": f"decision:{decision_id}:keep_blocked",
+            },
+        }
+
+    received = control.receive(callback(910))
+    control.process(received.telegram_update_row_id)
+    repeated = control.receive(callback(911))
+    control.process(repeated.telegram_update_row_id)
+    restarted = OutboxWorker(
+        factory,
+        revalidator=AllowingRevalidator(),
+        validator=gate,
+        adapters={Transport.BEEPER: transport},
+    )
+    assert restarted.process(message.id) is OutboxStatus.CANCELLED
+    assert transport.calls == 0
+    with factory() as session:
+        stored = session.get(OutboxMessage, message.id)
+        assert stored.cancel_reason is OutboxCancelReason.POLICY_BLOCKED
+        assert stored.final_text == original_text
 
 
 def test_validator_unavailable_keeps_outbox_pending(db_session) -> None:

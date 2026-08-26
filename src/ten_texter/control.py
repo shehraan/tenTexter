@@ -9,10 +9,15 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from ten_texter.correlation import Classification, Classifier, CorrelationOrchestrator, PreparedCorrelation
 from ten_texter.domain import DecisionService, DomainError, ProposalService
+from ten_texter.inbound import (
+    ordering_conflict_candidates,
+    ordering_conflict_still_requires_decision,
+)
 from ten_texter.enums import (
     AwaitedResponseStatus,
     DecisionStatus,
     MessageKind,
+    OutboxCancelReason,
     ParentTerminalPolicy,
     OutboxStatus,
     ProposalStatus,
@@ -63,6 +68,7 @@ class PreparedOwnerDecision:
     action: str
     awaited_response_id: int | None = None
     classification: Classification | None = None
+    message_revision_id: int | None = None
 
 
 class _UnusedSemantic:
@@ -98,6 +104,27 @@ class ProductionOwnerCommandHandler:
                 raise DomainError("decision not found")
             if decision.status is not DecisionStatus.PENDING:
                 return PreparedOwnerDecision("already_closed")
+            if decision.type == "MESSAGE_ORDERING_CONFLICT":
+                if action != "select_revision" or selected_id is None:
+                    raise DomainError(
+                        "message ordering decisions require `select revision <revision-id>`"
+                    )
+                subject = session.get(MessageRevision, decision.message_revision_id)
+                if subject is None:
+                    return PreparedOwnerDecision("stale")
+                candidate_ids = {
+                    revision.id
+                    for revision in ordering_conflict_candidates(session, subject)
+                }
+                if selected_id not in candidate_ids:
+                    raise DomainError(
+                        "selected revision is not a candidate for this ordering conflict"
+                    )
+                if not ordering_conflict_still_requires_decision(session, decision):
+                    return PreparedOwnerDecision("stale", message_revision_id=selected_id)
+                return PreparedOwnerDecision(
+                    "select_revision", message_revision_id=selected_id
+                )
             if decision.message_revision_id is not None:
                 if action != "select" or selected_id is None:
                     raise DomainError("correlation decisions require `select <awaited-response-id>`")
@@ -306,6 +333,41 @@ class ProductionOwnerCommandHandler:
                 apply=apply,
             )
             return
+        if decision.type == "MESSAGE_ORDERING_CONFLICT":
+            subject = session.get(MessageRevision, decision.message_revision_id)
+            selected = (
+                session.get(MessageRevision, payload.message_revision_id)
+                if payload.message_revision_id is not None
+                else None
+            )
+
+            def still_requires_ordering(_decision: DecisionRequest) -> bool:
+                if not ordering_conflict_still_requires_decision(session, decision):
+                    return False
+                if subject is None or selected is None or selected.message_id != subject.message_id:
+                    return False
+                return selected.id in {
+                    revision.id
+                    for revision in ordering_conflict_candidates(session, subject)
+                }
+
+            def apply_ordering(
+                _decision: DecisionRequest, _resolution: dict[str, object]
+            ) -> bool:
+                assert subject is not None and selected is not None
+                message = session.get(Message, subject.message_id)
+                if message is None:
+                    return False
+                message.current_revision_id = selected.id
+                return True
+
+            DecisionService(session).answer(
+                decision.id,
+                {"message_revision_id": payload.message_revision_id},
+                subject_still_requires_decision=still_requires_ordering,
+                apply=apply_ordering,
+            )
+            return
         if decision.message_revision_id is not None:
             revision = session.get(MessageRevision, decision.message_revision_id)
             message = session.get(Message, revision.message_id) if revision is not None else None
@@ -350,9 +412,28 @@ class ProductionOwnerCommandHandler:
             return
         if decision.outbox_message_id is not None:
             message = session.get(OutboxMessage, decision.outbox_message_id)
-            expected = "keep_reconciling" if decision.type == "UNCERTAIN_DELIVERY" else "keep_blocked"
+            if decision.type == "UNCERTAIN_DELIVERY":
+                expected = "keep_reconciling"
+            elif decision.type in {
+                "VALIDATOR_AUTHORITY_VIOLATION",
+                "VALIDATOR_REPAIR_REQUIRED",
+            }:
+                expected = "keep_blocked"
+            else:
+                raise DomainError("unsupported Outbox decision type")
             if payload.action != expected:
                 raise DomainError(f"{decision.type} only permits `{expected.replace('_', ' ')}`")
+
+            def apply_outbox_decision(
+                _decision: DecisionRequest, _resolution: dict[str, object]
+            ) -> bool:
+                if message is None:
+                    return False
+                if expected == "keep_blocked":
+                    message.status = OutboxStatus.CANCELLED
+                    message.cancel_reason = OutboxCancelReason.POLICY_BLOCKED
+                return True
+
             DecisionService(session).answer(
                 decision.id,
                 {"action": expected},
@@ -361,7 +442,7 @@ class ProductionOwnerCommandHandler:
                     and message.status
                     is (OutboxStatus.RECONCILING if expected == "keep_reconciling" else OutboxStatus.PENDING)
                 ),
-                apply=lambda _decision, _resolution: True,
+                apply=apply_outbox_decision,
             )
             return
         if decision.telegram_update_id is not None:
@@ -385,23 +466,33 @@ class ProductionOwnerCommandHandler:
             value = parts[2].casefold() if len(parts) >= 3 else ""
             selected = (
                 int(parts[3])
-                if value in {"select", "awaited_response"}
+                if value in {"select", "awaited_response", "message_revision"}
                 and len(parts) >= 4
                 and parts[3].isdigit()
                 else None
             )
             if value == "awaited_response":
                 value = "select"
+            elif value == "message_revision":
+                value = "select_revision"
         else:
             message = payload.get("message") or {}
             raw = str(message.get("text") or "").strip().casefold()
             parts = raw.split()
-            value = (
-                "_".join(parts[:2])
-                if parts[:2] in [["keep", "reconciling"], ["keep", "blocked"]]
-                else (parts[0] if parts else "")
-            )
-            selected = int(parts[1]) if value == "select" and len(parts) == 2 and parts[1].isdigit() else None
+            if len(parts) == 3 and parts[:2] == ["select", "revision"]:
+                value = "select_revision"
+                selected = int(parts[2]) if parts[2].isdigit() else None
+            else:
+                value = (
+                    "_".join(parts[:2])
+                    if parts[:2] in [["keep", "reconciling"], ["keep", "blocked"]]
+                    else (parts[0] if parts else "")
+                )
+                selected = (
+                    int(parts[1])
+                    if value == "select" and len(parts) == 2 and parts[1].isdigit()
+                    else None
+                )
         aliases = {"yes": "yes", "y": "yes", "no": "no", "n": "no"}
         return aliases.get(value, value), selected
 

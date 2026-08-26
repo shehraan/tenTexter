@@ -29,8 +29,9 @@ def _parse_time(value: str | None) -> datetime:
 
 
 class BeeperSyncService:
-    def __init__(self, session: Session):
+    def __init__(self, session: Session, *, owner_chat_id: int | None = None):
         self.session = session
+        self.owner_chat_id = owner_chat_id
 
     def sync_chat(self, payload: dict[str, Any]) -> Conversation:
         chat_id = payload.get("id")
@@ -171,7 +172,7 @@ class BeeperSyncService:
             is_deleted=is_deleted,
             content_support=ContentSupport.SUPPORTED if supported else ContentSupport.UNSUPPORTED,
         )
-        return MessageIngestor(self.session).ingest(event)
+        return MessageIngestor(self.session, owner_chat_id=self.owner_chat_id).ingest(event)
 
 
 class BeeperDesktopAdapter:
@@ -185,6 +186,7 @@ class BeeperDesktopAdapter:
         access_token: str | None,
         enabled: bool = False,
         client: httpx.Client | None = None,
+        owner_chat_id: int | None = None,
     ):
         if enabled and not access_token:
             raise ValueError("enabled Beeper adapter requires an access token")
@@ -193,6 +195,7 @@ class BeeperDesktopAdapter:
         self.access_token = access_token
         self.enabled = enabled
         self.client = client or httpx.Client(timeout=30)
+        self.owner_chat_id = owner_chat_id
 
     @property
     def headers(self) -> dict[str, str]:
@@ -247,7 +250,7 @@ class BeeperDesktopAdapter:
 
         revision_ids: list[int] = []
         with self.sessions.begin() as session:
-            sync = BeeperSyncService(session)
+            sync = BeeperSyncService(session, owner_chat_id=self.owner_chat_id)
             for chat, messages in fetched:
                 conversation = sync.sync_chat(chat)
                 ordered = sorted(

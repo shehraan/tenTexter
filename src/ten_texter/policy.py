@@ -20,9 +20,11 @@ from ten_texter.enums import (
 )
 from ten_texter.models import (
     BeeperOutboxDestination,
+    ConversationParticipant,
     ContactRule,
     DisclosureGrant,
     DisclosureGrantScope,
+    Identity,
     OutboxMessage,
     OutboxMessageParticipant,
     Message,
@@ -336,6 +338,12 @@ class PolicyRevalidator(PreSendRevalidator):
             assert participant is not None
             if participant.task_instance_id != task.id or participant.conversation_id != destination.conversation_id:
                 return PreSendDecision.STALE
+            if not self._current_identity_ids(
+                session,
+                person_id=participant.person_id,
+                conversation_id=destination.conversation_id,
+            ):
+                return PreSendDecision.STALE
             if self.rules.resolve(
                 session,
                 person_id=participant.person_id,
@@ -379,11 +387,27 @@ class PolicyRevalidator(PreSendRevalidator):
             )
         )
         rule_outcomes: list[tuple[int, str]] = []
+        membership_tokens: list[tuple[int, tuple[int, ...]]] = []
         for participant_id in participant_ids:
             participant = session.get(TaskParticipant, participant_id)
             if participant is None:
                 rule_outcomes.append((participant_id, "MISSING"))
+                membership_tokens.append((participant_id, ()))
                 continue
+            membership_tokens.append(
+                (
+                    participant_id,
+                    self._current_identity_ids(
+                        session,
+                        person_id=participant.person_id,
+                        conversation_id=(
+                            destination.conversation_id
+                            if destination is not None
+                            else participant.conversation_id
+                        ),
+                    ),
+                )
+            )
             outcome = self.rules.resolve(
                 session,
                 person_id=participant.person_id,
@@ -407,6 +431,27 @@ class PolicyRevalidator(PreSendRevalidator):
             destination.conversation_id if destination is not None else None,
             task_token,
             participant_ids,
+            tuple(membership_tokens),
             tuple(rule_outcomes),
             facts,
+        )
+
+    @staticmethod
+    def _current_identity_ids(
+        session: Session, *, person_id: int, conversation_id: int
+    ) -> tuple[int, ...]:
+        return tuple(
+            session.scalars(
+                select(Identity.id)
+                .join(
+                    ConversationParticipant,
+                    ConversationParticipant.identity_id == Identity.id,
+                )
+                .where(
+                    Identity.person_id == person_id,
+                    ConversationParticipant.conversation_id == conversation_id,
+                    ConversationParticipant.is_current.is_(True),
+                )
+                .order_by(Identity.id)
+            )
         )

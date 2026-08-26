@@ -4,7 +4,7 @@ from datetime import timedelta
 
 from sqlalchemy.orm import Session, sessionmaker
 
-from ten_texter.domain import ContactRuleService, DisclosureGrantService, TaskService
+from ten_texter.domain import ContactRuleService, DisclosureGrantService, TaskService, utc_now
 from ten_texter.enums import (
     AvailabilityEvidence,
     AvailabilityStatus,
@@ -14,12 +14,13 @@ from ten_texter.enums import (
     DisclosureInactiveReason,
     DisclosureScope,
     MessageKind,
+    OutboxCancelReason,
     OutboxStatus,
     PolicyOutcome,
     RuleStrength,
     Transport,
 )
-from ten_texter.models import ContactRule, ConversationParticipant, DisclosureGrant
+from ten_texter.models import ContactRule, ConversationParticipant, DisclosureGrant, Identity, OutboxMessage
 from ten_texter.outbox import DeliveryResult, OutboxService, OutboxWorker, PreSendDecision
 from ten_texter.policy import (
     ContactRuleResolver,
@@ -32,6 +33,23 @@ from ten_texter.policy import (
 from ten_texter.validator import DatabaseValidatorContextProvider
 from tests.test_domain import _second_conversation
 from tests.test_schema import NOW, seed_core
+
+
+class AlwaysValid:
+    def validate(self, **_: object) -> bool:
+        return True
+
+
+class RecordingTransport:
+    def __init__(self):
+        self.calls = 0
+
+    def send(self, _request: object) -> DeliveryResult:
+        self.calls += 1
+        return DeliveryResult(True, True, provider_message_id="sent")
+
+    def reconcile(self, _request: object, **_: object) -> str | None:
+        return None
 
 
 def add_rule(session: Session, core: dict[str, object], **changes: object) -> ContactRule:
@@ -359,3 +377,117 @@ def test_disclosure_revocation_during_validation_cancels_before_transport(
 
     assert worker.process(message.id) is OutboxStatus.CANCELLED
     assert not transport.sent
+
+
+def test_departed_participant_pending_outbox_is_cancelled_without_rerouting(db_session: Session) -> None:
+    core = seed_core(db_session)
+    alternate = _second_conversation(db_session, core)
+    db_session.add(ConversationParticipant(conversation_id=alternate, identity_id=core["identity"].id))
+    message = OutboxService(db_session).create_beeper(
+        task_instance_id=core["task"].id,
+        conversation_id=core["conversation"].id,
+        participant_ids=[core["participant"].id],
+        final_text="Are you available?",
+        message_kind=MessageKind.INITIAL,
+        idempotency_key="membership-left",
+    )
+    membership = db_session.get(
+        ConversationParticipant,
+        {"conversation_id": core["conversation"].id, "identity_id": core["identity"].id},
+    )
+    membership.is_current = False
+    membership.left_at = utc_now()
+    db_session.commit()
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    transport = RecordingTransport()
+    worker = OutboxWorker(
+        factory,
+        revalidator=PolicyRevalidator(),
+        validator=AlwaysValid(),
+        adapters={Transport.BEEPER: transport},
+    )
+    assert worker.process(message.id) is OutboxStatus.CANCELLED
+    assert transport.calls == 0
+    with factory() as session:
+        stored = session.get(OutboxMessage, message.id)
+        assert stored.cancel_reason is OutboxCancelReason.STALE
+        participant = session.get(type(core["participant"]), core["participant"].id)
+        assert participant.conversation_id == core["conversation"].id
+
+
+def test_membership_change_during_validator_blocks_send(db_session: Session) -> None:
+    core = seed_core(db_session)
+    message = OutboxService(db_session).create_beeper(
+        task_instance_id=core["task"].id,
+        conversation_id=core["conversation"].id,
+        participant_ids=[core["participant"].id],
+        final_text="Are you available?",
+        message_kind=MessageKind.INITIAL,
+        idempotency_key="membership-race",
+    )
+    db_session.commit()
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+
+    class LeavingValidator:
+        def validate(self, **_: object) -> bool:
+            with factory.begin() as session:
+                membership = session.get(
+                    ConversationParticipant,
+                    {"conversation_id": core["conversation"].id, "identity_id": core["identity"].id},
+                )
+                membership.is_current = False
+                membership.left_at = utc_now()
+            return True
+
+    transport = RecordingTransport()
+    worker = OutboxWorker(
+        factory,
+        revalidator=PolicyRevalidator(),
+        validator=LeavingValidator(),
+        adapters={Transport.BEEPER: transport},
+    )
+    assert worker.process(message.id) is OutboxStatus.CANCELLED
+    assert transport.calls == 0
+
+
+def test_another_current_identity_in_exact_destination_remains_routable(db_session: Session) -> None:
+    core = seed_core(db_session)
+    second_identity = Identity(
+        person_id=core["person"].id,
+        beeper_user_id="beeper:alex:second",
+        network="discord",
+        metadata_json={},
+    )
+    db_session.add(second_identity)
+    db_session.flush()
+    db_session.add(
+        ConversationParticipant(
+            conversation_id=core["conversation"].id,
+            identity_id=second_identity.id,
+        )
+    )
+    original = db_session.get(
+        ConversationParticipant,
+        {"conversation_id": core["conversation"].id, "identity_id": core["identity"].id},
+    )
+    original.is_current = False
+    original.left_at = utc_now()
+    message = OutboxService(db_session).create_beeper(
+        task_instance_id=core["task"].id,
+        conversation_id=core["conversation"].id,
+        participant_ids=[core["participant"].id],
+        final_text="Are you available?",
+        message_kind=MessageKind.INITIAL,
+        idempotency_key="membership-second-identity",
+    )
+    db_session.commit()
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    transport = RecordingTransport()
+    worker = OutboxWorker(
+        factory,
+        revalidator=PolicyRevalidator(),
+        validator=AlwaysValid(),
+        adapters={Transport.BEEPER: transport},
+    )
+    assert worker.process(message.id) is OutboxStatus.SENT
+    assert transport.calls == 1
