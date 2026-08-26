@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from ten_texter.correlation import Classification, CorrelationOrchestrator
 from ten_texter.domain import distinct_response_count
@@ -31,7 +31,11 @@ from ten_texter.models import (
     OutboxDeliveryAttempt,
     OutboxMessage,
     Proposal,
+    DecisionRequest,
+    DecisionRequestPrompt,
 )
+from ten_texter.control import ProductionOwnerCommandHandler
+from ten_texter.telegram import TelegramControlGateway
 from ten_texter.outbox import OutboxService
 from tests.test_schema import NOW, seed_core
 
@@ -101,6 +105,82 @@ def test_correlation_ambiguity_is_not_guessed(db_session: Session) -> None:
         )
     )
     assert candidate_count == 2
+
+
+def test_ambiguous_message_owner_selection_continues_semantic_processing(db_session: Session) -> None:
+    core = seed_core(db_session)
+    first = awaited(db_session, core, created_at=NOW - timedelta(minutes=10))
+    second = awaited(db_session, core, created_at=NOW - timedelta(minutes=5))
+    result = CorrelationOrchestrator(
+        db_session,
+        semantic=Semantic(),
+        classifier=Classifier(Classification(kind="AMBIGUOUS")),
+        owner_chat_id=99,
+    ).process(core["revision"].id)
+    prompt = db_session.scalar(
+        select(DecisionRequestPrompt).where(
+            DecisionRequestPrompt.decision_request_id == result.decision_request_id
+        )
+    )
+    assert prompt is not None
+    db_session.commit()
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    handler = ProductionOwnerCommandHandler(
+        factory,
+        owner_chat_id=99,
+        resolver=object(),  # type: ignore[arg-type]
+        generation=object(),  # type: ignore[arg-type]
+        classifier=Classifier(
+            Classification(kind="AVAILABILITY", availability=AvailabilityStatus.AVAILABLE)
+        ),
+    )
+    control = TelegramControlGateway(factory, owner_id=7, parser=object(), handler=handler)  # type: ignore[arg-type]
+    raw = {
+        "update_id": 700,
+        "callback_query": {
+            "id": "selection",
+            "from": {"id": 7},
+            "message": {"message_id": 1, "chat": {"id": 99, "type": "private"}},
+            "data": f"decision:{result.decision_request_id}:awaited_response:{second.id}",
+        },
+    }
+    received = control.receive(raw)
+    control.process(received.telegram_update_row_id)
+    with factory() as session:
+        revision = session.get(MessageRevision, core["revision"].id)
+        assert revision.awaited_response_id == second.id
+        assert session.get(AwaitedResponse, second.id).status is AwaitedResponseStatus.SATISFIED
+        assert session.get(AwaitedResponse, first.id).status is AwaitedResponseStatus.OPEN
+        assert session.get(type(core["participant"]), core["participant"].id).availability_status is AvailabilityStatus.AVAILABLE
+        decision = session.get(DecisionRequest, result.decision_request_id)
+        assert decision.status.value == "CLOSED"
+
+
+def test_stale_and_repeated_owner_correlation_answers_have_no_second_effect(db_session: Session) -> None:
+    core = seed_core(db_session)
+    first = awaited(db_session, core)
+    second = awaited(db_session, core, created_at=NOW - timedelta(minutes=4))
+    result = CorrelationOrchestrator(
+        db_session, semantic=Semantic(), classifier=Classifier(Classification(kind="AMBIGUOUS")), owner_chat_id=99
+    ).process(core["revision"].id)
+    core["revision"].awaited_response_id = first.id
+    db_session.commit()
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    handler = ProductionOwnerCommandHandler(
+        factory, owner_chat_id=99, resolver=object(), generation=object(),
+        classifier=Classifier(Classification(kind="AVAILABILITY", availability=AvailabilityStatus.UNAVAILABLE)),
+    )  # type: ignore[arg-type]
+    control = TelegramControlGateway(factory, owner_id=7, parser=object(), handler=handler)  # type: ignore[arg-type]
+    def callback(update_id: int) -> dict[str, object]:
+        return {"update_id": update_id, "callback_query": {"id": str(update_id), "from": {"id": 7}, "message": {"message_id": 1, "chat": {"id": 99, "type": "private"}}, "data": f"decision:{result.decision_request_id}:awaited_response:{second.id}"}}
+    first_update = control.receive(callback(701))
+    control.process(first_update.telegram_update_row_id)
+    repeated = control.receive(callback(702))
+    control.process(repeated.telegram_update_row_id)
+    with factory() as session:
+        decision = session.get(DecisionRequest, result.decision_request_id)
+        assert decision.close_reason.value == "SUBJECT_RESOLVED"
+        assert session.get(MessageRevision, core["revision"].id).awaited_response_id == first.id
 
 
 def test_known_correlation_interpretation_ambiguity_marks_awaited(db_session: Session) -> None:

@@ -413,7 +413,7 @@ class CorrelationOrchestrator:
                         task_instance_id=task.id,
                         final_text=(
                             f"Participant proposed {proposal.field} {proposal.operation}: "
-                            f"{proposal.proposed_value}. Approve?"
+                            f"{proposal.proposed_value}. Reply `approve` or `reject`."
                         ),
                         message_kind=MessageKind.NOTIFICATION,
                         idempotency_key=f"proposal:{proposal.id}:owner-prompt",
@@ -565,4 +565,30 @@ class CorrelationOrchestrator:
                 for candidate in candidates
             ]
         )
+        if self.owner_chat_id is not None and candidates:
+            lines = ["Choose the response this message belongs to:"]
+            for candidate in candidates:
+                participant = self.session.get(TaskParticipant, candidate.task_participant_id)
+                assert participant is not None
+                task = self.session.get(TaskInstance, participant.task_instance_id)
+                assert task is not None
+                lines.append(
+                    f"- {candidate.id}: {task.topic_key} at {task.scheduled_at.isoformat()}, "
+                    f"participant {participant.person_id}, conversation {participant.conversation_id}, "
+                    f"expected {candidate.expected_response_type}; reply `select {candidate.id}`"
+                )
+            prompt = OutboxService(self.session).create_owner(
+                telegram_chat_id=self.owner_chat_id,
+                final_text="\n".join(lines),
+                message_kind=MessageKind.NOTIFICATION,
+                idempotency_key=f"decision:{decision.id}:owner-prompt",
+                task_instance_id=decision.task_instance_id,
+                parent_terminal_policy=ParentTerminalPolicy.SURVIVE,
+            )
+            self.session.add(
+                DecisionRequestPrompt(
+                    decision_request_id=decision.id,
+                    outbox_message_id=prompt.id,
+                )
+            )
         return decision

@@ -37,6 +37,7 @@ def _run_outbox_worker(app: Application, *, once: bool) -> None:
         app.sessions,
         validator=validator,
         contexts=DatabaseValidatorContextProvider(app.sessions, facts=facts),
+        owner_chat_id=getattr(app.settings, "owner_chat_id", None),
     )
     worker = OutboxWorker(
         app.sessions,
@@ -55,6 +56,7 @@ def _run_outbox_worker(app: Application, *, once: bool) -> None:
             ),
         },
         raise_validation_errors=True,
+        owner_chat_id=getattr(app.settings, "owner_chat_id", None),
     )
     while True:
         with app.sessions() as session:

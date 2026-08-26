@@ -157,6 +157,7 @@ class DeterministicSpawnRouter:
                 .where(
                     Identity.person_id == person_id,
                     Conversation.archived_at.is_(None),
+                    ConversationParticipant.is_current.is_(True),
                 )
                 .distinct()
             )
@@ -546,11 +547,13 @@ def build_runtime(
         generator=generator,
         validator=independent_validator,
     )
+    classifier = MessageClassifier(primary_backend)
     handler = ProductionOwnerCommandHandler(
         sessions,
         owner_chat_id=settings.owner_chat_id,
         resolver=EntityResolverAssistant(primary_backend),
         generation=generation,
+        classifier=classifier,
     )
     telegram = telegram or TelegramBotAdapter(
         token=settings.telegram_bot_token,
@@ -576,9 +579,11 @@ def build_runtime(
             sessions,
             validator=independent_validator,
             contexts=DatabaseValidatorContextProvider(sessions, facts=facts),
+            owner_chat_id=settings.owner_chat_id,
         ),
         adapters={Transport.BEEPER: beeper, Transport.TELEGRAM: telegram},
         raise_validation_errors=True,
+        owner_chat_id=settings.owner_chat_id,
     )
     recurrence = RecurrenceScheduler(
         router=DeterministicSpawnRouter(),
@@ -597,7 +602,7 @@ def build_runtime(
         beeper=beeper,
         revisions=RevisionProcessor(sessions),
         semantic=SemanticCorrelationFallback(primary_backend),
-        classifier=MessageClassifier(primary_backend),
+        classifier=classifier,
         recurrence=recurrence,
         triggers=triggers,
         outbox=outbox,

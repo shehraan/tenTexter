@@ -261,6 +261,7 @@ class OutboxWorker:
         adapters: dict[Transport, TransportAdapter],
         lease_duration: timedelta = timedelta(seconds=30),
         raise_validation_errors: bool = False,
+        owner_chat_id: int | None = None,
     ):
         self.sessions = sessions
         self.revalidator = revalidator
@@ -268,6 +269,7 @@ class OutboxWorker:
         self.adapters = adapters
         self.lease_duration = lease_duration
         self.raise_validation_errors = raise_validation_errors
+        self.owner_chat_id = owner_chat_id
 
     def process(self, outbox_id: int) -> OutboxStatus:
         snapshot = self._snapshot(outbox_id)
@@ -408,7 +410,7 @@ class OutboxWorker:
                 # Import avoids coupling worker construction to decision orchestration.
                 from ten_texter.models import DecisionRequest
 
-                DecisionService(session).create(
+                decision = DecisionService(session).create(
                     decision_type="UNCERTAIN_DELIVERY",
                     subject_kind="outbox_message",
                     subject_id=outbox_id,
@@ -416,6 +418,21 @@ class OutboxWorker:
                     task_instance_id=message.task_instance_id,
                     parent_terminal_policy=ParentTerminalPolicy.SURVIVE,
                 )
+                if self.owner_chat_id is not None:
+                    from ten_texter.models import DecisionRequestPrompt
+
+                    prompt = OutboxService(session).create_owner(
+                        telegram_chat_id=self.owner_chat_id,
+                        final_text=(
+                            f"Delivery for outbox {outbox_id} is uncertain. It must not be retried. "
+                            f"Reply `keep reconciling` to acknowledge while leaving it blocked."
+                        ),
+                        message_kind=MessageKind.NOTIFICATION,
+                        idempotency_key=f"decision:{decision.id}:owner-prompt",
+                        task_instance_id=message.task_instance_id,
+                        parent_terminal_policy=ParentTerminalPolicy.SURVIVE,
+                    )
+                    session.add(DecisionRequestPrompt(decision_request_id=decision.id, outbox_message_id=prompt.id))
             return message.status
 
     def _snapshot(self, outbox_id: int) -> dict[str, object] | None:

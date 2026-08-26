@@ -105,6 +105,7 @@ class TaskService:
                 .join(Identity, Identity.id == ConversationParticipant.identity_id)
                 .where(
                     ConversationParticipant.conversation_id == conversation_id,
+                    ConversationParticipant.is_current.is_(True),
                     Identity.person_id == person_id,
                 )
             )

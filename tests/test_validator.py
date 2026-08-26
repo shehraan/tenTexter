@@ -5,7 +5,7 @@ from sqlalchemy.orm import sessionmaker
 
 from ten_texter.enums import MessageKind, OutboxStatus, Transport, ValidatorCategory
 from ten_texter.model_clients import MessageGenerator, ModelOutputError, ModelUnavailable
-from ten_texter.models import DecisionRequest
+from ten_texter.models import DecisionRequest, DecisionRequestPrompt, OutboxMessage
 from ten_texter.outbox import (
     AllowingRevalidator,
     DeliveryRequest,
@@ -161,6 +161,7 @@ def test_invalid_outbox_text_cannot_send_and_creates_owner_decision(db_session) 
         factory,
         validator=IndependentMessageValidator(backend),
         contexts=MinimalValidatorContextProvider(constraints=("No commitments.",)),
+        owner_chat_id=99,
     )
     transport = FakeTransport()
     worker = OutboxWorker(
@@ -177,6 +178,12 @@ def test_invalid_outbox_text_cannot_send_and_creates_owner_decision(db_session) 
     )
     assert decision is not None
     assert decision.type == "VALIDATOR_AUTHORITY_VIOLATION"
+    assert db_session.scalar(
+        select(DecisionRequestPrompt).where(DecisionRequestPrompt.decision_request_id == decision.id)
+    ) is not None
+    assert db_session.get(OutboxMessage, message.id).final_text == "I booked it for us."
+    assert worker.process(message.id) is OutboxStatus.PENDING
+    assert transport.calls == 0
 
 
 def test_validator_unavailable_keeps_outbox_pending(db_session) -> None:

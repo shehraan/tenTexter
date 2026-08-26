@@ -58,7 +58,13 @@ class BeeperSyncService:
             conversation.title = payload.get("title")
         participant_payload = payload.get("participants") or {}
         items = participant_payload.get("items") if isinstance(participant_payload, dict) else []
+        participants_complete = (
+            participant_payload.get("hasMore") is False
+            if isinstance(participant_payload, dict)
+            else False
+        )
         counterparty_person_id: int | None = None
+        current_identity_ids: set[int] = set()
         for user in items or []:
             if not isinstance(user, dict) or user.get("isSelf") is True:
                 continue
@@ -68,19 +74,36 @@ class BeeperSyncService:
                 {"conversation_id": conversation.id, "identity_id": identity.id},
             )
             if membership is None:
-                self.session.add(
-                    ConversationParticipant(conversation_id=conversation.id, identity_id=identity.id)
-                )
+                membership = ConversationParticipant(conversation_id=conversation.id, identity_id=identity.id)
+                self.session.add(membership)
+            else:
+                membership.is_current = True
+                membership.left_at = None
+            current_identity_ids.add(identity.id)
             if conversation.kind is ConversationKind.DIRECT:
                 counterparty_person_id = identity.person_id
-        conversation.counterparty_person_id = (
-            counterparty_person_id if conversation.kind is ConversationKind.DIRECT else None
-        )
+        if participants_complete:
+            departed = list(
+                self.session.scalars(
+                    select(ConversationParticipant).where(
+                        ConversationParticipant.conversation_id == conversation.id,
+                        ConversationParticipant.is_current.is_(True),
+                        ConversationParticipant.identity_id.not_in(current_identity_ids),
+                    )
+                )
+            )
+            timestamp = utc_now()
+            for membership in departed:
+                membership.is_current = False
+                membership.left_at = timestamp
+            conversation.counterparty_person_id = (
+                counterparty_person_id if conversation.kind is ConversationKind.DIRECT else None
+            )
+        elif conversation.kind is not ConversationKind.DIRECT:
+            conversation.counterparty_person_id = None
         conversation.metadata_json = {
             "account_id": payload.get("accountID"),
-            "participants_complete": not bool(participant_payload.get("hasMore"))
-            if isinstance(participant_payload, dict)
-            else False,
+            "participants_complete": participants_complete,
         }
         self.session.flush()
         return conversation
@@ -245,7 +268,10 @@ class BeeperDesktopAdapter:
             return DeliveryResult(False, False, definitely_not_sent=True, error="wrong transport")
         if not self.enabled:
             return DeliveryResult(False, False, definitely_not_sent=True, error="Beeper transport disabled")
-        chat_id = self._provider_chat_id(request.destination)
+        try:
+            chat_id = self._provider_chat_id(request.destination)
+        except DomainError as exc:
+            return DeliveryResult(False, False, definitely_not_sent=True, error=str(exc))
         try:
             response = self.client.post(
                 f"{self.base_url}/v1/chats/{quote(chat_id, safe='')}/messages",
@@ -268,7 +294,6 @@ class BeeperDesktopAdapter:
         return DeliveryResult(
             False,
             True,
-            definitely_not_sent=not response.is_success,
             error=str(payload.get("error") or response.status_code),
         )
 

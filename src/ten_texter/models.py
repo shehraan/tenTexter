@@ -75,7 +75,15 @@ class ConversationParticipant(Base):
     __tablename__ = "conversation_participant"
     conversation_id: Mapped[int] = mapped_column(ForeignKey("conversation.id", ondelete="RESTRICT"), primary_key=True)
     identity_id: Mapped[int] = mapped_column(ForeignKey("identity.id", ondelete="RESTRICT"), primary_key=True)
+    is_current: Mapped[bool] = mapped_column(Boolean, default=True)
+    left_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    __table_args__ = (
+        CheckConstraint(
+            "(is_current = 1 AND left_at IS NULL) OR (is_current = 0 AND left_at IS NOT NULL)",
+            name="ck_conversation_participant_current_left_at",
+        ),
+    )
 
 
 class TaskDefinition(ArchivedMixin, Base):

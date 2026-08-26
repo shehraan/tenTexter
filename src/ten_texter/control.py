@@ -7,11 +7,14 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from ten_texter.correlation import Classification, Classifier, CorrelationOrchestrator, PreparedCorrelation
 from ten_texter.domain import DecisionService, DomainError, ProposalService
 from ten_texter.enums import (
+    AwaitedResponseStatus,
     DecisionStatus,
     MessageKind,
     ParentTerminalPolicy,
+    OutboxStatus,
     ProposalStatus,
 )
 from ten_texter.model_clients import EntityResolverAssistant, TaskPlan
@@ -20,9 +23,14 @@ from ten_texter.models import (
     ConversationParticipant,
     DecisionRequest,
     DecisionRequestPrompt,
+    DecisionRequestAwaitedResponseCandidate,
+    AwaitedResponse,
     Identity,
     Person,
     Proposal,
+    Message,
+    MessageRevision,
+    OutboxMessage,
     TelegramUpdate,
     TaskDefinition,
     TaskDefinitionParticipant,
@@ -50,6 +58,18 @@ class PreparedOwnerCommand:
     review_reason: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedOwnerDecision:
+    action: str
+    awaited_response_id: int | None = None
+    classification: Classification | None = None
+
+
+class _UnusedSemantic:
+    def choose(self, revision: MessageRevision, candidates: list[AwaitedResponse]) -> int | None:
+        return None
+
+
 class ProductionOwnerCommandHandler:
     """Turns validated owner plans into one deterministic coordination transaction."""
 
@@ -60,11 +80,53 @@ class ProductionOwnerCommandHandler:
         owner_chat_id: int,
         resolver: EntityResolverAssistant,
         generation: ValidatedGenerationPipeline,
+        classifier: Classifier | None = None,
     ):
         self.sessions = sessions
         self.owner_chat_id = owner_chat_id
         self.resolver = resolver
         self.generation = generation
+        self.classifier = classifier
+
+    def prepare_decision(
+        self, decision_id: int, payload: dict[str, Any], _update: TelegramUpdate
+    ) -> PreparedOwnerDecision:
+        action, selected_id = self._decision_action(payload)
+        with self.sessions() as session:
+            decision = session.get(DecisionRequest, decision_id)
+            if decision is None:
+                raise DomainError("decision not found")
+            if decision.status is not DecisionStatus.PENDING:
+                return PreparedOwnerDecision("already_closed")
+            if decision.message_revision_id is not None:
+                if action != "select" or selected_id is None:
+                    raise DomainError("correlation decisions require `select <awaited-response-id>`")
+                allowed = session.get(
+                    DecisionRequestAwaitedResponseCandidate,
+                    {"decision_request_id": decision.id, "awaited_response_id": selected_id},
+                )
+                if allowed is None:
+                    raise DomainError("selected response is not a candidate for this decision")
+                revision = session.get(MessageRevision, decision.message_revision_id)
+                awaited = session.get(AwaitedResponse, selected_id)
+                message = session.get(Message, revision.message_id) if revision is not None else None
+                if (
+                    revision is None
+                    or awaited is None
+                    or message is None
+                    or message.current_revision_id != revision.id
+                    or revision.awaited_response_id is not None
+                    or awaited.status is not AwaitedResponseStatus.OPEN
+                ):
+                    return PreparedOwnerDecision("stale", selected_id)
+                if self.classifier is None:
+                    raise DomainError("correlation decision classifier is unavailable")
+                return PreparedOwnerDecision(
+                    "select",
+                    selected_id,
+                    self.classifier.classify(revision, awaited),
+                )
+        return PreparedOwnerDecision(action, selected_id)
 
     def prepare_command(self, parsed: object, _update: TelegramUpdate) -> PreparedOwnerCommand:
         if not isinstance(parsed, TaskPlan):
@@ -160,7 +222,10 @@ class ProductionOwnerCommandHandler:
             )
             prompt = OutboxService(session).create_owner(
                 telegram_chat_id=self.owner_chat_id,
-                final_text=prepared.review_reason,
+                final_text=(
+                    f"{prepared.review_reason}\n"
+                    "This command cannot be applied safely. Reply `dismiss` and submit a corrected command separately."
+                ),
                 message_kind=MessageKind.NOTIFICATION,
                 idempotency_key=f"telegram-update:{update.id}:review",
                 parent_terminal_policy=ParentTerminalPolicy.SURVIVE,
@@ -210,14 +275,20 @@ class ProductionOwnerCommandHandler:
         self,
         session: Session,
         decision_id: int,
-        payload: dict[str, Any],
+        payload: object,
         _update: TelegramUpdate,
     ) -> None:
         decision = session.get(DecisionRequest, decision_id)
-        if decision is None or decision.status is not DecisionStatus.PENDING:
-            raise DomainError("decision is not pending")
-        accepted = self._accepted(payload)
+        if decision is None:
+            raise DomainError("decision not found")
+        if decision.status is not DecisionStatus.PENDING:
+            return
+        if not isinstance(payload, PreparedOwnerDecision):
+            raise DomainError("decision answer was not prepared")
         if decision.proposal_id is not None:
+            accepted = payload.action in {"approve", "accept", "yes"}
+            if payload.action not in {"approve", "accept", "yes", "reject", "decline", "no"}:
+                raise DomainError("proposal decision requires approve or reject")
             proposal = session.get(Proposal, decision.proposal_id)
             assert proposal is not None
 
@@ -235,26 +306,105 @@ class ProductionOwnerCommandHandler:
                 apply=apply,
             )
             return
-        DecisionService(session).answer(
-            decision.id,
-            {"acknowledged": accepted},
-            subject_still_requires_decision=lambda _decision: True,
-            apply=lambda _decision, _resolution: True,
-        )
+        if decision.message_revision_id is not None:
+            revision = session.get(MessageRevision, decision.message_revision_id)
+            message = session.get(Message, revision.message_id) if revision is not None else None
+            awaited = (
+                session.get(AwaitedResponse, payload.awaited_response_id)
+                if payload.awaited_response_id
+                else None
+            )
+
+            def still_requires_correlation(_decision: DecisionRequest) -> bool:
+                return bool(
+                    payload.action == "select"
+                    and revision is not None
+                    and message is not None
+                    and message.current_revision_id == revision.id
+                    and revision.awaited_response_id is None
+                    and awaited is not None
+                    and awaited.status is AwaitedResponseStatus.OPEN
+                )
+
+            def apply_correlation(_decision: DecisionRequest, _resolution: dict[str, object]) -> bool:
+                assert revision is not None and awaited is not None and payload.classification is not None
+                CorrelationOrchestrator(
+                    session,
+                    semantic=_UnusedSemantic(),
+                    classifier=self.classifier,  # type: ignore[arg-type]
+                    owner_chat_id=self.owner_chat_id,
+                ).apply_prepared(
+                    revision.id,
+                    PreparedCorrelation(
+                        "KNOWN", awaited.id, "OWNER_SELECTION", payload.classification
+                    ),
+                )
+                return True
+
+            DecisionService(session).answer(
+                decision.id,
+                {"awaited_response_id": payload.awaited_response_id},
+                subject_still_requires_decision=still_requires_correlation,
+                apply=apply_correlation,
+            )
+            return
+        if decision.outbox_message_id is not None:
+            message = session.get(OutboxMessage, decision.outbox_message_id)
+            expected = "keep_reconciling" if decision.type == "UNCERTAIN_DELIVERY" else "keep_blocked"
+            if payload.action != expected:
+                raise DomainError(f"{decision.type} only permits `{expected.replace('_', ' ')}`")
+            DecisionService(session).answer(
+                decision.id,
+                {"action": expected},
+                subject_still_requires_decision=lambda _decision: bool(
+                    message is not None
+                    and message.status
+                    is (OutboxStatus.RECONCILING if expected == "keep_reconciling" else OutboxStatus.PENDING)
+                ),
+                apply=lambda _decision, _resolution: True,
+            )
+            return
+        if decision.telegram_update_id is not None:
+            if payload.action != "dismiss":
+                raise DomainError("owner-command review only permits `dismiss`; submit a corrected command separately")
+            DecisionService(session).answer(
+                decision.id,
+                {"action": "dismiss"},
+                subject_still_requires_decision=lambda _decision: True,
+                apply=lambda _decision, _resolution: True,
+            )
+            return
+        raise DomainError("unsupported decision subject")
 
     @staticmethod
-    def _accepted(payload: dict[str, Any]) -> bool:
+    def _decision_action(payload: dict[str, Any]) -> tuple[str, int | None]:
         callback = payload.get("callback_query")
         if isinstance(callback, dict):
-            value = str(callback.get("data") or "").rsplit(":", 1)[-1].casefold()
+            raw = str(callback.get("data") or "")
+            parts = raw.split(":")
+            value = parts[2].casefold() if len(parts) >= 3 else ""
+            selected = (
+                int(parts[3])
+                if value in {"select", "awaited_response"}
+                and len(parts) >= 4
+                and parts[3].isdigit()
+                else None
+            )
+            if value == "awaited_response":
+                value = "select"
         else:
             message = payload.get("message") or {}
-            value = str(message.get("text") or "").strip().casefold()
-        if value in {"approve", "accept", "yes", "y"}:
-            return True
-        if value in {"reject", "decline", "no", "n"}:
-            return False
-        raise DomainError("owner decision answer must be an explicit yes/no choice")
+            raw = str(message.get("text") or "").strip().casefold()
+            parts = raw.split()
+            value = (
+                "_".join(parts[:2])
+                if parts[:2] in [["keep", "reconciling"], ["keep", "blocked"]]
+                else (parts[0] if parts else "")
+            )
+            selected = int(parts[1]) if value == "select" and len(parts) == 2 and parts[1].isdigit() else None
+        aliases = {"yes": "yes", "y": "yes", "no": "no", "n": "no"}
+        return aliases.get(value, value), selected
+
 
     @staticmethod
     def _route_candidates(session: Session) -> list[dict[str, object]]:
@@ -269,7 +419,11 @@ class ProductionOwnerCommandHandler:
                 Conversation,
                 Conversation.id == ConversationParticipant.conversation_id,
             )
-            .where(Person.archived_at.is_(None), Conversation.archived_at.is_(None))
+            .where(
+                Person.archived_at.is_(None),
+                Conversation.archived_at.is_(None),
+                ConversationParticipant.is_current.is_(True),
+            )
             .order_by(Person.id, Conversation.id)
         )
         candidates: list[dict[str, object]] = []

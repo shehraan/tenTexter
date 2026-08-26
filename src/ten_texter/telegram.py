@@ -27,6 +27,8 @@ class OwnerCommandHandler(Protocol):
 
     def apply_command(self, session: Session, parsed: object, update: TelegramUpdate) -> None: ...
 
+    def prepare_decision(self, decision_id: int, payload: dict[str, Any], update: TelegramUpdate) -> object: ...
+
     def apply_decision(self, session: Session, decision_id: int, payload: dict[str, Any], update: TelegramUpdate) -> None: ...
 
 
@@ -112,6 +114,13 @@ class TelegramControlGateway:
             parsed = self.parser.parse(text)
             prepare = getattr(self.handler, "prepare_command", None)
             prepared = prepare(parsed, update) if prepare is not None else parsed
+        else:
+            prepare_decision = getattr(self.handler, "prepare_decision", None)
+            prepared = (
+                prepare_decision(decision_id, raw, update)
+                if prepare_decision is not None
+                else raw
+            )
         with self.sessions.begin() as session:
             update = session.get(TelegramUpdate, row_id)
             if update is None:
@@ -119,7 +128,7 @@ class TelegramControlGateway:
             if update.status is not TelegramUpdateStatus.PENDING:
                 return update.status
             if decision_id is not None:
-                self.handler.apply_decision(session, decision_id, dict(update.payload_json), update)
+                self.handler.apply_decision(session, decision_id, prepared, update)
             else:
                 self.handler.apply_command(session, prepared, update)
             update.status = TelegramUpdateStatus.PROCESSED
