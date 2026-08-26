@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ten-texter"
+version = "0.1.0"
+description = "Local-first messaging coordination agent"
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "alembic>=1,<2",
+    "pydantic>=2,<3",
+    "pydantic-settings>=2,<3",
+    "sqlalchemy>=2,<2.1",
+]
+
+[project.scripts]
+ten-texter = "ten_texter.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9,<10",
+    "ruff>=0.12,<1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
