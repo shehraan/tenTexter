@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import time
+from dataclasses import asdict
 
 from alembic import command
 from alembic.config import Config
@@ -121,6 +123,10 @@ def main(argv: list[str] | None = None) -> int:
     worker.add_argument("--once", action="store_true")
     runtime = subparsers.add_parser("run")
     runtime.add_argument("--once", action="store_true")
+    subparsers.add_parser("identities")
+    link_identity = subparsers.add_parser("link-identity")
+    link_identity.add_argument("--identity-id", type=int, required=True)
+    link_identity.add_argument("--person-id", type=int, required=True)
     args = parser.parse_args(argv)
     settings = Settings.from_env()
     if args.command == "migrate":
@@ -129,6 +135,28 @@ def main(argv: list[str] | None = None) -> int:
         _run_outbox_worker(Application.bootstrap(settings), once=args.once)
     elif args.command == "run":
         _run_agent(Application.bootstrap(settings), once=args.once)
+    elif args.command == "identities":
+        from ten_texter.identity import IdentityLinkingService
+
+        app = Application.bootstrap(settings)
+        with app.sessions() as session:
+            print(
+                json.dumps(
+                    [asdict(record) for record in IdentityLinkingService(session).inspect()],
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+    elif args.command == "link-identity":
+        from ten_texter.identity import IdentityLinkingService
+
+        app = Application.bootstrap(settings)
+        with app.sessions.begin() as session:
+            result = IdentityLinkingService(session).link(
+                identity_id=args.identity_id,
+                target_person_id=args.person_id,
+            )
+            print(json.dumps(asdict(result), sort_keys=True))
     else:
         app = Application.bootstrap(settings)
         with app.engine.connect() as connection:

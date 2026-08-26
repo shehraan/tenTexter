@@ -87,6 +87,10 @@ class TaskService:
         location: str | None = None,
         coordination_close_offset_minutes: int = 60,
     ) -> TaskInstance:
+        participant_pairs = list(participants)
+        person_ids = [person_id for person_id, _conversation_id in participant_pairs]
+        if len(person_ids) != len(set(person_ids)):
+            raise DomainError("duplicate canonical person in task participants")
         task = TaskInstance(
             task_definition_id=task_definition_id,
             occurrence_key=occurrence_key,
@@ -99,7 +103,7 @@ class TaskService:
         )
         self.session.add(task)
         self.session.flush()
-        for person_id, conversation_id in participants:
+        for person_id, conversation_id in participant_pairs:
             membership = self.session.scalar(
                 select(ConversationParticipant)
                 .join(Identity, Identity.id == ConversationParticipant.identity_id)
