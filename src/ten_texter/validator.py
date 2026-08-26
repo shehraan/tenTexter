@@ -1,0 +1,215 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Protocol
+
+from pydantic import Field, model_validator
+from sqlalchemy import select
+from sqlalchemy.orm import Session, sessionmaker
+
+from ten_texter.domain import DecisionService
+from ten_texter.enums import (
+    MessageKind,
+    ParentTerminalPolicy,
+    ValidatorCategory,
+)
+from ten_texter.model_clients import MessageGenerator, ModelBackend, StrictOutput, _validate
+from ten_texter.models import DecisionRequest, OutboxMessage
+
+
+class ValidatorOutput(StrictOutput):
+    category: ValidatorCategory
+    critique: str | None = Field(default=None, max_length=1000)
+
+    @model_validator(mode="after")
+    def critique_consistency(self) -> "ValidatorOutput":
+        if self.category is ValidatorCategory.VALID and self.critique is not None:
+            raise ValueError("VALID output cannot include critique")
+        if self.category is not ValidatorCategory.VALID and not self.critique:
+            raise ValueError("invalid output requires bounded critique")
+        return self
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatorContext:
+    message_kind: MessageKind
+    allowed_claims: tuple[str, ...] = ()
+    constraints: tuple[str, ...] = ()
+    allowed_disclosure_scopes: tuple[str, ...] = ()
+
+
+class IndependentMessageValidator:
+    def __init__(self, backend: ModelBackend):
+        self.backend = backend
+
+    def review(self, *, text: str, context: ValidatorContext) -> ValidatorOutput:
+        output = self.backend.infer(
+            operation="message_validator",
+            payload={
+                "trusted_instructions": (
+                    "Independently validate the exact immutable outbound text. Return only a bounded "
+                    "category and critique. Do not repair text and do not request side effects."
+                ),
+                "exact_text": text,
+                "message_kind": context.message_kind.value,
+                "allowed_claims": list(context.allowed_claims),
+                "constraints": list(context.constraints),
+                "allowed_disclosure_scopes": list(context.allowed_disclosure_scopes),
+            },
+        )
+        return _validate(ValidatorOutput, output)
+
+
+class ValidatorContextProvider(Protocol):
+    def context_for(self, outbox_id: int, message_kind: MessageKind) -> ValidatorContext: ...
+
+
+class MinimalValidatorContextProvider:
+    def __init__(
+        self,
+        *,
+        allowed_claims: tuple[str, ...] = (),
+        constraints: tuple[str, ...] = (),
+        allowed_disclosure_scopes: tuple[str, ...] = (),
+    ):
+        self.allowed_claims = allowed_claims
+        self.constraints = constraints
+        self.allowed_disclosure_scopes = allowed_disclosure_scopes
+
+    def context_for(self, outbox_id: int, message_kind: MessageKind) -> ValidatorContext:
+        return ValidatorContext(
+            message_kind=message_kind,
+            allowed_claims=self.allowed_claims,
+            constraints=self.constraints,
+            allowed_disclosure_scopes=self.allowed_disclosure_scopes,
+        )
+
+
+class OutboxValidatorGate:
+    """Adapter used by OutboxWorker; invalid immutable text is escalated, never repaired there."""
+
+    AUTHORITY_CATEGORIES = {
+        ValidatorCategory.UNSUPPORTED_CLAIM,
+        ValidatorCategory.UNAUTHORIZED_COMMITMENT,
+        ValidatorCategory.RULE_VIOLATION,
+    }
+
+    def __init__(
+        self,
+        sessions: sessionmaker[Session],
+        *,
+        validator: IndependentMessageValidator,
+        contexts: ValidatorContextProvider,
+    ):
+        self.sessions = sessions
+        self.validator = validator
+        self.contexts = contexts
+
+    def validate(self, *, text: str, message_kind: MessageKind, outbox_id: int) -> bool:
+        result = self.validator.review(
+            text=text,
+            context=self.contexts.context_for(outbox_id, message_kind),
+        )
+        if result.category is ValidatorCategory.VALID:
+            return True
+        decision_type = (
+            "VALIDATOR_AUTHORITY_VIOLATION"
+            if result.category in self.AUTHORITY_CATEGORIES
+            else "VALIDATOR_REPAIR_REQUIRED"
+        )
+        with self.sessions.begin() as session:
+            message = session.get(OutboxMessage, outbox_id)
+            if message is None or message.final_text != text:
+                return False
+            existing = session.scalar(
+                select(DecisionRequest).where(
+                    DecisionRequest.outbox_message_id == outbox_id,
+                    DecisionRequest.type == decision_type,
+                )
+            )
+            if existing is None:
+                DecisionService(session).create(
+                    decision_type=decision_type,
+                    subject_kind="outbox_message",
+                    subject_id=outbox_id,
+                    context={
+                        "validator_category": result.category.value,
+                        "critique": result.critique,
+                    },
+                    task_instance_id=message.task_instance_id,
+                    parent_terminal_policy=ParentTerminalPolicy.SURVIVE,
+                )
+        return False
+
+
+class GenerationOutcome(str, Enum):
+    READY = "READY"
+    ASK_ME = "ASK_ME"
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationResult:
+    outcome: GenerationOutcome
+    text: str | None
+    category: ValidatorCategory
+    critique: str | None = None
+
+
+class ValidatedGenerationPipeline:
+    AUTHORITY_CATEGORIES = OutboxValidatorGate.AUTHORITY_CATEGORIES
+    REPAIRABLE_CATEGORIES = {
+        ValidatorCategory.WRONG_MESSAGE_KIND,
+        ValidatorCategory.UNCLEAR_OR_AMBIGUOUS,
+    }
+
+    def __init__(
+        self,
+        *,
+        generator: MessageGenerator,
+        validator: IndependentMessageValidator,
+        max_repairs: int = 2,
+    ):
+        if max_repairs < 0:
+            raise ValueError("max_repairs must be non-negative")
+        self.generator = generator
+        self.validator = validator
+        self.max_repairs = max_repairs
+
+    def run(
+        self,
+        *,
+        goal: str,
+        facts: list[dict[str, Any]],
+        constraints: list[str],
+        context: ValidatorContext,
+        untrusted_text: str | None = None,
+    ) -> GenerationResult:
+        critique: str | None = None
+        for attempt in range(self.max_repairs + 1):
+            text = self.generator.generate(
+                goal=goal,
+                facts=facts,
+                constraints=constraints,
+                untrusted_text=untrusted_text,
+                critique=critique,
+            )
+            result = self.validator.review(text=text, context=context)
+            if result.category is ValidatorCategory.VALID:
+                return GenerationResult(GenerationOutcome.READY, text, result.category)
+            if result.category in self.AUTHORITY_CATEGORIES:
+                return GenerationResult(
+                    GenerationOutcome.ASK_ME,
+                    None,
+                    result.category,
+                    result.critique,
+                )
+            if result.category not in self.REPAIRABLE_CATEGORIES or attempt == self.max_repairs:
+                return GenerationResult(
+                    GenerationOutcome.ASK_ME,
+                    None,
+                    result.category,
+                    result.critique,
+                )
+            critique = result.critique
+        raise AssertionError("bounded generation loop exhausted unexpectedly")
