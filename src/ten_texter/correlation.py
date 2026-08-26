@@ -17,6 +17,8 @@ from ten_texter.enums import (
     AvailabilityEvidence,
     AvailabilityStatus,
     AwaitedResponseStatus,
+    DecisionCloseReason,
+    DecisionStatus,
     MessageKind,
     ParentTerminalPolicy,
     ProposalStatus,
@@ -33,6 +35,7 @@ from ten_texter.models import (
     OutboxDeliveryAttempt,
     OutboxMessage,
     Proposal,
+    TaskEvent,
     TaskInstance,
     TaskParticipant,
     DecisionRequestPrompt,
@@ -71,6 +74,16 @@ class CorrelationResult:
     decision_request_id: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedCorrelation:
+    outcome: str
+    awaited_response_id: int | None = None
+    source: str | None = None
+    classification: Classification | None = None
+    candidate_ids: tuple[int, ...] = ()
+    decision_type: str | None = None
+
+
 class CorrelationOrchestrator:
     def __init__(
         self,
@@ -84,6 +97,118 @@ class CorrelationOrchestrator:
         self.semantic = semantic
         self.classifier = classifier
         self.owner_chat_id = owner_chat_id
+
+    def prepare(self, revision_id: int) -> PreparedCorrelation:
+        """Run correlation/classification reads and model calls without a write transaction."""
+        revision = self.session.get(MessageRevision, revision_id)
+        if revision is None:
+            raise DomainError("revision not found")
+        message = self.session.get(Message, revision.message_id)
+        if message is None or message.current_revision_id != revision.id:
+            raise StaleWork("revision is not current")
+        if revision.awaited_response_id is not None:
+            return PreparedCorrelation("ALREADY_CORRELATED", revision.awaited_response_id)
+
+        lineage = list(
+            self.session.scalars(
+                select(AwaitedResponse)
+                .join(MessageRevision, MessageRevision.awaited_response_id == AwaitedResponse.id)
+                .where(
+                    MessageRevision.message_id == message.id,
+                    MessageRevision.id != revision.id,
+                    MessageRevision.awaited_response_id.is_not(None),
+                )
+                .distinct()
+            )
+        )
+        if len(lineage) == 1:
+            return self._prepare_known(revision, lineage[0], "REVISION_LINEAGE")
+        if len(lineage) > 1:
+            return self._prepare_ambiguous(lineage, "REVISION_LINEAGE_CONFLICT")
+
+        reply = self._reply_candidates(message)
+        if reply:
+            narrowed = self._narrow_to_sender(reply, message.sender_identity_id) or reply
+            if len(narrowed) == 1:
+                return self._prepare_known(revision, narrowed[0], "PROVIDER_REPLY")
+            return self._prepare_ambiguous(narrowed, "CORRELATION_AMBIGUITY")
+
+        exact = self._exact_conversation_candidates(message)
+        if len(exact) == 1:
+            return self._prepare_known(revision, exact[0], "EXACT_CONVERSATION")
+        if len(exact) > 1:
+            relevant = self._temporally_relevant(exact, message)
+            if len(relevant) == 1:
+                return self._prepare_known(revision, relevant[0], "RECENCY")
+            candidates = relevant or exact
+            chosen = self.semantic.choose(revision, candidates)
+            if chosen is not None and sum(item.id == chosen for item in candidates) == 1:
+                awaited = next(item for item in candidates if item.id == chosen)
+                return self._prepare_known(revision, awaited, "SEMANTIC")
+            return self._prepare_ambiguous(candidates, "CORRELATION_AMBIGUITY")
+
+        cross = self._same_person_other_conversation(message)
+        if cross:
+            return self._prepare_ambiguous(cross, "CROSS_CONVERSATION_RESPONSE")
+        return PreparedCorrelation("UNMATCHED")
+
+    def apply_prepared(self, revision_id: int, plan: PreparedCorrelation) -> CorrelationResult:
+        revision = self.session.get(MessageRevision, revision_id)
+        if revision is None:
+            raise DomainError("revision not found")
+        message = self.session.get(Message, revision.message_id)
+        if message is None or message.current_revision_id != revision.id:
+            raise StaleWork("revision is not current")
+        if plan.outcome == "ALREADY_CORRELATED":
+            return CorrelationResult(plan.outcome, plan.awaited_response_id)
+        if plan.outcome == "UNMATCHED":
+            return CorrelationResult("UNMATCHED")
+        if plan.awaited_response_id is not None:
+            awaited = self.session.get(AwaitedResponse, plan.awaited_response_id)
+            if awaited is None:
+                raise StaleWork("prepared awaited response disappeared")
+            return self._apply_known(
+                revision,
+                awaited,
+                source=plan.source or "PREPARED",
+                classification=plan.classification,
+            )
+        candidates = [
+            candidate
+            for candidate_id in plan.candidate_ids
+            if (candidate := self.session.get(AwaitedResponse, candidate_id)) is not None
+        ]
+        if len(candidates) != len(plan.candidate_ids):
+            raise StaleWork("prepared correlation candidates changed")
+        return self._ambiguous(
+            revision,
+            candidates,
+            plan.decision_type or "CORRELATION_AMBIGUITY",
+        )
+
+    def _prepare_known(
+        self,
+        revision: MessageRevision,
+        awaited: AwaitedResponse,
+        source: str,
+    ) -> PreparedCorrelation:
+        return PreparedCorrelation(
+            outcome="KNOWN",
+            awaited_response_id=awaited.id,
+            source=source,
+            classification=self.classifier.classify(revision, awaited),
+        )
+
+    @staticmethod
+    def _prepare_ambiguous(
+        candidates: list[AwaitedResponse],
+        decision_type: str,
+    ) -> PreparedCorrelation:
+        return PreparedCorrelation(
+            outcome=decision_type,
+            candidate_ids=tuple(candidate.id for candidate in candidates),
+            decision_type=decision_type,
+        )
 
     def process(self, revision_id: int) -> CorrelationResult:
         revision = self.session.get(MessageRevision, revision_id)
@@ -221,6 +346,7 @@ class CorrelationOrchestrator:
         awaited: AwaitedResponse,
         *,
         source: str,
+        classification: Classification | None = None,
     ) -> CorrelationResult:
         participant = self.session.get(TaskParticipant, awaited.task_participant_id)
         assert participant is not None
@@ -237,7 +363,12 @@ class CorrelationOrchestrator:
             self.session.flush()
             return CorrelationResult("LATE_TERMINAL", awaited.id, decision.id)
 
-        classification = self.classifier.classify(revision, awaited)
+        classification = classification or self.classifier.classify(revision, awaited)
+        proposals_to_create = self._reconcile_previous_effects(
+            revision,
+            participant,
+            classification,
+        )
         if classification.kind == "AMBIGUOUS":
             awaited.status = AwaitedResponseStatus.AMBIGUOUS
             self.session.flush()
@@ -251,7 +382,7 @@ class CorrelationOrchestrator:
             )
             awaited.status = AwaitedResponseStatus.SATISFIED
         elif classification.kind == "COUNTERPROPOSAL" and classification.proposals:
-            for atomic in classification.proposals:
+            for atomic in proposals_to_create:
                 proposal = Proposal(
                         task_instance_id=task.id,
                         proposed_by_participant_id=participant.id,
@@ -301,6 +432,92 @@ class CorrelationOrchestrator:
             return CorrelationResult("INTERPRETATION_AMBIGUOUS", awaited.id)
         self.session.flush()
         return CorrelationResult("CORRELATED", awaited.id)
+
+    def _reconcile_previous_effects(
+        self,
+        revision: MessageRevision,
+        participant: TaskParticipant,
+        classification: Classification,
+    ) -> tuple[AtomicProposal, ...]:
+        """Diff semantic effects owned by earlier revisions of the same message."""
+        prior_revision_ids = list(
+            self.session.scalars(
+                select(MessageRevision.id).where(
+                    MessageRevision.message_id == revision.message_id,
+                    MessageRevision.id != revision.id,
+                )
+            )
+        )
+        if not prior_revision_ids:
+            return classification.proposals
+
+        if (
+            participant.availability_source_revision_id in prior_revision_ids
+            and classification.kind != "AVAILABILITY"
+        ):
+            participant.availability_status = AvailabilityStatus.UNKNOWN
+            participant.availability_evidence = None
+            participant.availability_source_revision_id = None
+            participant.updated_at = utc_now()
+            self.session.add(
+                TaskEvent(
+                    task_instance_id=participant.task_instance_id,
+                    task_participant_id=participant.id,
+                    source_message_revision_id=revision.id,
+                    event_type="AVAILABILITY_RETRACTED_BY_EDIT",
+                    payload_json={},
+                )
+            )
+
+        pending = list(
+            self.session.scalars(
+                select(Proposal).where(
+                    Proposal.source_message_revision_id.in_(prior_revision_ids),
+                    Proposal.status == ProposalStatus.PENDING,
+                )
+            )
+        )
+        unmatched = list(classification.proposals if classification.kind == "COUNTERPROPOSAL" else ())
+        timestamp = utc_now()
+        for proposal in pending:
+            matching_index = next(
+                (
+                    index
+                    for index, atomic in enumerate(unmatched)
+                    if (
+                        proposal.field,
+                        proposal.operation,
+                        proposal.old_value,
+                        proposal.proposed_value,
+                    )
+                    == (
+                        atomic.field,
+                        atomic.operation,
+                        atomic.old_value,
+                        atomic.proposed_value,
+                    )
+                ),
+                None,
+            )
+            if matching_index is not None:
+                proposal.source_message_revision_id = revision.id
+                unmatched.pop(matching_index)
+                continue
+            proposal.status = ProposalStatus.SUPERSEDED
+            proposal.resolved_at = timestamp
+            decisions = list(
+                self.session.scalars(
+                    select(DecisionRequest).where(
+                        DecisionRequest.proposal_id == proposal.id,
+                        DecisionRequest.status == DecisionStatus.PENDING,
+                    )
+                )
+            )
+            for decision in decisions:
+                decision.status = DecisionStatus.CLOSED
+                decision.close_reason = DecisionCloseReason.SUBJECT_RESOLVED
+                decision.resolved_at = timestamp
+        return tuple(unmatched)
 
     def _ambiguous(
         self,

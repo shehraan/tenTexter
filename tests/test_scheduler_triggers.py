@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+import pytest
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -20,6 +21,7 @@ from ten_texter.models import (
     TaskTrigger,
     TriggerExecution,
 )
+from ten_texter.model_clients import ModelUnavailable
 from ten_texter.scheduler import RecurrenceScheduler
 from ten_texter.triggers import TriggerWorker
 from tests.test_schema import NOW, seed_core
@@ -196,3 +198,26 @@ def test_permanent_one_shot_failure_alerts_and_deactivates(db_session: Session) 
     db_session.expire_all()
     stored = db_session.get(TaskTrigger, trigger.id)
     assert (stored.status, stored.inactive_reason) == (TriggerStatus.INACTIVE, TriggerInactiveReason.FIRED)
+
+
+def test_transient_model_outage_keeps_trigger_pending_for_recovery(db_session: Session) -> None:
+    core = seed_core(db_session)
+    trigger = trigger_for(db_session, core)
+    db_session.commit()
+
+    class UnavailableGenerator:
+        def generate(self, **_: object) -> str:
+            raise ModelUnavailable("primary model unavailable")
+
+    worker = trigger_worker(db_session, UnavailableGenerator())
+    claim = worker.claim(trigger.id, "fire:retry", now=NOW)
+    assert claim is not None
+    with pytest.raises(ModelUnavailable):
+        worker.run_claim(claim)
+
+    db_session.expire_all()
+    execution = db_session.scalar(select(TriggerExecution))
+    assert execution.status is TriggerExecutionStatus.PENDING
+    assert execution.lease_expires_at is None
+    assert db_session.get(TaskTrigger, trigger.id).status is TriggerStatus.ACTIVE
+    assert db_session.scalar(select(func.count(OutboxMessage.id))) == 0
