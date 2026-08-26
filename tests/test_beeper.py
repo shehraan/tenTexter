@@ -169,3 +169,44 @@ def test_beeper_transport_disabled_by_default(db_session: Session) -> None:
 
     result = adapter.send(DeliveryRequest(1, Transport.BEEPER, "1", "text", "key"))
     assert not result.success and result.definitely_not_sent
+
+
+def test_beeper_poll_syncs_chats_and_ingests_inbound_messages(db_session: Session) -> None:
+    class PollClient:
+        def get(self, url: str, **_: object) -> Response:
+            if url.endswith("/v1/chats"):
+                return Response({"items": [chat_payload()]})
+            if url.endswith("/v1/chats/%21direct%3Abeeper/messages"):
+                return Response(
+                    {
+                        "items": [
+                            {
+                                "id": "incoming:1",
+                                "chatID": "!direct:beeper",
+                                "senderID": "@discord_123:beeper",
+                                "sortKey": "00000100",
+                                "timestamp": "2026-08-26T15:00:00Z",
+                                "type": "TEXT",
+                                "text": "yes",
+                                "isSender": False,
+                            }
+                        ]
+                    }
+                )
+            raise AssertionError(f"unexpected URL: {url}")
+
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    adapter = BeeperDesktopAdapter(
+        factory,
+        access_token="fake-token",
+        enabled=True,
+        client=PollClient(),  # type: ignore[arg-type]
+    )
+
+    revision_ids = adapter.poll_inbound()
+
+    assert len(revision_ids) == 1
+    with factory() as session:
+        revision = session.get(MessageRevision, revision_ids[0])
+        assert revision.text == "yes"
+        assert revision.processing_status.value == "PENDING"

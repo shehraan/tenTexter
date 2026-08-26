@@ -62,6 +62,16 @@ class CoordinationWorkflow:
                 (plan.person_id, plan.conversation_id) for plan in participant_sends
             ],
         )
+        return self.start_existing(task.id, participant_sends)
+
+    def start_existing(
+        self,
+        task_id: int,
+        participant_sends: list[ParticipantSendPlan],
+    ) -> CoordinationStart:
+        task = self.session.get(TaskInstance, task_id)
+        if task is None:
+            raise DomainError("task not found")
         outbox_ids: list[int] = []
         awaited_ids: list[int] = []
         participants_by_person = {
@@ -73,7 +83,9 @@ class CoordinationWorkflow:
         outbox = OutboxService(self.session)
         awaited_service = AwaitedResponseService(self.session)
         for plan in participant_sends:
-            participant = participants_by_person[plan.person_id]
+            participant = participants_by_person.get(plan.person_id)
+            if participant is None or participant.conversation_id != plan.conversation_id:
+                raise DomainError("send plan does not match a pinned task participant")
             message = outbox.create_beeper(
                 task_instance_id=task.id,
                 conversation_id=plan.conversation_id,

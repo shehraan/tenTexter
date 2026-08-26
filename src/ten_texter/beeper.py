@@ -185,10 +185,60 @@ class BeeperDesktopAdapter:
     def list_chats(self) -> list[dict[str, Any]]:
         if not self.enabled:
             return []
-        response = self.client.get(f"{self.base_url}/v1/chats", headers=self.headers)
-        response.raise_for_status()
-        payload = response.json()
-        return list(payload.get("items") or [])
+        return self._list_pages(f"{self.base_url}/v1/chats")
+
+    def list_messages(self, chat_id: str) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
+        return self._list_pages(
+            f"{self.base_url}/v1/chats/{quote(chat_id, safe='')}/messages"
+        )
+
+    def _list_pages(self, url: str, *, max_pages: int = 20) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        params: dict[str, str] = {}
+        for _page in range(max_pages):
+            response = self.client.get(url, headers=self.headers, params=params)
+            response.raise_for_status()
+            payload = response.json()
+            items.extend(item for item in payload.get("items") or [] if isinstance(item, dict))
+            if payload.get("hasMore") is not True:
+                break
+            cursor = payload.get("oldestCursor")
+            if not isinstance(cursor, str) or not cursor:
+                raise RuntimeError("Beeper pagination indicated more data without a cursor")
+            params = {"cursor": cursor, "direction": "before"}
+        else:
+            raise RuntimeError("Beeper pagination exceeded the bounded poll limit")
+        return items
+
+    def poll_inbound(self) -> list[int]:
+        """Fetch current chat/message pages, then durably ingest non-owner messages."""
+        chats = self.list_chats()
+        fetched: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
+        for chat in chats:
+            chat_id = chat.get("id")
+            if not isinstance(chat_id, str) or not chat_id:
+                continue
+            fetched.append((chat, self.list_messages(chat_id)))
+
+        revision_ids: list[int] = []
+        with self.sessions.begin() as session:
+            sync = BeeperSyncService(session)
+            for chat, messages in fetched:
+                conversation = sync.sync_chat(chat)
+                ordered = sorted(
+                    (item for item in messages if isinstance(item, dict)),
+                    key=lambda item: str(item.get("sortKey") or item.get("timestamp") or ""),
+                )
+                for item in ordered:
+                    if item.get("isSender") is True:
+                        continue
+                    payload = dict(item)
+                    payload.setdefault("chatID", conversation.beeper_conversation_id)
+                    result = sync.ingest_message(payload)
+                    revision_ids.append(result.revision_id)
+        return revision_ids
 
     def send(self, request: DeliveryRequest) -> DeliveryResult:
         if request.transport is not Transport.BEEPER:

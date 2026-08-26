@@ -14,15 +14,16 @@ def _run_outbox_worker(app: Application, *, once: bool) -> None:
     from sqlalchemy import select
 
     from ten_texter.beeper import BeeperDesktopAdapter
+    from ten_texter.domain import utc_now
     from ten_texter.enums import OutboxStatus, Transport
     from ten_texter.model_clients import HTTPModelBackend
     from ten_texter.models import OutboxMessage
     from ten_texter.outbox import OutboxWorker
-    from ten_texter.policy import PolicyRevalidator
+    from ten_texter.policy import DatabaseContextProvider, PolicyRevalidator
     from ten_texter.telegram import TelegramBotAdapter
     from ten_texter.validator import (
         IndependentMessageValidator,
-        MinimalValidatorContextProvider,
+        DatabaseValidatorContextProvider,
         OutboxValidatorGate,
     )
 
@@ -31,19 +32,15 @@ def _run_outbox_worker(app: Application, *, once: bool) -> None:
     validator = IndependentMessageValidator(
         HTTPModelBackend(app.settings.validator_model_url)
     )
+    facts = DatabaseContextProvider()
     gate = OutboxValidatorGate(
         app.sessions,
         validator=validator,
-        contexts=MinimalValidatorContextProvider(
-            constraints=(
-                "Do not make unsupported claims or unauthorized commitments.",
-                "Respect the supplied message kind and disclosure scopes.",
-            )
-        ),
+        contexts=DatabaseValidatorContextProvider(app.sessions, facts=facts),
     )
     worker = OutboxWorker(
         app.sessions,
-        revalidator=PolicyRevalidator(),
+        revalidator=PolicyRevalidator(facts=facts),
         validator=gate,
         adapters={
             Transport.BEEPER: BeeperDesktopAdapter(
@@ -57,9 +54,30 @@ def _run_outbox_worker(app: Application, *, once: bool) -> None:
                 enabled=True,
             ),
         },
+        raise_validation_errors=True,
     )
     while True:
         with app.sessions() as session:
+            expired_sending = list(
+                session.scalars(
+                    select(OutboxMessage.id)
+                    .where(
+                        OutboxMessage.status == OutboxStatus.SENDING,
+                        OutboxMessage.lease_expires_at <= utc_now(),
+                    )
+                    .order_by(OutboxMessage.id)
+                )
+            )
+        for outbox_id in expired_sending:
+            worker.reclaim_expired(outbox_id)
+        with app.sessions() as session:
+            reconciling = list(
+                session.scalars(
+                    select(OutboxMessage.id)
+                    .where(OutboxMessage.status == OutboxStatus.RECONCILING)
+                    .order_by(OutboxMessage.id)
+                )
+            )
             pending = list(
                 session.scalars(
                     select(OutboxMessage.id)
@@ -67,6 +85,8 @@ def _run_outbox_worker(app: Application, *, once: bool) -> None:
                     .order_by(OutboxMessage.id)
                 )
             )
+        for outbox_id in reconciling:
+            worker.reconcile(outbox_id)
         for outbox_id in pending:
             worker.process(outbox_id)
         if once:
@@ -80,6 +100,16 @@ def _alembic_config(database_url: str) -> Config:
     return config
 
 
+def _run_agent(app: Application, *, once: bool) -> None:
+    from ten_texter.runtime import build_runtime
+
+    runtime = build_runtime(app)
+    if once:
+        runtime.run_once()
+    else:
+        runtime.run_forever()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ten-texter")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -87,12 +117,16 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser("migrate")
     worker = subparsers.add_parser("worker")
     worker.add_argument("--once", action="store_true")
+    runtime = subparsers.add_parser("run")
+    runtime.add_argument("--once", action="store_true")
     args = parser.parse_args(argv)
     settings = Settings.from_env()
     if args.command == "migrate":
         command.upgrade(_alembic_config(settings.database_url), "head")
     elif args.command == "worker":
         _run_outbox_worker(Application.bootstrap(settings), once=args.once)
+    elif args.command == "run":
+        _run_agent(Application.bootstrap(settings), once=args.once)
     else:
         app = Application.bootstrap(settings)
         with app.engine.connect() as connection:

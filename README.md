@@ -33,13 +33,15 @@ uv run ten-texter migrate
 uv run ten-texter check
 ```
 
-Run the durable outbound worker after Beeper Desktop and the independent validator server are available:
+Run the complete agent after Telegram, Beeper Desktop, and both model servers are available:
 
 ```bash
-uv run ten-texter worker
+uv run ten-texter run
 ```
 
-Use `uv run ten-texter worker --once` for a single drain pass. The worker refuses to start unless real transports are explicitly enabled. Every participant and owner send is claimed from Outbox, freshly policy-checked, independently validated, and then passed to the configured adapter.
+Use `uv run ten-texter run --once` for one complete polling pass. The runtime polls and processes Telegram owner updates and Beeper inbound revisions, advances recurrence and triggers, sweeps task lifecycle deadlines, records dependency health transitions, and drains every Outbox recovery state. It refuses to start unless real transports are explicitly enabled.
+
+`uv run ten-texter worker` remains available when only the outbound delivery pump is needed. It reclaims expired `SENDING` leases, reconciles uncertain deliveries, and processes new `PENDING` sends. Every participant and owner send is freshly policy-checked with destination-aware facts, independently validated against concrete allowed claims, and then passed to the configured adapter.
 
 ## External services
 

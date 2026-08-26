@@ -23,6 +23,8 @@ class OwnerTaskParser(Protocol):
 
 
 class OwnerCommandHandler(Protocol):
+    def prepare_command(self, parsed: object, update: TelegramUpdate) -> object: ...
+
     def apply_command(self, session: Session, parsed: object, update: TelegramUpdate) -> None: ...
 
     def apply_decision(self, session: Session, decision_id: int, payload: dict[str, Any], update: TelegramUpdate) -> None: ...
@@ -103,10 +105,13 @@ class TelegramControlGateway:
             _sender, _chat, _type, text, reply_to = _extract(raw)
             decision_id = self._resolve_decision(read_session, raw, reply_to)
         parsed: object | None = None
+        prepared: object | None = None
         if decision_id is None:
             if not isinstance(text, str) or not text.strip():
                 raise DomainError("owner update has no supported instruction")
             parsed = self.parser.parse(text)
+            prepare = getattr(self.handler, "prepare_command", None)
+            prepared = prepare(parsed, update) if prepare is not None else parsed
         with self.sessions.begin() as session:
             update = session.get(TelegramUpdate, row_id)
             if update is None:
@@ -116,7 +121,7 @@ class TelegramControlGateway:
             if decision_id is not None:
                 self.handler.apply_decision(session, decision_id, dict(update.payload_json), update)
             else:
-                self.handler.apply_command(session, parsed, update)
+                self.handler.apply_command(session, prepared, update)
             update.status = TelegramUpdateStatus.PROCESSED
             update.error_details = None
             session.flush()
