@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from sqlalchemy import func, select
+import pytest
 from sqlalchemy.orm import Session, sessionmaker
 
 from ten_texter.domain import DecisionService
@@ -14,11 +15,15 @@ from ten_texter.enums import (
 from ten_texter.models import (
     DecisionRequestPrompt,
     OutboxDeliveryAttempt,
+    OutboxMessage,
     Person,
     TelegramUpdate,
 )
 from ten_texter.outbox import DeliveryRequest, OutboxService
+from ten_texter.policy import DatabaseContextProvider
 from ten_texter.telegram import TelegramBotAdapter, TelegramControlGateway
+from ten_texter.runtime import AgentRuntime
+from ten_texter.validator import DatabaseValidatorContextProvider
 from tests.test_schema import NOW, seed_core
 
 
@@ -112,6 +117,54 @@ def test_effect_and_processed_status_rollback_together(db_session: Session) -> N
     db_session.expire_all()
     assert db_session.get(TelegramUpdate, received.telegram_update_row_id).status is TelegramUpdateStatus.PENDING
     assert db_session.scalar(select(func.count(Person.id)).where(Person.display_name == "command:4")) == 0
+
+
+def test_runtime_failure_notifies_owner_once_and_keeps_update_pending(
+    db_session: Session,
+) -> None:
+    parser = Parser()
+    handler = Handler(fail=True)
+    control = gateway(db_session, parser, handler)
+    received = control.receive(raw(40))
+    runtime = AgentRuntime.__new__(AgentRuntime)
+    runtime.sessions = sessionmaker(
+        bind=db_session.bind, expire_on_commit=False, autoflush=False
+    )
+    runtime.control = control
+    runtime.owner_chat_id = 99
+
+    class NoUpdates:
+        def poll(self, **_: object) -> list[dict[str, object]]:
+            return []
+
+    runtime.telegram = NoUpdates()
+
+    with pytest.raises(RuntimeError, match="crash"):
+        runtime._poll_telegram()
+    with pytest.raises(RuntimeError, match="crash"):
+        runtime._poll_telegram()
+
+    db_session.expire_all()
+    update = db_session.get(TelegramUpdate, received.telegram_update_row_id)
+    assert update.status is TelegramUpdateStatus.PENDING
+    notices = list(
+        db_session.scalars(
+            select(OutboxMessage).where(
+                OutboxMessage.idempotency_key
+                == f"telegram-update:{update.id}:processing-failed"
+            )
+        )
+    )
+    assert len(notices) == 1
+    assert notices[0].final_text == (
+        "Telegram command 40 could not be processed and remains pending for retry."
+    )
+    context = DatabaseValidatorContextProvider(
+        runtime.sessions,
+        facts=DatabaseContextProvider(),
+        owner_chat_id=99,
+    ).context_for(notices[0].id, notices[0].message_kind)
+    assert context.allowed_claims == (notices[0].final_text,)
 
 
 def test_explicit_callback_decision_id_has_priority(db_session: Session) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -449,12 +450,42 @@ def test_task_parser_strict_structured_output() -> None:
             }
         }
     )
-    parsed = TaskParser(backend).parse("Ask Alex about tennis tomorrow")
+    parsed = TaskParser(
+        backend,
+        owner_timezone="America/Toronto",
+        clock=lambda: datetime(2026, 8, 26, 16, tzinfo=UTC),
+    ).parse("Ask Alex about tennis tomorrow")
     assert parsed.topic_key == "tennis"
     assert parsed.duration_minutes == 60
     instructions = backend.calls[0][1]["trusted_instructions"]
     assert "recurrence wall-clock state" in instructions
     assert "must both be null" in instructions
+    assert "current_datetime" in instructions
+    payload = backend.calls[0][1]
+    assert payload["current_datetime"] == "2026-08-26T12:00:00-04:00"
+    assert payload["owner_timezone"] == "America/Toronto"
+
+
+def test_task_parser_rejects_past_one_time_task() -> None:
+    backend = Backend(
+        {
+            "task_parser": {
+                "scheduled_at": "2026-08-25T17:00:00-04:00",
+                "duration_minutes": 60,
+                "location": None,
+                "topic_key": "tennis",
+                "participant_references": ["Alex"],
+                "recurrence_rule": None,
+                "timezone": None,
+            }
+        }
+    )
+    with pytest.raises(ModelOutputError, match="past one-time"):
+        TaskParser(
+            backend,
+            owner_timezone="America/Toronto",
+            clock=lambda: datetime(2026, 8, 26, 16, tzinfo=UTC),
+        ).parse("Ask Alex about tennis yesterday")
 
 
 @pytest.mark.parametrize(

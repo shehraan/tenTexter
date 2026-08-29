@@ -20,6 +20,7 @@ from ten_texter.domain import DomainError, TaskService, utc_now
 from ten_texter.enums import (
     MessageKind,
     OutboxStatus,
+    ParentTerminalPolicy,
     PolicyOutcome,
     ProcessingFailureType,
     ProcessingStatus,
@@ -296,7 +297,23 @@ class AgentRuntime:
                 )
             )
         for update_id in pending:
-            self.control.process(update_id)
+            try:
+                self.control.process(update_id)
+            except Exception:
+                with self.sessions.begin() as session:
+                    update = session.get(TelegramUpdate, update_id)
+                    if update is not None and update.status.value == "PENDING":
+                        OutboxService(session).create_owner(
+                            telegram_chat_id=self.owner_chat_id,
+                            final_text=(
+                                f"Telegram command {update.telegram_update_id} could not be processed "
+                                "and remains pending for retry."
+                            ),
+                            message_kind=MessageKind.NOTIFICATION,
+                            idempotency_key=f"telegram-update:{update.id}:processing-failed",
+                            parent_terminal_policy=ParentTerminalPolicy.SURVIVE,
+                        )
+                raise
 
     def _poll_beeper(self) -> None:
         self.beeper.poll_inbound()
@@ -531,6 +548,7 @@ def build_runtime(
     validator_backend: ModelBackend | None = None,
     telegram: TelegramBotAdapter | None = None,
     beeper: BeeperDesktopAdapter | None = None,
+    task_parser_clock: Callable[[], datetime] | None = None,
 ) -> AgentRuntime:
     settings = app.settings
     sessions = app.sessions
@@ -569,7 +587,11 @@ def build_runtime(
     control = TelegramControlGateway(
         sessions,
         owner_id=settings.owner_id,
-        parser=TaskParser(primary_backend),
+        parser=TaskParser(
+            primary_backend,
+            owner_timezone=getattr(settings, "owner_timezone", "UTC"),
+            clock=task_parser_clock,
+        ),
         handler=handler,
     )
     facts = DatabaseContextProvider()

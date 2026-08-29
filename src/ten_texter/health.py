@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ten_texter.enums import DestinationKind, MessageKind, ParentTerminalPolicy, Transport
-from ten_texter.models import OutboxMessage, TelegramOutboxDestination
+from ten_texter.models import OutboxMessage, TelegramOutboxDestination, TelegramUpdate
 from ten_texter.outbox import OutboxService
 
 
@@ -50,6 +50,41 @@ def owner_health_claim(
         return None
     detail = message.final_text.removeprefix(detail_prefix)
     return message.final_text if _HEALTH_DETAIL.fullmatch(detail) else None
+
+
+def owner_telegram_update_failure_claim(
+    session: Session,
+    message: OutboxMessage,
+    *,
+    owner_chat_id: int | None,
+) -> str | None:
+    """Authorize only the canonical owner notice for one still-pending update."""
+    prefix = "telegram-update:"
+    suffix = ":processing-failed"
+    if (
+        owner_chat_id is None
+        or message.transport is not Transport.TELEGRAM
+        or message.destination_kind is not DestinationKind.OWNER
+        or message.message_kind is not MessageKind.NOTIFICATION
+        or message.task_instance_id is not None
+        or message.trigger_execution_id is not None
+        or message.corrects_outbox_message_id is not None
+        or message.parent_terminal_policy is not ParentTerminalPolicy.SURVIVE
+        or not message.idempotency_key.startswith(prefix)
+        or not message.idempotency_key.endswith(suffix)
+    ):
+        return None
+    row_id = message.idempotency_key[len(prefix) : -len(suffix)]
+    if not row_id.isdigit():
+        return None
+    destination = session.get(TelegramOutboxDestination, message.id)
+    update = session.get(TelegramUpdate, int(row_id))
+    if destination is None or destination.telegram_chat_id != owner_chat_id or update is None:
+        return None
+    expected = (
+        f"Telegram command {update.telegram_update_id} could not be processed and remains pending for retry."
+    )
+    return expected if message.final_text == expected else None
 
 
 class HealthMonitor:

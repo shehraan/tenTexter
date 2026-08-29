@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from collections.abc import Callable
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Protocol
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -284,22 +286,45 @@ def _operation_json_schema(operation: str) -> dict[str, Any]:
 
 
 class TaskParser:
-    def __init__(self, backend: ModelBackend):
+    def __init__(
+        self,
+        backend: ModelBackend,
+        *,
+        owner_timezone: str = "UTC",
+        clock: Callable[[], datetime] | None = None,
+    ):
         self.backend = backend
+        try:
+            self.owner_timezone = ZoneInfo(owner_timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f"unknown owner timezone: {owner_timezone}") from exc
+        self.clock = clock or (lambda: datetime.now(UTC))
 
     def parse(self, text: str) -> TaskPlan:
+        now = self.clock()
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("task parser clock must return an aware datetime")
+        local_now = now.astimezone(self.owner_timezone)
         output = self.backend.infer(
             operation="task_parser",
             payload={
                 "trusted_instructions": (
                     "Parse the owner's coordination request into the bounded schema. "
+                    "Resolve relative dates and times against current_datetime in owner_timezone. "
                     "Timezone is recurrence wall-clock state; for a one-time task, "
                     "recurrence_rule and timezone must both be null."
                 ),
+                "current_datetime": local_now.isoformat(),
+                "owner_timezone": self.owner_timezone.key,
                 "owner_instruction": text,
             },
         )
-        return _validate(TaskPlan, output)
+        parsed: TaskPlan = _validate(TaskPlan, output)
+        if parsed.scheduled_at.tzinfo is None or parsed.scheduled_at.utcoffset() is None:
+            raise ModelOutputError("task_parser scheduled_at must include a UTC offset")
+        if parsed.recurrence_rule is None and parsed.scheduled_at <= now:
+            raise ModelOutputError("task_parser produced a past one-time scheduled_at")
+        return parsed
 
 
 class MessageClassifier:

@@ -402,6 +402,7 @@ def test_production_runtime_composes_owner_command_through_durable_send(
         validator_backend=ValidatorBackend(),
         telegram=telegram,
         beeper=beeper,
+        task_parser_clock=lambda: NOW,
     )
 
     tick = runtime.run_once(now=NOW)

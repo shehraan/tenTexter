@@ -15,7 +15,7 @@ from ten_texter.enums import (
     ValidatorCategory,
 )
 from ten_texter.model_clients import MessageGenerator, ModelBackend, StrictOutput, _validate
-from ten_texter.health import owner_health_claim
+from ten_texter.health import owner_health_claim, owner_telegram_update_failure_claim
 from ten_texter.models import DecisionRequest, DecisionRequestPrompt, OutboxMessage
 from ten_texter.outbox import OutboxService
 from ten_texter.policy import DatabaseContextProvider
@@ -152,18 +152,25 @@ class DatabaseValidatorContextProvider:
                 if message_kind is message.message_kind
                 else None
             )
-            if health_claim is not None:
+            update_failure_claim = (
+                owner_telegram_update_failure_claim(
+                    session, message, owner_chat_id=self.owner_chat_id
+                )
+                if message_kind is message.message_kind
+                else None
+            )
+            operational_claim = health_claim or update_failure_claim
+            if operational_claim is not None:
+                claim_kind = "health-status" if health_claim is not None else "operational-status"
                 return ValidatorContext(
                     message_kind=message_kind,
-                    allowed_claims=(health_claim,),
+                    allowed_claims=(operational_claim,),
                     constraints=(
                         "Use only the enumerated allowed claims.",
                         "Do not make commitments on the owner's behalf.",
                         "Reject any private fact not present in allowed_claims.",
-                        (
-                            "This owner-only notification may report exactly the enumerated "
-                            "health-status claim; it does not authorize any other fact or commitment."
-                        ),
+                        f"This owner-only notification may report exactly the enumerated {claim_kind} "
+                        "claim; it does not authorize any other fact or commitment.",
                     ),
                 )
             disclosed = self.facts.facts_for(session, message)
