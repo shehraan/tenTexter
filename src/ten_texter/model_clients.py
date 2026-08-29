@@ -176,9 +176,9 @@ def _operation_json_schema(operation: str) -> dict[str, Any]:
     schema = schemas.get(operation)
     if schema is None and operation == "message_validator":
         # Imported lazily to avoid model_clients <-> validator initialization cycles.
-        from ten_texter.validator import ValidatorOutput
+        from ten_texter.validator import validator_output_json_schema
 
-        schema = ValidatorOutput
+        return validator_output_json_schema()
     if schema is None:
         return {"type": "object"}
     return schema.model_json_schema()

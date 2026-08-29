@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
@@ -61,6 +62,37 @@ def test_validator_output_is_strict_and_minimal() -> None:
         "constraints",
         "allowed_disclosure_scopes",
     }
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        {"category": "VALID", "critique": "No issues."},
+        {"category": "UNSUPPORTED_CLAIM", "critique": None},
+        {"category": "UNSUPPORTED_CLAIM", "critique": ""},
+    ],
+)
+def test_validator_rejects_inconsistent_category_critique(output: dict[str, object]) -> None:
+    with pytest.raises(ModelOutputError):
+        IndependentMessageValidator(Backend([output])).review(
+            text="Are you free at 5?",
+            context=context(),
+        )
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        {"category": "VALID", "critique": None},
+        {"category": "RULE_VIOLATION", "critique": "A current rule blocks this message."},
+    ],
+)
+def test_validator_accepts_consistent_category_critique(output: dict[str, object]) -> None:
+    result = IndependentMessageValidator(Backend([output])).review(
+        text="Are you free at 5?",
+        context=context(),
+    )
+    assert result.category.value == output["category"]
 
 
 def test_clarity_failure_repairs_with_bounded_critique() -> None:

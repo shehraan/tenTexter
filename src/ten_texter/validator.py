@@ -20,9 +20,12 @@ from ten_texter.outbox import OutboxService
 from ten_texter.policy import DatabaseContextProvider
 
 
+VALIDATOR_CRITIQUE_MAX_LENGTH = 1000
+
+
 class ValidatorOutput(StrictOutput):
     category: ValidatorCategory
-    critique: str | None = Field(default=None, max_length=1000)
+    critique: str | None = Field(default=None, max_length=VALIDATOR_CRITIQUE_MAX_LENGTH)
 
     @model_validator(mode="after")
     def critique_consistency(self) -> "ValidatorOutput":
@@ -31,6 +34,39 @@ class ValidatorOutput(StrictOutput):
         if self.category is not ValidatorCategory.VALID and not self.critique:
             raise ValueError("invalid output requires bounded critique")
         return self
+
+
+def validator_output_json_schema() -> dict[str, Any]:
+    """llama.cpp-compatible discriminated schema for constrained validation output."""
+    invalid_categories = [
+        category.value for category in ValidatorCategory if category is not ValidatorCategory.VALID
+    ]
+    return {
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "category": {"const": ValidatorCategory.VALID.value},
+                    "critique": {"type": "null"},
+                },
+                "required": ["category", "critique"],
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "category": {"enum": invalid_categories},
+                    "critique": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": VALIDATOR_CRITIQUE_MAX_LENGTH,
+                    },
+                },
+                "required": ["category", "critique"],
+                "additionalProperties": False,
+            },
+        ]
+    }
 
 
 @dataclass(frozen=True, slots=True)

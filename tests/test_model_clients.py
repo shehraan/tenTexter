@@ -63,6 +63,65 @@ def test_http_backend_uses_llama_chat_completions_with_schema() -> None:
     assert body["response_format"]["schema"]["additionalProperties"] is False
 
 
+def test_message_validator_llama_schema_discriminates_critique() -> None:
+    request_body: dict[str, object] = {}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        request_body.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"category":"VALID","critique":null}'}}]},
+        )
+
+    output = HTTPModelBackend(
+        "http://validator.test",
+        client=httpx.Client(transport=httpx.MockTransport(respond)),
+    ).infer(operation="message_validator", payload={})
+
+    assert output == {"category": "VALID", "critique": None}
+    schema = request_body["response_format"]["schema"]
+    assert len(schema["oneOf"]) == 2
+    valid, invalid = schema["oneOf"]
+    assert valid["properties"]["category"] == {"const": "VALID"}
+    assert valid["properties"]["critique"] == {"type": "null"}
+    assert valid["required"] == ["category", "critique"]
+    assert valid["additionalProperties"] is False
+    assert set(invalid["properties"]["category"]["enum"]) == {
+        "UNSUPPORTED_CLAIM",
+        "UNAUTHORIZED_COMMITMENT",
+        "WRONG_MESSAGE_KIND",
+        "UNCLEAR_OR_AMBIGUOUS",
+        "RULE_VIOLATION",
+    }
+    assert invalid["properties"]["critique"] == {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 1000,
+    }
+    assert invalid["required"] == ["category", "critique"]
+    assert invalid["additionalProperties"] is False
+
+
+def test_other_model_operation_schema_is_unchanged() -> None:
+    request_body: dict[str, object] = {}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        request_body.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"text":"Hello"}'}}]},
+        )
+
+    HTTPModelBackend(
+        "http://model.test",
+        client=httpx.Client(transport=httpx.MockTransport(respond)),
+    ).infer(operation="message_generator", payload={})
+
+    schema = request_body["response_format"]["schema"]
+    assert "oneOf" not in schema
+    assert schema["properties"]["text"]["maxLength"] == 4096
+
+
 @pytest.mark.parametrize(
     "base_url",
     ["http://model.test/v1", "http://model.test/v1/chat/completions"],
