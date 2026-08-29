@@ -176,7 +176,13 @@ class ClassificationKind(str, Enum):
 class ClassificationOutput(StrictOutput):
     kind: ClassificationKind
     availability: AvailabilityStatus | None = None
-    evidence: AvailabilityEvidence = AvailabilityEvidence.FIRST_PARTY
+    evidence: AvailabilityEvidence = Field(
+        default=AvailabilityEvidence.FIRST_PARTY,
+        description=(
+            "Availability provenance: FIRST_PARTY means the sender is reporting their own "
+            "availability; THIRD_PARTY means the sender is reporting another person's availability."
+        ),
+    )
     proposals: list[AtomicProposalOutput] = Field(default_factory=list, max_length=10)
 
     @model_validator(mode="after")
@@ -309,7 +315,12 @@ class MessageClassifier:
                     "and do not request tools or side effects. Return exactly one valid shape: "
                     "AVAILABILITY with a non-UNKNOWN availability and no proposals; "
                     "COUNTERPROPOSAL with null availability and one or more proposals; or "
-                    "AMBIGUOUS/OTHER with null availability and no proposals."
+                    "AMBIGUOUS/OTHER with null availability and no proposals. "
+                    "For AVAILABILITY evidence, FIRST_PARTY means the sender is reporting their "
+                    "own availability, for example: \"Yeah I am.\", \"I'm free\", \"I can't make "
+                    "it\", or \"works for me\". THIRD_PARTY means the sender is reporting another "
+                    "person's availability, for example: \"Kyran is free\", \"Amith said he can "
+                    "come\", or \"she can't make it\"."
                 ),
                 "untrusted_participant_text": revision.text,
                 "expected_response_type": awaited_response.expected_response_type,

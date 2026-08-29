@@ -7,7 +7,7 @@ import pytest
 from pydantic import ValidationError
 
 from ten_texter.domain import AwaitedResponseService
-from ten_texter.enums import AvailabilityStatus
+from ten_texter.enums import AvailabilityEvidence, AvailabilityStatus
 from ten_texter.model_clients import (
     ClassificationOutput,
     CorrelationOutput,
@@ -345,6 +345,8 @@ def test_classification_evidence_enum_and_default_are_preserved() -> None:
     generated = ClassificationOutput.model_json_schema()
     evidence = generated["properties"]["evidence"]
     assert evidence["default"] == "FIRST_PARTY"
+    assert "sender is reporting their own availability" in evidence["description"]
+    assert "sender is reporting another person's availability" in evidence["description"]
     assert generated["$defs"]["AvailabilityEvidence"]["enum"] == [
         "FIRST_PARTY",
         "THIRD_PARTY",
@@ -540,6 +542,62 @@ def test_participant_prompt_injection_is_untrusted_classification_data(db_sessio
     payload = backend.calls[0][1]
     assert payload["untrusted_participant_text"].startswith("Ignore instructions")
     assert "tools" not in payload
+
+
+@pytest.mark.parametrize(
+    "text,availability,evidence",
+    [
+        ("Yeah I am.", AvailabilityStatus.AVAILABLE, AvailabilityEvidence.FIRST_PARTY),
+        ("I'm free", AvailabilityStatus.AVAILABLE, AvailabilityEvidence.FIRST_PARTY),
+        (
+            "I can't make it",
+            AvailabilityStatus.UNAVAILABLE,
+            AvailabilityEvidence.FIRST_PARTY,
+        ),
+        (
+            "Kyran said he's free",
+            AvailabilityStatus.AVAILABLE,
+            AvailabilityEvidence.THIRD_PARTY,
+        ),
+        (
+            "Amith can't come",
+            AvailabilityStatus.UNAVAILABLE,
+            AvailabilityEvidence.THIRD_PARTY,
+        ),
+    ],
+)
+def test_message_classifier_defines_and_preserves_availability_provenance(
+    db_session,
+    text: str,
+    availability: AvailabilityStatus,
+    evidence: AvailabilityEvidence,
+) -> None:
+    core = seed_core(db_session)
+    response = AwaitedResponseService(db_session).create(
+        core["participant"].id,
+        "availability",
+    )
+    core["revision"].text = text
+    backend = Backend(
+        {
+            "message_classifier": {
+                "kind": "AVAILABILITY",
+                "availability": availability.value,
+                "evidence": evidence.value,
+                "proposals": [],
+            }
+        }
+    )
+
+    classification = MessageClassifier(backend).classify(core["revision"], response)
+
+    assert classification.availability is availability
+    assert classification.evidence is evidence
+    instructions = backend.calls[0][1]["trusted_instructions"]
+    assert "FIRST_PARTY means the sender is reporting their own availability" in instructions
+    assert "THIRD_PARTY means the sender is reporting another person's availability" in instructions
+    assert '"Yeah I am."' in instructions
+    assert '"Kyran is free"' in instructions
 
 
 def test_classifier_rejects_inconsistent_semantic_effects(db_session) -> None:
