@@ -118,6 +118,47 @@ class TaskPlan(StrictOutput):
         return self
 
 
+def task_plan_json_schema() -> dict[str, Any]:
+    """llama.cpp-compatible TaskPlan schema with paired recurrence fields."""
+    generated = TaskPlan.model_json_schema()
+    common_properties = {
+        name: schema
+        for name, schema in generated["properties"].items()
+        if name not in {"recurrence_rule", "timezone"}
+    }
+    required = [
+        *generated["required"],
+        "recurrence_rule",
+        "timezone",
+    ]
+
+    def branch(
+        recurrence_rule: dict[str, Any],
+        timezone: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                **common_properties,
+                "recurrence_rule": recurrence_rule,
+                "timezone": timezone,
+            },
+            "required": required,
+            "additionalProperties": False,
+        }
+
+    return {
+        "title": generated.get("title", "TaskPlan"),
+        "oneOf": [
+            branch({"type": "null"}, {"type": "null"}),
+            branch(
+                {"type": "string", "minLength": 1},
+                {"type": "string", "minLength": 1},
+            ),
+        ],
+    }
+
+
 class AtomicProposalOutput(StrictOutput):
     field: str
     operation: str
@@ -167,12 +208,13 @@ class GeneratedMessage(StrictOutput):
 
 def _operation_json_schema(operation: str) -> dict[str, Any]:
     schemas: dict[str, type[StrictOutput]] = {
-        "task_parser": TaskPlan,
         "message_classifier": ClassificationOutput,
         "semantic_correlation": CorrelationOutput,
         "entity_resolution": EntityResolutionOutput,
         "message_generator": GeneratedMessage,
     }
+    if operation == "task_parser":
+        return task_plan_json_schema()
     schema = schemas.get(operation)
     if schema is None and operation == "message_validator":
         # Imported lazily to avoid model_clients <-> validator initialization cycles.
@@ -192,7 +234,11 @@ class TaskParser:
         output = self.backend.infer(
             operation="task_parser",
             payload={
-                "trusted_instructions": "Parse the owner's coordination request into the bounded schema.",
+                "trusted_instructions": (
+                    "Parse the owner's coordination request into the bounded schema. "
+                    "Timezone is recurrence wall-clock state; for a one-time task, "
+                    "recurrence_rule and timezone must both be null."
+                ),
                 "owner_instruction": text,
             },
         )

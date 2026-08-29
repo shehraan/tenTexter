@@ -102,6 +102,66 @@ def test_message_validator_llama_schema_discriminates_critique() -> None:
     assert invalid["additionalProperties"] is False
 
 
+def test_task_parser_llama_schema_pairs_recurrence_and_timezone() -> None:
+    request_body: dict[str, object] = {}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        request_body.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"scheduled_at":"2026-09-01T17:00:00Z",'
+                                '"duration_minutes":60,"location":null,"topic_key":"tennis",'
+                                '"participant_references":["Alex"],'
+                                '"recurrence_rule":null,"timezone":null}'
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    HTTPModelBackend(
+        "http://model.test",
+        client=httpx.Client(transport=httpx.MockTransport(respond)),
+    ).infer(operation="task_parser", payload={})
+
+    schema = request_body["response_format"]["schema"]
+    assert len(schema["oneOf"]) == 2
+    one_time, recurring = schema["oneOf"]
+    assert one_time["properties"]["recurrence_rule"] == {"type": "null"}
+    assert one_time["properties"]["timezone"] == {"type": "null"}
+    assert recurring["properties"]["recurrence_rule"] == {
+        "type": "string",
+        "minLength": 1,
+    }
+    assert recurring["properties"]["timezone"] == {
+        "type": "string",
+        "minLength": 1,
+    }
+    for branch in (one_time, recurring):
+        assert branch["required"] == [
+            "scheduled_at",
+            "duration_minutes",
+            "topic_key",
+            "participant_references",
+            "recurrence_rule",
+            "timezone",
+        ]
+        assert branch["additionalProperties"] is False
+        assert branch["properties"]["duration_minutes"]["exclusiveMinimum"] == 0
+        assert branch["properties"]["duration_minutes"]["maximum"] == 1440
+        assert branch["properties"]["location"]["anyOf"][0]["maxLength"] == 500
+        assert branch["properties"]["topic_key"]["minLength"] == 1
+        assert branch["properties"]["topic_key"]["maxLength"] == 300
+        assert branch["properties"]["participant_references"]["minItems"] == 1
+        assert branch["properties"]["participant_references"]["maxItems"] == 100
+
+
 def test_other_model_operation_schema_is_unchanged() -> None:
     request_body: dict[str, object] = {}
 
@@ -188,6 +248,53 @@ def test_task_parser_strict_structured_output() -> None:
     parsed = TaskParser(backend).parse("Ask Alex about tennis tomorrow")
     assert parsed.topic_key == "tennis"
     assert parsed.duration_minutes == 60
+    instructions = backend.calls[0][1]["trusted_instructions"]
+    assert "recurrence wall-clock state" in instructions
+    assert "must both be null" in instructions
+
+
+@pytest.mark.parametrize(
+    "recurrence_rule, timezone",
+    [(None, "UTC"), ("FREQ=WEEKLY", None)],
+)
+def test_task_parser_rejects_unpaired_recurrence_fields(
+    recurrence_rule: str | None,
+    timezone: str | None,
+) -> None:
+    backend = Backend(
+        {
+            "task_parser": {
+                "scheduled_at": "2026-08-27T17:00:00-04:00",
+                "duration_minutes": 60,
+                "location": None,
+                "topic_key": "tennis",
+                "participant_references": ["Alex"],
+                "recurrence_rule": recurrence_rule,
+                "timezone": timezone,
+            }
+        }
+    )
+    with pytest.raises(ModelOutputError):
+        TaskParser(backend).parse("Coordinate tennis")
+
+
+def test_task_parser_accepts_valid_recurring_plan() -> None:
+    backend = Backend(
+        {
+            "task_parser": {
+                "scheduled_at": "2026-08-27T17:00:00-04:00",
+                "duration_minutes": 60,
+                "location": None,
+                "topic_key": "tennis",
+                "participant_references": ["Alex"],
+                "recurrence_rule": "FREQ=WEEKLY",
+                "timezone": "America/Toronto",
+            }
+        }
+    )
+    parsed = TaskParser(backend).parse("Coordinate weekly tennis")
+    assert parsed.recurrence_rule == "FREQ=WEEKLY"
+    assert parsed.timezone == "America/Toronto"
 
 
 def test_malformed_or_tool_shaped_output_fails_closed() -> None:
