@@ -292,7 +292,7 @@ def test_database_validator_context_contains_only_facts_allowed_for_exact_destin
     db_session.commit()
     factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
     facts = DatabaseContextProvider()
-    contexts = DatabaseValidatorContextProvider(factory, facts=facts)
+    contexts = DatabaseValidatorContextProvider(factory, facts=facts, owner_chat_id=99)
 
     blocked = contexts.context_for(message.id, message.message_kind)
     assert not any("Alex availability" in claim for claim in blocked.allowed_claims)

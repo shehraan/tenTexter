@@ -38,7 +38,11 @@ def _run_outbox_worker(app: Application, *, once: bool) -> None:
     gate = OutboxValidatorGate(
         app.sessions,
         validator=validator,
-        contexts=DatabaseValidatorContextProvider(app.sessions, facts=facts),
+        contexts=DatabaseValidatorContextProvider(
+            app.sessions,
+            facts=facts,
+            owner_chat_id=getattr(app.settings, "owner_chat_id", None),
+        ),
         owner_chat_id=getattr(app.settings, "owner_chat_id", None),
     )
     worker = OutboxWorker(

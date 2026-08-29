@@ -579,7 +579,11 @@ def build_runtime(
         validator=OutboxValidatorGate(
             sessions,
             validator=independent_validator,
-            contexts=DatabaseValidatorContextProvider(sessions, facts=facts),
+            contexts=DatabaseValidatorContextProvider(
+                sessions,
+                facts=facts,
+                owner_chat_id=settings.owner_chat_id,
+            ),
             owner_chat_id=settings.owner_chat_id,
         ),
         adapters={Transport.BEEPER: beeper, Transport.TELEGRAM: telegram},

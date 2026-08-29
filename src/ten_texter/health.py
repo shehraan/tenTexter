@@ -1,11 +1,55 @@
 from __future__ import annotations
 
+import re
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ten_texter.enums import MessageKind, ParentTerminalPolicy, Transport
-from ten_texter.models import OutboxMessage
+from ten_texter.enums import DestinationKind, MessageKind, ParentTerminalPolicy, Transport
+from ten_texter.models import OutboxMessage, TelegramOutboxDestination
 from ten_texter.outbox import OutboxService
+
+
+_HEALTH_KEY = re.compile(
+    r"health:(?P<dependency>[a-z][a-z0-9-]*):unhealthy:(?P<generation>[1-9][0-9]*)"
+)
+_HEALTH_DETAIL_TOKEN = r"[A-Za-z][A-Za-z0-9_-]*(?:\.[A-Za-z][A-Za-z0-9_-]*)*"
+_HEALTH_DETAIL = re.compile(rf"{_HEALTH_DETAIL_TOKEN}(?: {_HEALTH_DETAIL_TOKEN})*")
+
+
+def owner_health_claim(
+    session: Session,
+    message: OutboxMessage,
+    *,
+    owner_chat_id: int | None,
+) -> str | None:
+    """Return the exact persisted claim only for a canonical owner health notification."""
+    if (
+        owner_chat_id is None
+        or message.transport is not Transport.TELEGRAM
+        or message.destination_kind is not DestinationKind.OWNER
+        or message.message_kind is not MessageKind.NOTIFICATION
+        or message.task_instance_id is not None
+        or message.trigger_execution_id is not None
+        or message.corrects_outbox_message_id is not None
+        or message.parent_terminal_policy is not ParentTerminalPolicy.SURVIVE
+    ):
+        return None
+    key = _HEALTH_KEY.fullmatch(message.idempotency_key)
+    if key is None:
+        return None
+    destination = session.get(TelegramOutboxDestination, message.id)
+    if destination is None or destination.telegram_chat_id != owner_chat_id:
+        return None
+    dependency = key.group("dependency")
+    prefix = f"{dependency} became unhealthy."
+    if message.final_text == prefix:
+        return message.final_text
+    detail_prefix = f"{prefix} "
+    if not message.final_text.startswith(detail_prefix):
+        return None
+    detail = message.final_text.removeprefix(detail_prefix)
+    return message.final_text if _HEALTH_DETAIL.fullmatch(detail) else None
 
 
 class HealthMonitor:
