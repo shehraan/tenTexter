@@ -470,9 +470,107 @@ def test_task_parser_strict_structured_output() -> None:
     assert "recurrence wall-clock state" in instructions
     assert "must both be null" in instructions
     assert "current_datetime" in instructions
+    assert "Respect any explicit timezone" in instructions
+    assert "include a UTC offset" in instructions
+    assert "valid IANA timezone" in instructions
     payload = backend.calls[0][1]
     assert payload["current_datetime"] == "2026-08-26T12:00:00-04:00"
     assert payload["owner_timezone"] == "America/Toronto"
+
+
+@pytest.mark.parametrize(
+    ("instruction", "scheduled_at"),
+    [
+        (
+            "Ask Alex about tennis tomorrow at 5 PM for 60 minutes",
+            "2026-08-30T17:00:00-04:00",
+        ),
+        (
+            "Ask Alex about tennis on August 30, 2026 at 5 PM Eastern for 60 minutes",
+            "2026-08-30T17:00:00-04:00",
+        ),
+        (
+            "Ask Alex about tennis on August 30, 2026 at 21:00 UTC for 60 minutes",
+            "2026-08-30T21:00:00Z",
+        ),
+    ],
+)
+def test_task_parser_normalizes_absolute_time_from_trusted_temporal_context(
+    instruction: str,
+    scheduled_at: str,
+) -> None:
+    backend = Backend(
+        {
+            "task_parser": {
+                "scheduled_at": scheduled_at,
+                "duration_minutes": 60,
+                "location": None,
+                "topic_key": "tennis",
+                "participant_references": ["Alex"],
+                "recurrence_rule": None,
+                "timezone": None,
+            }
+        }
+    )
+
+    parsed = TaskParser(
+        backend,
+        owner_timezone="America/Toronto",
+        clock=lambda: datetime(2026, 8, 29, 17, tzinfo=UTC),
+    ).parse(instruction)
+
+    assert not isinstance(parsed, TaskParseReview)
+    assert parsed.scheduled_at.isoformat() == "2026-08-30T21:00:00+00:00"
+    assert parsed.recurrence_rule is None
+    assert parsed.timezone is None
+    assert backend.calls[0][1]["current_datetime"] == "2026-08-29T13:00:00-04:00"
+    assert backend.calls[0][1]["owner_timezone"] == "America/Toronto"
+
+
+def test_task_parser_rejects_naive_model_timestamp() -> None:
+    backend = Backend(
+        {
+            "task_parser": {
+                "scheduled_at": "2026-08-30T17:00:00",
+                "duration_minutes": 60,
+                "location": None,
+                "topic_key": "tennis",
+                "participant_references": ["Alex"],
+                "recurrence_rule": None,
+                "timezone": None,
+            }
+        }
+    )
+
+    with pytest.raises(ModelOutputError, match="must include a UTC offset"):
+        TaskParser(
+            backend,
+            owner_timezone="America/Toronto",
+            clock=lambda: datetime(2026, 8, 29, 17, tzinfo=UTC),
+        ).parse("Ask Alex about tennis tomorrow at 5 PM for 60 minutes")
+
+
+def test_task_parser_rejects_invalid_iana_recurrence_timezone() -> None:
+    backend = Backend(
+        {
+            "task_parser": {
+                "scheduled_at": "2026-08-30T17:00:00-04:00",
+                "duration_minutes": 60,
+                "location": None,
+                "topic_key": "tennis",
+                "participant_references": ["Alex"],
+                "recurrence_rule": "FREQ=WEEKLY",
+                "timezone": "Eastern",
+            }
+        }
+    )
+
+    with pytest.raises(ModelOutputError, match="valid IANA timezone"):
+        TaskParser(
+            backend,
+            owner_timezone="America/Toronto",
+            clock=lambda: datetime(2026, 8, 29, 17, tzinfo=UTC),
+        ).parse("Ask Alex about tennis every Sunday at 5 PM for 60 minutes")
 
 
 def test_task_parser_missing_time_and_duration_requires_review() -> None:

@@ -118,6 +118,14 @@ class TaskPlan(StrictOutput):
     def recurrence_fields_pair(self) -> "TaskPlan":
         if (self.recurrence_rule is None) != (self.timezone is None):
             raise ValueError("recurrence_rule and timezone must be provided together")
+        if self.scheduled_at.tzinfo is None or self.scheduled_at.utcoffset() is None:
+            raise ValueError("scheduled_at must include a UTC offset")
+        if self.timezone is not None:
+            try:
+                ZoneInfo(self.timezone)
+            except ZoneInfoNotFoundError as exc:
+                raise ValueError("recurrence timezone must be a valid IANA timezone") from exc
+        self.scheduled_at = self.scheduled_at.astimezone(UTC)
         return self
 
 
@@ -328,11 +336,14 @@ class TaskParser:
                 "trusted_instructions": (
                     "Parse the owner's coordination request into the bounded schema. "
                     "Resolve relative dates and times against current_datetime in owner_timezone. "
+                    "Respect any explicit timezone in the owner instruction. scheduled_at must "
+                    "include a UTC offset and represent the absolute instant, preferably in UTC. "
                     "Never invent an activity, start time, duration, participant, or location. "
                     "When any required fact is absent or ambiguous, return only review_reason "
                     "explaining what the owner must clarify. The topic is the activity, never a "
                     "participant's name. "
-                    "Timezone is recurrence wall-clock state; for a one-time task, "
+                    "Timezone is recurrence wall-clock state and must be a valid IANA timezone; "
+                    "for a one-time task, "
                     "recurrence_rule and timezone must both be null."
                 ),
                 "current_datetime": local_now.isoformat(),
@@ -343,8 +354,6 @@ class TaskParser:
         if "review_reason" in output:
             return _validate(TaskParseReview, output)
         parsed: TaskPlan = _validate(TaskPlan, output)
-        if parsed.scheduled_at.tzinfo is None or parsed.scheduled_at.utcoffset() is None:
-            raise ModelOutputError("task_parser scheduled_at must include a UTC offset")
         if parsed.recurrence_rule is None and parsed.scheduled_at <= now:
             raise ModelOutputError("task_parser produced a past one-time scheduled_at")
         missing = self._missing_explicit_task_facts(text)

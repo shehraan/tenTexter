@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy.orm import Session
@@ -61,6 +61,50 @@ def test_task_creation_rejects_unpinned_person(db_session: Session) -> None:
             topic_key="Bad Route",
             participants=[(9999, core["conversation"].id)],  # type: ignore[union-attr]
         )
+
+
+def test_task_service_rejects_naive_authoritative_scheduled_at(
+    db_session: Session,
+) -> None:
+    with pytest.raises(DomainError, match="timezone-aware"):
+        TaskService(db_session).create(
+            scheduled_at=datetime(2026, 8, 30, 17),
+            duration_minutes=60,
+            topic_key="tennis",
+        )
+
+
+def test_task_service_normalizes_authoritative_scheduled_at_to_utc(
+    db_session: Session,
+) -> None:
+    task = TaskService(db_session).create(
+        scheduled_at=datetime.fromisoformat("2026-08-30T17:00:00-04:00"),
+        duration_minutes=60,
+        topic_key="tennis",
+    )
+
+    assert task.scheduled_at.tzinfo is UTC
+    assert task.scheduled_at.isoformat() == "2026-08-30T21:00:00+00:00"
+
+
+def test_task_service_reschedule_rejects_naive_and_normalizes_to_utc(
+    db_session: Session,
+) -> None:
+    task = seed_core(db_session)["task"]
+    original_scheduled_at = task.scheduled_at
+    service = TaskService(db_session)
+
+    with pytest.raises(DomainError, match="timezone-aware"):
+        service.reschedule(task.id, datetime(2026, 8, 31, 17))
+    assert task.scheduled_at == original_scheduled_at
+
+    service.reschedule(
+        task.id,
+        datetime.fromisoformat("2026-08-31T17:00:00-04:00"),
+    )
+
+    assert task.scheduled_at.tzinfo is UTC
+    assert task.scheduled_at.isoformat() == "2026-08-31T21:00:00+00:00"
 
 
 def test_terminalization_is_atomic_and_respects_survive(db_session: Session) -> None:

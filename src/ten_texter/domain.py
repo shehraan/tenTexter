@@ -71,6 +71,12 @@ def normalize_topic_key(value: str) -> str:
     return normalized
 
 
+def _normalize_absolute_instant(value: datetime, *, field: str) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise DomainError(f"{field} must be timezone-aware")
+    return value.astimezone(UTC)
+
+
 class TaskService:
     def __init__(self, session: Session):
         self.session = session
@@ -87,6 +93,10 @@ class TaskService:
         location: str | None = None,
         coordination_close_offset_minutes: int = 60,
     ) -> TaskInstance:
+        scheduled_at = _normalize_absolute_instant(
+            scheduled_at,
+            field="scheduled_at",
+        )
         participant_pairs = list(participants)
         person_ids = [person_id for person_id, _conversation_id in participant_pairs]
         if len(person_ids) != len(set(person_ids)):
@@ -127,6 +137,10 @@ class TaskService:
         return task
 
     def reschedule(self, task_id: int, scheduled_at: datetime) -> TaskInstance:
+        scheduled_at = _normalize_absolute_instant(
+            scheduled_at,
+            field="scheduled_at",
+        )
         task = self._active(task_id)
         task.scheduled_at = scheduled_at
         task.updated_at = utc_now()
