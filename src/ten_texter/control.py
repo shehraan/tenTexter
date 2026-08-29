@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -47,6 +48,11 @@ from ten_texter.validator import (
     ValidatorContext,
 )
 from ten_texter.workflows import CoordinationWorkflow, ParticipantSendPlan
+
+
+# Keeps entity-resolution prompts safely below the v1 local model context window.
+MAX_SEMANTIC_ROUTE_CANDIDATES = 20
+SEMANTIC_ROUTE_FIELD_MAX_CHARS = 96
 
 
 @dataclass(frozen=True, slots=True)
@@ -559,10 +565,14 @@ class ProductionOwnerCommandHandler:
                 for key in keys
             )
         ]
-        pool = exact or candidates
-        chosen: dict[str, object] | None = pool[0] if len(pool) == 1 else None
-        if chosen is None and pool:
-            selected_id = self.resolver.resolve(reference, pool)
+        if len(exact) == 1:
+            chosen = exact[0]
+        else:
+            pool = exact or self._lexical_route_candidates(reference, candidates)
+            if not pool or len(pool) > MAX_SEMANTIC_ROUTE_CANDIDATES:
+                return None
+            semantic_pool = [self._compact_route_candidate(candidate) for candidate in pool]
+            selected_id = self.resolver.resolve(reference, semantic_pool)
             matches = [candidate for candidate in pool if candidate["id"] == selected_id]
             chosen = matches[0] if len(matches) == 1 else None
         if chosen is None:
@@ -572,3 +582,67 @@ class ProductionOwnerCommandHandler:
             conversation_id=int(chosen["conversation_id"]),
             display_name=str(chosen["display_name"]),
         )
+
+    @staticmethod
+    def _lexical_route_candidates(
+        reference: str,
+        candidates: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        reference_tokens = ProductionOwnerCommandHandler._route_tokens(reference)
+        if not reference_tokens:
+            return []
+        searchable_keys = (
+            "person_name",
+            "identity_username",
+            "identity_display_name",
+            "conversation_title",
+            "network",
+            "beeper_user_id",
+            "beeper_conversation_id",
+        )
+        plausible: list[dict[str, object]] = []
+        for candidate in candidates:
+            candidate_tokens = {
+                token
+                for key in searchable_keys
+                if isinstance(candidate.get(key), str)
+                for token in ProductionOwnerCommandHandler._route_tokens(str(candidate[key]))
+            }
+            if all(
+                any(
+                    token == candidate_token
+                    or candidate_token.startswith(token)
+                    or token in candidate_token
+                    for candidate_token in candidate_tokens
+                )
+                for token in reference_tokens
+            ):
+                plausible.append(candidate)
+        return plausible
+
+    @staticmethod
+    def _route_tokens(value: str) -> tuple[str, ...]:
+        normalized = " ".join(value.strip().casefold().lstrip("@").split())
+        return tuple(re.findall(r"[^\W_]+", normalized))
+
+    @staticmethod
+    def _compact_route_candidate(candidate: dict[str, object]) -> dict[str, object]:
+        keys = (
+            "id",
+            "person_name",
+            "identity_username",
+            "identity_display_name",
+            "conversation_title",
+            "network",
+        )
+        compact: dict[str, object] = {}
+        for key in keys:
+            value = candidate.get(key)
+            if value is None:
+                continue
+            compact[key] = (
+                value[:SEMANTIC_ROUTE_FIELD_MAX_CHARS]
+                if isinstance(value, str)
+                else value
+            )
+        return compact
