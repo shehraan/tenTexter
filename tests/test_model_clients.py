@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import json
+
+import httpx
 import pytest
 
 from ten_texter.domain import AwaitedResponseService
 from ten_texter.enums import AvailabilityStatus
 from ten_texter.model_clients import (
     EntityResolverAssistant,
+    HTTPModelBackend,
     MessageClassifier,
     MessageGenerator,
     ModelOutputError,
+    ModelUnavailable,
     SemanticCorrelationFallback,
     TaskParser,
 )
@@ -23,6 +28,88 @@ class Backend:
     def infer(self, *, operation: str, payload: dict[str, object]) -> dict[str, object]:
         self.calls.append((operation, payload))
         return self.outputs[operation]
+
+
+def test_http_backend_uses_llama_chat_completions_with_schema() -> None:
+    request_seen: dict[str, object] = {}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        request_seen["url"] = str(request.url)
+        request_seen["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"role": "assistant", "content": '{"text":"Hello"}'}}
+                ]
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(respond))
+    output = HTTPModelBackend("http://model.test", client=client).infer(
+        operation="message_generator",
+        payload={"trusted_instructions": "Generate safely", "goal": "greet"},
+    )
+
+    assert output == {"text": "Hello"}
+    assert request_seen["url"] == "http://model.test/v1/chat/completions"
+    body = request_seen["body"]
+    assert isinstance(body, dict)
+    assert body["stream"] is False
+    assert body["temperature"] == 0
+    assert body["messages"][0]["role"] == "system"
+    assert json.loads(body["messages"][1]["content"])["operation"] == "message_generator"
+    assert body["response_format"]["type"] == "json_object"
+    assert body["response_format"]["schema"]["additionalProperties"] is False
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    ["http://model.test/v1", "http://model.test/v1/chat/completions"],
+)
+def test_http_backend_normalizes_llama_endpoint(base_url: str) -> None:
+    urls: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        urls.append(str(request.url))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
+
+    HTTPModelBackend(base_url, client=httpx.Client(transport=httpx.MockTransport(respond))).infer(
+        operation="unknown_test_operation",
+        payload={},
+    )
+    assert urls == ["http://model.test/v1/chat/completions"]
+
+
+@pytest.mark.parametrize(
+    "response_body",
+    [
+        {},
+        {"choices": []},
+        {"choices": [{"message": {"content": "not json"}}]},
+        {"choices": [{"message": {"content": "[]"}}]},
+    ],
+)
+def test_http_backend_rejects_malformed_chat_completion(response_body: object) -> None:
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=response_body))
+    )
+    with pytest.raises(ModelOutputError):
+        HTTPModelBackend("http://model.test", client=client).infer(
+            operation="unknown_test_operation",
+            payload={},
+        )
+
+
+def test_http_backend_reports_http_failure_as_unavailable() -> None:
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(503, text="unavailable"))
+    )
+    with pytest.raises(ModelUnavailable):
+        HTTPModelBackend("http://model.test", client=client).infer(
+            operation="unknown_test_operation",
+            payload={},
+        )
 
 
 def test_task_parser_strict_structured_output() -> None:

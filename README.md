@@ -47,7 +47,7 @@ Use `uv run ten-texter run --once` for one complete polling pass. The runtime po
 
 - Telegram uses Bot API long polling for owner updates and `sendMessage` only through Outbox. Create a bot with BotFather, set the owner’s numeric user/chat IDs, and provide the token.
 - Beeper uses the local Desktop REST v1 API at `http://127.0.0.1:23373` by default. Enable Desktop API access, provide its token, and keep Beeper Desktop running. Chats remain distinct; tenTexter never assumes merged conversations.
-- The primary and validator model servers are independently configured at `/v1/infer`. Each accepts `{operation, input}` and returns `{output}` conforming to the strict operation schema. Tests replace both with fakes.
+- The primary and validator model servers are independent llama.cpp servers. Configure each server's base URL (or its full `/v1/chat/completions` URL); tenTexter sends non-streaming OpenAI-compatible chat requests with schema-constrained JSON output and then strictly validates the returned `choices[0].message.content`. Tests replace both with fakes.
 
 The Beeper adapter follows the documented v1 chat/message endpoints. A successful send request returns a pending message ID and therefore enters reconciliation until a final successful provider message is observed. WebSocket delivery remains optional/experimental; provider event ingestion is exposed through the adapter’s deterministic sync/ingestion boundary.
 

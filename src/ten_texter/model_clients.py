@@ -26,25 +26,66 @@ class ModelBackend(Protocol):
 
 
 class HTTPModelBackend:
-    """Small replaceable protocol for a local model server."""
+    """OpenAI-compatible adapter for a dedicated local llama.cpp server."""
 
     def __init__(self, base_url: str, *, client: httpx.Client | None = None):
         self.base_url = base_url.rstrip("/")
         self.client = client or httpx.Client(timeout=60)
 
     def infer(self, *, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.base_url.endswith("/v1/chat/completions"):
+            endpoint = self.base_url
+        elif self.base_url.endswith("/v1"):
+            endpoint = f"{self.base_url}/chat/completions"
+        else:
+            endpoint = f"{self.base_url}/v1/chat/completions"
+
+        trusted_instructions = payload.get("trusted_instructions")
+        if not isinstance(trusted_instructions, str):
+            trusted_instructions = "Return the requested structured result."
+        model_input = {key: value for key, value in payload.items() if key != "trusted_instructions"}
+        request_body: dict[str, Any] = {
+            "model": "local-model",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a bounded tenTexter model component. "
+                        "Return only one JSON object matching the supplied response schema. "
+                        "Never invoke tools or perform side effects. "
+                        f"Operation instructions: {trusted_instructions}"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {"operation": operation, "input": model_input},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                },
+            ],
+            "temperature": 0,
+            "stream": False,
+            "response_format": {
+                "type": "json_object",
+                "schema": _operation_json_schema(operation),
+            },
+        }
         try:
-            response = self.client.post(
-                f"{self.base_url}/v1/infer",
-                json={"operation": operation, "input": payload},
-            )
+            response = self.client.post(endpoint, json=request_body)
             response.raise_for_status()
             body = response.json()
         except Exception as exc:
             raise ModelUnavailable(f"model request failed: {exc}") from exc
-        output = body.get("output") if isinstance(body, dict) else None
+
+        try:
+            content = body["choices"][0]["message"]["content"]
+            output = json.loads(content)
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+            raise ModelOutputError("model response must contain JSON object message content") from exc
         if not isinstance(output, dict):
-            raise ModelOutputError("model response must contain an object output")
+            raise ModelOutputError("model message content must decode to an object")
         return output
 
 
@@ -122,6 +163,25 @@ class EntityResolutionOutput(StrictOutput):
 
 class GeneratedMessage(StrictOutput):
     text: str = Field(min_length=1, max_length=4096)
+
+
+def _operation_json_schema(operation: str) -> dict[str, Any]:
+    schemas: dict[str, type[StrictOutput]] = {
+        "task_parser": TaskPlan,
+        "message_classifier": ClassificationOutput,
+        "semantic_correlation": CorrelationOutput,
+        "entity_resolution": EntityResolutionOutput,
+        "message_generator": GeneratedMessage,
+    }
+    schema = schemas.get(operation)
+    if schema is None and operation == "message_validator":
+        # Imported lazily to avoid model_clients <-> validator initialization cycles.
+        from ten_texter.validator import ValidatorOutput
+
+        schema = ValidatorOutput
+    if schema is None:
+        return {"type": "object"}
+    return schema.model_json_schema()
 
 
 class TaskParser:

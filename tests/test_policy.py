@@ -304,7 +304,7 @@ def test_database_validator_context_contains_only_facts_allowed_for_exact_destin
         source_conversation_id=core["conversation"].id,
         destination_conversation_id=destination,
         task_instance_id=core["task"].id,
-        expires_at=NOW + timedelta(days=2),
+        expires_at=utc_now() + timedelta(days=2),
     )
     db_session.commit()
 
@@ -334,7 +334,7 @@ def test_disclosure_revocation_during_validation_cancels_before_transport(
         source_conversation_id=core["conversation"].id,
         destination_conversation_id=destination,
         task_instance_id=core["task"].id,
-        expires_at=NOW + timedelta(days=2),
+        expires_at=utc_now() + timedelta(days=2),
     )
     message = OutboxService(db_session).create_beeper(
         task_instance_id=core["task"].id,
