@@ -359,7 +359,7 @@ def test_production_runtime_composes_owner_command_through_durable_send(
                     "message": {
                         "from": {"id": 7},
                         "chat": {"id": 9, "type": "private"},
-                        "text": "Set up tennis with Alex.",
+                        "text": "Set up tennis with Alex at 5 PM for 60 minutes.",
                     },
                 }
             ]

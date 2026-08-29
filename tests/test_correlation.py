@@ -37,6 +37,8 @@ from ten_texter.models import (
 from ten_texter.control import ProductionOwnerCommandHandler
 from ten_texter.telegram import TelegramControlGateway
 from ten_texter.outbox import OutboxService
+from ten_texter.policy import DatabaseContextProvider
+from ten_texter.validator import DatabaseValidatorContextProvider
 from tests.test_schema import NOW, seed_core
 
 
@@ -88,6 +90,47 @@ def test_exact_conversation_single_open_response_correlates(db_session: Session)
     assert response.status is AwaitedResponseStatus.SATISFIED
     assert core["revision"].awaited_response_id == response.id
     assert core["participant"].availability_status is AvailabilityStatus.AVAILABLE
+
+
+def test_availability_reply_creates_one_durable_owner_notification(
+    db_session: Session,
+) -> None:
+    core = seed_core(db_session)
+    response = awaited(db_session, core)
+    service = CorrelationOrchestrator(
+        db_session,
+        semantic=Semantic(),
+        classifier=Classifier(
+            Classification(kind="AVAILABILITY", availability=AvailabilityStatus.AVAILABLE)
+        ),
+        owner_chat_id=99,
+    )
+
+    service.process(core["revision"].id)
+    service.process(core["revision"].id)
+
+    notices = list(
+        db_session.scalars(
+            select(OutboxMessage).where(
+                OutboxMessage.idempotency_key
+                == (
+                    f"task:{core['task'].id}:availability:{core['participant'].id}:"
+                    f"revision:{core['revision'].id}"
+                )
+            )
+        )
+    )
+    assert response.status is AwaitedResponseStatus.SATISFIED
+    assert len(notices) == 1
+    assert notices[0].final_text == "Alex is available for tennis."
+    db_session.commit()
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    context = DatabaseValidatorContextProvider(
+        factory,
+        facts=DatabaseContextProvider(),
+        owner_chat_id=99,
+    ).context_for(notices[0].id, notices[0].message_kind)
+    assert "Alex availability is available" in context.allowed_claims
 
 
 def test_correlation_ambiguity_is_not_guessed(db_session: Session) -> None:

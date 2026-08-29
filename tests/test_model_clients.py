@@ -21,6 +21,7 @@ from ten_texter.model_clients import (
     ModelOutputError,
     ModelUnavailable,
     SemanticCorrelationFallback,
+    TaskParseReview,
     TaskParser,
     _operation_json_schema,
     classification_output_json_schema,
@@ -141,8 +142,8 @@ def test_task_parser_llama_schema_pairs_recurrence_and_timezone() -> None:
     ).infer(operation="task_parser", payload={})
 
     schema = request_body["response_format"]["schema"]
-    assert len(schema["oneOf"]) == 2
-    one_time, recurring = schema["oneOf"]
+    assert len(schema["oneOf"]) == 3
+    one_time, recurring, review = schema["oneOf"]
     assert one_time["properties"]["recurrence_rule"] == {"type": "null"}
     assert one_time["properties"]["timezone"] == {"type": "null"}
     assert recurring["properties"]["recurrence_rule"] == {
@@ -170,6 +171,14 @@ def test_task_parser_llama_schema_pairs_recurrence_and_timezone() -> None:
         assert branch["properties"]["topic_key"]["maxLength"] == 300
         assert branch["properties"]["participant_references"]["minItems"] == 1
         assert branch["properties"]["participant_references"]["maxItems"] == 100
+    assert review == {
+        "type": "object",
+        "properties": {
+            "review_reason": {"type": "string", "minLength": 1, "maxLength": 500}
+        },
+        "required": ["review_reason"],
+        "additionalProperties": False,
+    }
 
 
 def test_message_classifier_llama_schema_discriminates_semantic_shapes() -> None:
@@ -454,7 +463,7 @@ def test_task_parser_strict_structured_output() -> None:
         backend,
         owner_timezone="America/Toronto",
         clock=lambda: datetime(2026, 8, 26, 16, tzinfo=UTC),
-    ).parse("Ask Alex about tennis tomorrow")
+    ).parse("Ask Alex about tennis tomorrow at 5 PM for 60 minutes")
     assert parsed.topic_key == "tennis"
     assert parsed.duration_minutes == 60
     instructions = backend.calls[0][1]["trusted_instructions"]
@@ -464,6 +473,70 @@ def test_task_parser_strict_structured_output() -> None:
     payload = backend.calls[0][1]
     assert payload["current_datetime"] == "2026-08-26T12:00:00-04:00"
     assert payload["owner_timezone"] == "America/Toronto"
+
+
+def test_task_parser_missing_time_and_duration_requires_review() -> None:
+    backend = Backend(
+        {
+            "task_parser": {
+                "scheduled_at": "2026-08-30T09:00:00Z",
+                "duration_minutes": 15,
+                "location": None,
+                "topic_key": "shehraan-canada",
+                "participant_references": ["Shehraan Canada"],
+                "recurrence_rule": None,
+                "timezone": None,
+            }
+        }
+    )
+
+    parsed = TaskParser(
+        backend,
+        owner_timezone="America/Toronto",
+        clock=lambda: datetime(2026, 8, 29, 17, tzinfo=UTC),
+    ).parse("Ask Shehraan Canada if he's free for tennis tomorrow")
+
+    assert isinstance(parsed, TaskParseReview)
+    assert "precise start time" in parsed.review_reason
+    assert "duration" in parsed.review_reason
+
+
+def test_task_parser_participant_name_cannot_replace_explicit_topic() -> None:
+    backend = Backend(
+        {
+            "task_parser": {
+                "scheduled_at": "2026-08-30T21:00:00Z",
+                "duration_minutes": 60,
+                "location": None,
+                "topic_key": "shehraan-canada",
+                "participant_references": ["Shehraan Canada"],
+                "recurrence_rule": None,
+                "timezone": None,
+            }
+        }
+    )
+
+    parsed = TaskParser(
+        backend,
+        owner_timezone="America/Toronto",
+        clock=lambda: datetime(2026, 8, 29, 17, tzinfo=UTC),
+    ).parse(
+        "Ask Shehraan Canada about tennis tomorrow at 5 PM for 60 minutes"
+    )
+
+    assert isinstance(parsed, TaskParseReview)
+    assert "activity/topic" in parsed.review_reason
+
+
+def test_task_parser_accepts_model_clarification_outcome() -> None:
+    backend = Backend(
+        {"task_parser": {"review_reason": "What time should tennis start?"}}
+    )
+
+    parsed = TaskParser(backend).parse("Ask Alex about tennis tomorrow")
+
+    assert isinstance(parsed, TaskParseReview)
+    assert parsed.review_reason == "What time should tennis start?"
 
 
 def test_task_parser_rejects_past_one_time_task() -> None:
@@ -527,7 +600,9 @@ def test_task_parser_accepts_valid_recurring_plan() -> None:
             }
         }
     )
-    parsed = TaskParser(backend).parse("Coordinate weekly tennis")
+    parsed = TaskParser(backend).parse(
+        "Coordinate weekly tennis at 5 PM for 60 minutes"
+    )
     assert parsed.recurrence_rule == "FREQ=WEEKLY"
     assert parsed.timezone == "America/Toronto"
 

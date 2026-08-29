@@ -23,7 +23,7 @@ from ten_texter.enums import (
     OutboxStatus,
     ProposalStatus,
 )
-from ten_texter.model_clients import EntityResolverAssistant, TaskPlan
+from ten_texter.model_clients import EntityResolverAssistant, TaskParseReview, TaskPlan
 from ten_texter.models import (
     Conversation,
     ConversationParticipant,
@@ -64,7 +64,7 @@ class ResolvedRoute:
 
 @dataclass(frozen=True, slots=True)
 class PreparedOwnerCommand:
-    plan: TaskPlan
+    plan: TaskPlan | None
     sends: tuple[ParticipantSendPlan, ...] = ()
     review_reason: str | None = None
 
@@ -162,6 +162,8 @@ class ProductionOwnerCommandHandler:
         return PreparedOwnerDecision(action, selected_id)
 
     def prepare_command(self, parsed: object, _update: TelegramUpdate) -> PreparedOwnerCommand:
+        if isinstance(parsed, TaskParseReview):
+            return PreparedOwnerCommand(None, review_reason=parsed.review_reason)
         if not isinstance(parsed, TaskPlan):
             raise DomainError("owner parser returned an unsupported plan")
         with self.sessions() as session:
@@ -270,6 +272,8 @@ class ProductionOwnerCommandHandler:
                 )
             )
             return
+        if prepared.plan is None:
+            raise DomainError("reviewed owner command has no executable task plan")
         if prepared.plan.recurrence_rule is not None and prepared.plan.timezone is not None:
             local_time = prepared.plan.scheduled_at.astimezone(
                 ZoneInfo(prepared.plan.timezone)

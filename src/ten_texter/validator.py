@@ -12,6 +12,7 @@ from ten_texter.domain import DecisionService
 from ten_texter.enums import (
     MessageKind,
     ParentTerminalPolicy,
+    Transport,
     ValidatorCategory,
 )
 from ten_texter.model_clients import MessageGenerator, ModelBackend, StrictOutput, _validate
@@ -173,11 +174,15 @@ class DatabaseValidatorContextProvider:
                         "claim; it does not authorize any other fact or commitment.",
                     ),
                 )
-            disclosed = self.facts.facts_for(session, message)
+            if message.transport is Transport.TELEGRAM:
+                contextual_facts = self.facts.candidate_facts(session, message)
+                scopes: tuple[str, ...] = ()
+            else:
+                contextual_facts = self.facts.facts_for(session, message)
+                scopes = tuple(sorted({fact.scope.value for fact in contextual_facts}))
             allowed_claims = self.facts.task_claims(session, message) + tuple(
-                str(fact.value) for fact in disclosed
+                str(fact.value) for fact in contextual_facts
             )
-            scopes = tuple(sorted({fact.scope.value for fact in disclosed}))
             return ValidatorContext(
                 message_kind=message_kind,
                 allowed_claims=allowed_claims,

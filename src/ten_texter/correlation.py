@@ -34,6 +34,7 @@ from ten_texter.models import (
     MessageRevision,
     OutboxDeliveryAttempt,
     OutboxMessage,
+    Person,
     Proposal,
     TaskEvent,
     TaskInstance,
@@ -381,6 +382,22 @@ class CorrelationOrchestrator:
                 classification.evidence,
             )
             awaited.status = AwaitedResponseStatus.SATISFIED
+            if self.owner_chat_id is not None:
+                person = self.session.get(Person, participant.person_id)
+                assert person is not None
+                status = classification.availability.value.lower()
+                OutboxService(self.session).create_owner(
+                    telegram_chat_id=self.owner_chat_id,
+                    task_instance_id=task.id,
+                    final_text=(
+                        f"{person.display_name} is {status} for {task.topic_key}."
+                    ),
+                    message_kind=MessageKind.NOTIFICATION,
+                    idempotency_key=(
+                        f"task:{task.id}:availability:{participant.id}:revision:{revision.id}"
+                    ),
+                    parent_terminal_policy=ParentTerminalPolicy.SURVIVE,
+                )
         elif classification.kind == "COUNTERPROPOSAL" and classification.proposals:
             for atomic in proposals_to_create:
                 proposal = Proposal(

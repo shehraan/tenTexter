@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import Enum
@@ -120,6 +121,10 @@ class TaskPlan(StrictOutput):
         return self
 
 
+class TaskParseReview(StrictOutput):
+    review_reason: str = Field(min_length=1, max_length=500)
+
+
 def task_plan_json_schema() -> dict[str, Any]:
     """llama.cpp-compatible TaskPlan schema with paired recurrence fields."""
     generated = TaskPlan.model_json_schema()
@@ -157,6 +162,18 @@ def task_plan_json_schema() -> dict[str, Any]:
                 {"type": "string", "minLength": 1},
                 {"type": "string", "minLength": 1},
             ),
+            {
+                "type": "object",
+                "properties": {
+                    "review_reason": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 500,
+                    }
+                },
+                "required": ["review_reason"],
+                "additionalProperties": False,
+            },
         ],
     }
 
@@ -300,7 +317,7 @@ class TaskParser:
             raise ValueError(f"unknown owner timezone: {owner_timezone}") from exc
         self.clock = clock or (lambda: datetime.now(UTC))
 
-    def parse(self, text: str) -> TaskPlan:
+    def parse(self, text: str) -> TaskPlan | TaskParseReview:
         now = self.clock()
         if now.tzinfo is None or now.utcoffset() is None:
             raise ValueError("task parser clock must return an aware datetime")
@@ -311,6 +328,10 @@ class TaskParser:
                 "trusted_instructions": (
                     "Parse the owner's coordination request into the bounded schema. "
                     "Resolve relative dates and times against current_datetime in owner_timezone. "
+                    "Never invent an activity, start time, duration, participant, or location. "
+                    "When any required fact is absent or ambiguous, return only review_reason "
+                    "explaining what the owner must clarify. The topic is the activity, never a "
+                    "participant's name. "
                     "Timezone is recurrence wall-clock state; for a one-time task, "
                     "recurrence_rule and timezone must both be null."
                 ),
@@ -319,12 +340,61 @@ class TaskParser:
                 "owner_instruction": text,
             },
         )
+        if "review_reason" in output:
+            return _validate(TaskParseReview, output)
         parsed: TaskPlan = _validate(TaskPlan, output)
         if parsed.scheduled_at.tzinfo is None or parsed.scheduled_at.utcoffset() is None:
             raise ModelOutputError("task_parser scheduled_at must include a UTC offset")
         if parsed.recurrence_rule is None and parsed.scheduled_at <= now:
             raise ModelOutputError("task_parser produced a past one-time scheduled_at")
+        missing = self._missing_explicit_task_facts(text)
+        if missing:
+            return TaskParseReview(
+                review_reason=(
+                    "The command must explicitly provide " + ", ".join(missing) + "."
+                )
+            )
+        if not self._topic_is_supported_by_instruction(text, parsed):
+            return TaskParseReview(
+                review_reason="The activity/topic could not be grounded in the owner command."
+            )
         return parsed
+
+    @staticmethod
+    def _missing_explicit_task_facts(text: str) -> tuple[str, ...]:
+        normalized = " ".join(text.casefold().split())
+        has_time = bool(
+            re.search(r"\b(?:[01]?\d|2[0-3]):[0-5]\d\b", normalized)
+            or re.search(r"\b(?:1[0-2]|0?[1-9])(?:\s*:\s*[0-5]\d)?\s*(?:a\.?m\.?|p\.?m\.?)\b", normalized)
+            or re.search(r"\b(?:noon|midnight)\b", normalized)
+        )
+        number = r"(?:\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten)"
+        has_duration = bool(
+            re.search(
+                rf"\b(?:for\s+)?{number}[ -]*(?:minutes?|mins?|hours?|hrs?)\b",
+                normalized,
+            )
+            or re.search(r"\bfrom\s+.+\s+to\s+.+", normalized)
+        )
+        return tuple(
+            label
+            for present, label in (
+                (has_time, "a precise start time"),
+                (has_duration, "a duration"),
+            )
+            if not present
+        )
+
+    @staticmethod
+    def _topic_is_supported_by_instruction(text: str, parsed: TaskPlan) -> bool:
+        instruction_tokens = set(re.findall(r"[^\W_]+", text.casefold()))
+        participant_tokens = {
+            token
+            for reference in parsed.participant_references
+            for token in re.findall(r"[^\W_]+", reference.casefold())
+        }
+        topic_tokens = set(re.findall(r"[^\W_]+", parsed.topic_key.casefold()))
+        return bool(topic_tokens & (instruction_tokens - participant_tokens))
 
 
 class MessageClassifier:

@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from sqlalchemy import func, select
 from sqlalchemy.orm import sessionmaker
 
 from ten_texter.control import ProductionOwnerCommandHandler
-from ten_texter.model_clients import EntityResolverAssistant, TaskPlan
+from ten_texter.enums import TelegramUpdateStatus
+from ten_texter.model_clients import EntityResolverAssistant, TaskParseReview, TaskPlan
+from ten_texter.models import DecisionRequest, OutboxMessage, TaskInstance, TelegramUpdate
 
 
 def candidate(
@@ -188,3 +191,32 @@ def test_prepare_command_still_rejects_duplicate_person_routes(db_session, monke
     assert prepared.sends == ()
     assert prepared.review_reason == "Participant was resolved more than once: Instagram Direct"
     assert resolver.calls == []
+
+
+def test_parse_clarification_creates_owner_review_without_task(db_session) -> None:
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    command_handler = handler(RecordingResolver(), factory)
+    update = TelegramUpdate(
+        telegram_update_id=800,
+        sender_user_id=7,
+        chat_id=99,
+        payload_json={},
+        status=TelegramUpdateStatus.PENDING,
+    )
+    db_session.add(update)
+    db_session.flush()
+    prepared = command_handler.prepare_command(
+        TaskParseReview(review_reason="A precise start time and duration are required."),
+        update,
+    )
+
+    command_handler.apply_command(db_session, prepared, update)
+    db_session.flush()
+
+    assert db_session.scalar(select(func.count(TaskInstance.id))) == 0
+    decision = db_session.scalar(select(DecisionRequest))
+    prompt = db_session.scalar(select(OutboxMessage))
+    assert decision is not None and decision.type == "OWNER_COMMAND_REVIEW"
+    assert prompt is not None
+    assert prompt.idempotency_key == f"telegram-update:{update.id}:review"
+    assert "precise start time and duration" in prompt.final_text.lower()
