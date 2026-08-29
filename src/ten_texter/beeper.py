@@ -146,9 +146,32 @@ class BeeperSyncService:
         conversation = self.session.scalar(
             select(Conversation).where(Conversation.beeper_conversation_id == chat_id)
         )
+        if conversation is None:
+            raise DomainError("Beeper chat must be synced before message ingestion")
         identity = self.session.scalar(select(Identity).where(Identity.beeper_user_id == sender_id))
-        if conversation is None or identity is None:
-            raise DomainError("Beeper chat and sender must be synced before message ingestion")
+        if identity is None:
+            sender_name = payload.get("senderName")
+            identity = self._sync_identity(
+                {
+                    "id": sender_id,
+                    "fullName": sender_name if isinstance(sender_name, str) else None,
+                },
+                network=conversation.network,
+            )
+        membership = self.session.get(
+            ConversationParticipant,
+            {"conversation_id": conversation.id, "identity_id": identity.id},
+        )
+        if membership is None:
+            # A message proves historical participation, not current membership.
+            self.session.add(
+                ConversationParticipant(
+                    conversation_id=conversation.id,
+                    identity_id=identity.id,
+                    is_current=False,
+                    left_at=received_at or utc_now(),
+                )
+            )
         message_type = payload.get("type")
         is_deleted = bool(payload.get("isDeleted"))
         text_value = payload.get("text")

@@ -420,3 +420,78 @@ def test_beeper_poll_truncates_recent_pages_and_remains_idempotent(db_session: S
         assert conversation is not None
         assert session.scalar(select(func.count(Message.id))) == 1
         assert session.scalar(select(func.count(MessageRevision.id))) == 1
+
+
+def test_poll_ingests_stable_sender_missing_from_incomplete_participants(
+    db_session: Session,
+) -> None:
+    omitted_sender_id = "@discord_omitted:beeper"
+    incomplete_chat = chat_payload(chat_id="!incomplete:beeper")
+    incomplete_chat["participants"] = {
+        "hasMore": True,
+        "items": [{"id": "@self:beeper", "fullName": "Owner", "isSelf": True}],
+    }
+
+    class MissingParticipantClient:
+        def get(self, url: str, **_: object) -> Response:
+            if url.endswith("/v1/chats"):
+                return Response({"items": [incomplete_chat], "hasMore": False})
+            if url.endswith("/v1/chats/%21incomplete%3Abeeper/messages"):
+                return Response(
+                    {
+                        "items": [
+                            {
+                                "id": "message-from-omitted-sender",
+                                "chatID": "!incomplete:beeper",
+                                "senderID": omitted_sender_id,
+                                "senderName": "Omitted Sender",
+                                "sortKey": "00000300",
+                                "timestamp": "2026-08-28T16:00:00Z",
+                                "type": "TEXT",
+                                "text": "I can make it.",
+                                "isSender": False,
+                            }
+                        ],
+                        "hasMore": False,
+                    }
+                )
+            raise AssertionError(f"unexpected URL: {url}")
+
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    adapter = BeeperDesktopAdapter(
+        factory,
+        access_token="fake-token",
+        enabled=True,
+        client=MissingParticipantClient(),  # type: ignore[arg-type]
+    )
+
+    first = adapter.poll_inbound()
+    second = adapter.poll_inbound()
+
+    assert first == second
+    with factory() as session:
+        identity = session.scalar(
+            select(Identity).where(Identity.beeper_user_id == omitted_sender_id)
+        )
+        conversation = session.scalar(
+            select(Conversation).where(
+                Conversation.beeper_conversation_id == "!incomplete:beeper"
+            )
+        )
+        assert identity is not None
+        assert identity.display_name == "Omitted Sender"
+        assert conversation is not None
+        membership = session.get(
+            ConversationParticipant,
+            {"conversation_id": conversation.id, "identity_id": identity.id},
+        )
+        assert membership is not None
+        assert not membership.is_current
+        assert membership.left_at is not None
+        message = session.scalar(
+            select(Message).where(Message.provider_message_id == "message-from-omitted-sender")
+        )
+        assert message is not None
+        assert message.sender_identity_id == identity.id
+        assert session.scalar(select(func.count(Message.id))) == 1
+        assert session.scalar(select(func.count(MessageRevision.id))) == 1
