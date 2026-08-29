@@ -346,6 +346,18 @@ class BeeperDesktopAdapter:
             )
         except Exception as exc:
             return DeliveryResult(False, True, error=str(exc))
+        if response.status_code in {401, 403}:
+            try:
+                rejection = response.json()
+                error = str(rejection.get("error") or response.status_code)
+            except Exception:
+                error = str(response.status_code)
+            return DeliveryResult(
+                False,
+                False,
+                definitely_not_sent=True,
+                error=error,
+            )
         try:
             payload = response.json()
         except Exception as exc:
@@ -427,4 +439,4 @@ class BeeperDesktopAdapter:
             if attempt is None:
                 return utc_now()
             value = attempt.started_at
-            return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+            return value.astimezone(UTC)

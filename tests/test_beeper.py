@@ -1,18 +1,20 @@
 from __future__ import annotations
 
+from datetime import UTC, timedelta
+
 import pytest
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from ten_texter.beeper import BeeperDesktopAdapter, BeeperSyncService
-from ten_texter.enums import MessageKind, OutboxStatus, Transport
-from ten_texter.models import Conversation, ConversationParticipant, DecisionRequest, DecisionRequestPrompt, Identity, Message, MessageRevision, Person, TaskInstance, TaskParticipant
+from ten_texter.enums import DecisionCloseReason, DecisionStatus, MessageKind, OutboxStatus, Transport
+from ten_texter.models import BeeperOutboxDestination, Conversation, ConversationParticipant, DecisionRequest, DecisionRequestPrompt, Identity, Message, MessageRevision, OutboxDeliveryAttempt, OutboxMessage, Person, TaskInstance, TaskParticipant
 from ten_texter.enums import AvailabilityStatus, TaskStatus
 from ten_texter.domain import utc_now
 from ten_texter.control import ProductionOwnerCommandHandler
 from ten_texter.telegram import TelegramControlGateway
-from ten_texter.outbox import AllowingRevalidator, OutboxService, OutboxWorker
+from ten_texter.outbox import AllowingRevalidator, DeliveryRequest, OutboxService, OutboxWorker
 from tests.test_schema import NOW, seed_core
 
 
@@ -142,10 +144,16 @@ def test_beeper_message_maps_sort_key_edits_and_reply_link(db_session: Session) 
 
 
 class Response:
-    def __init__(self, payload: dict[str, object], *, success: bool = True):
+    def __init__(
+        self,
+        payload: dict[str, object],
+        *,
+        success: bool = True,
+        status_code: int | None = None,
+    ):
         self.payload = payload
         self.is_success = success
-        self.status_code = 200 if success else 500
+        self.status_code = status_code if status_code is not None else (200 if success else 500)
 
     def json(self) -> dict[str, object]:
         return self.payload
@@ -178,6 +186,50 @@ class Client:
         return Response({"items": []})
 
 
+class SlowPendingClient(Client):
+    def get(self, url: str, **_: object) -> Response:
+        self.gets.append(url)
+        if url.endswith("pending%3A1"):
+            return Response(
+                {
+                    "id": "pending:1",
+                    "chatID": "conv:alex",
+                    "text": "Are you available?",
+                    "sendStatus": {"status": "PENDING"},
+                }
+            )
+        return Response({"items": []})
+
+
+class EventuallySuccessfulClient(SlowPendingClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.finalized = False
+
+    def get(self, url: str, **_: object) -> Response:
+        if url.endswith("pending%3A1") and self.finalized:
+            self.gets.append(url)
+            return Response(
+                {
+                    "id": "final:1",
+                    "chatID": "conv:alex",
+                    "text": "Are you available?",
+                    "sendStatus": {"status": "SUCCESS"},
+                }
+            )
+        return super().get(url)
+
+
+class AuthorizationFailureClient(Client):
+    def post(self, url: str, **_: object) -> Response:
+        self.posts.append(url)
+        return Response(
+            {"error": "Insufficient permissions. Required scopes: write"},
+            success=False,
+            status_code=403,
+        )
+
+
 class ServerFailureClient(Client):
     def post(self, url: str, **_: object) -> Response:
         self.posts.append(url)
@@ -204,6 +256,58 @@ class MalformedClient(Client):
 class Validator:
     def validate(self, **_: object) -> bool:
         return True
+
+
+PENDING_GRACE = timedelta(minutes=5)
+
+
+def pending_worker(
+    factory: sessionmaker[Session],
+    client: Client,
+    *,
+    owner_chat_id: int | None = None,
+) -> OutboxWorker:
+    return OutboxWorker(
+        factory,
+        revalidator=AllowingRevalidator(),
+        validator=Validator(),
+        adapters={
+            Transport.BEEPER: BeeperDesktopAdapter(
+                factory,
+                access_token="fake-token",
+                enabled=True,
+                client=client,  # type: ignore[arg-type]
+            )
+        },
+        owner_chat_id=owner_chat_id,
+        pending_reconciliation_grace=PENDING_GRACE,
+    )
+
+
+def attempt_started_at(factory: sessionmaker[Session], outbox_id: int):
+    with factory() as session:
+        attempt = session.scalar(
+            select(OutboxDeliveryAttempt)
+            .where(OutboxDeliveryAttempt.outbox_message_id == outbox_id)
+            .order_by(OutboxDeliveryAttempt.id.desc())
+        )
+        assert attempt is not None
+        value = attempt.started_at
+        return value.astimezone(UTC)
+
+
+def create_beeper_send(db_session: Session, *, key: str) -> OutboxMessage:
+    core = seed_core(db_session)
+    message = OutboxService(db_session).create_beeper(
+        task_instance_id=core["task"].id,
+        conversation_id=core["conversation"].id,
+        participant_ids=[core["participant"].id],
+        final_text="Are you available?",
+        message_kind=MessageKind.INITIAL,
+        idempotency_key=key,
+    )
+    db_session.commit()
+    return message
 
 
 def test_pending_send_maps_to_reconciling_then_final_id(db_session: Session) -> None:
@@ -238,6 +342,195 @@ def test_pending_send_maps_to_reconciling_then_final_id(db_session: Session) -> 
     assert any(url.endswith("pending%3A1") for url in client.gets)
 
 
+def test_pending_send_unresolved_immediately_does_not_request_owner_decision(
+    db_session: Session,
+) -> None:
+    core = seed_core(db_session)
+    message = OutboxService(db_session).create_beeper(
+        task_instance_id=core["task"].id,
+        conversation_id=core["conversation"].id,
+        participant_ids=[core["participant"].id],
+        final_text="Are you available?",
+        message_kind=MessageKind.INITIAL,
+        idempotency_key="beeper-slow-pending",
+    )
+    db_session.commit()
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    worker = OutboxWorker(
+        factory,
+        revalidator=AllowingRevalidator(),
+        validator=Validator(),
+        adapters={
+            Transport.BEEPER: BeeperDesktopAdapter(
+                factory,
+                access_token="fake-token",
+                enabled=True,
+                client=SlowPendingClient(),  # type: ignore[arg-type]
+            )
+        },
+    )
+
+    assert worker.process(message.id) is OutboxStatus.RECONCILING
+    assert worker.reconcile(message.id) is OutboxStatus.RECONCILING
+    with factory() as session:
+        assert session.scalar(
+            select(func.count(DecisionRequest.id)).where(
+                DecisionRequest.outbox_message_id == message.id
+            )
+        ) == 0
+
+
+def test_pending_send_stays_reconciling_on_repeated_ticks_within_grace(
+    db_session: Session,
+) -> None:
+    message = create_beeper_send(db_session, key="beeper-pending-repeat")
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    client = SlowPendingClient()
+    worker = pending_worker(factory, client)
+
+    assert worker.process(message.id) is OutboxStatus.RECONCILING
+    started_at = attempt_started_at(factory, message.id)
+    assert worker.reconcile(message.id, at=started_at + timedelta(minutes=1)) is OutboxStatus.RECONCILING
+    assert worker.reconcile(message.id, at=started_at + timedelta(minutes=4)) is OutboxStatus.RECONCILING
+
+    with factory() as session:
+        assert session.scalar(
+            select(func.count(DecisionRequest.id)).where(
+                DecisionRequest.outbox_message_id == message.id
+            )
+        ) == 0
+        assert session.scalar(
+            select(func.count(OutboxDeliveryAttempt.id)).where(
+                OutboxDeliveryAttempt.outbox_message_id == message.id
+            )
+        ) == 1
+    assert len(client.posts) == 1
+
+
+def test_pending_send_reconciles_to_final_id_during_grace(db_session: Session) -> None:
+    message = create_beeper_send(db_session, key="beeper-pending-success")
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    client = EventuallySuccessfulClient()
+    worker = pending_worker(factory, client)
+
+    assert worker.process(message.id) is OutboxStatus.RECONCILING
+    started_at = attempt_started_at(factory, message.id)
+    assert worker.reconcile(message.id, at=started_at + timedelta(minutes=1)) is OutboxStatus.RECONCILING
+    client.finalized = True
+    assert worker.reconcile(message.id, at=started_at + timedelta(minutes=2)) is OutboxStatus.SENT
+
+    with factory() as session:
+        attempt = session.scalar(
+            select(OutboxDeliveryAttempt)
+            .where(OutboxDeliveryAttempt.outbox_message_id == message.id)
+            .order_by(OutboxDeliveryAttempt.id.desc())
+        )
+        assert attempt is not None
+        assert attempt.provider_message_id == "final:1"
+        assert session.scalar(
+            select(func.count(DecisionRequest.id)).where(
+                DecisionRequest.outbox_message_id == message.id
+            )
+        ) == 0
+    assert len(client.posts) == 1
+
+
+def test_pending_send_unresolved_after_grace_creates_exactly_one_decision(
+    db_session: Session,
+) -> None:
+    message = create_beeper_send(db_session, key="beeper-pending-expired")
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    client = SlowPendingClient()
+    worker = pending_worker(factory, client)
+
+    assert worker.process(message.id) is OutboxStatus.RECONCILING
+    started_at = attempt_started_at(factory, message.id)
+    after_grace = started_at + PENDING_GRACE + timedelta(seconds=1)
+    assert worker.reconcile(message.id, at=after_grace) is OutboxStatus.RECONCILING
+    assert worker.reconcile(message.id, at=after_grace + timedelta(minutes=1)) is OutboxStatus.RECONCILING
+
+    with factory() as session:
+        decisions = list(
+            session.scalars(
+                select(DecisionRequest).where(
+                    DecisionRequest.outbox_message_id == message.id,
+                    DecisionRequest.type == "UNCERTAIN_DELIVERY",
+                )
+            )
+        )
+        assert len(decisions) == 1
+    assert len(client.posts) == 1
+
+
+def test_pending_reconciliation_grace_survives_worker_restart(db_session: Session) -> None:
+    message = create_beeper_send(db_session, key="beeper-pending-restart")
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    client = SlowPendingClient()
+    assert pending_worker(factory, client).process(message.id) is OutboxStatus.RECONCILING
+    started_at = attempt_started_at(factory, message.id)
+
+    restarted = pending_worker(factory, client)
+    assert restarted.reconcile(
+        message.id,
+        at=started_at + timedelta(minutes=2),
+    ) is OutboxStatus.RECONCILING
+    with factory() as session:
+        assert session.scalar(
+            select(func.count(DecisionRequest.id)).where(
+                DecisionRequest.outbox_message_id == message.id
+            )
+        ) == 0
+    assert len(client.posts) == 1
+
+
+def test_pending_send_late_success_closes_uncertain_delivery_decision(
+    db_session: Session,
+) -> None:
+    message = create_beeper_send(db_session, key="beeper-pending-late-success")
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    client = EventuallySuccessfulClient()
+    worker = pending_worker(factory, client)
+
+    assert worker.process(message.id) is OutboxStatus.RECONCILING
+    started_at = attempt_started_at(factory, message.id)
+    assert worker.reconcile(
+        message.id,
+        at=started_at + PENDING_GRACE + timedelta(seconds=1),
+    ) is OutboxStatus.RECONCILING
+    with factory() as session:
+        decision = session.scalar(
+            select(DecisionRequest).where(
+                DecisionRequest.outbox_message_id == message.id,
+                DecisionRequest.type == "UNCERTAIN_DELIVERY",
+            )
+        )
+        assert decision is not None
+        assert decision.status is DecisionStatus.PENDING
+
+    client.finalized = True
+    assert worker.reconcile(
+        message.id,
+        at=started_at + PENDING_GRACE + timedelta(minutes=1),
+    ) is OutboxStatus.SENT
+    with factory() as session:
+        decision = session.scalar(
+            select(DecisionRequest).where(
+                DecisionRequest.outbox_message_id == message.id,
+                DecisionRequest.type == "UNCERTAIN_DELIVERY",
+            )
+        )
+        attempt = session.scalar(
+            select(OutboxDeliveryAttempt)
+            .where(OutboxDeliveryAttempt.outbox_message_id == message.id)
+            .order_by(OutboxDeliveryAttempt.id.desc())
+        )
+        assert decision is not None
+        assert decision.status is DecisionStatus.CLOSED
+        assert decision.close_reason is DecisionCloseReason.SUBJECT_RESOLVED
+        assert attempt is not None
+        assert attempt.provider_message_id == "final:1"
+
+
 def test_beeper_transport_disabled_by_default(db_session: Session) -> None:
     factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
     adapter = BeeperDesktopAdapter(factory, access_token=None)
@@ -245,6 +538,42 @@ def test_beeper_transport_disabled_by_default(db_session: Session) -> None:
 
     result = adapter.send(DeliveryRequest(1, Transport.BEEPER, "1", "text", "key"))
     assert not result.success and result.definitely_not_sent
+
+
+def test_authorization_rejection_is_definitely_not_sent(db_session: Session) -> None:
+    message = create_beeper_send(db_session, key="beeper-authorization-rejected")
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    client = AuthorizationFailureClient()
+    adapter = BeeperDesktopAdapter(
+        factory,
+        access_token="fake-token",
+        enabled=True,
+        client=client,  # type: ignore[arg-type]
+    )
+    destination = db_session.get(BeeperOutboxDestination, message.id)
+    assert destination is not None
+    request = DeliveryRequest(
+        message.id,
+        Transport.BEEPER,
+        str(destination.conversation_id),
+        message.final_text,
+        message.idempotency_key,
+    )
+    result = adapter.send(request)
+    assert result.definitely_not_sent
+    assert not result.boundary_crossed
+
+    worker = pending_worker(factory, client)
+    assert worker.process(message.id) is OutboxStatus.PENDING
+    with factory() as session:
+        stored = session.get(OutboxMessage, message.id)
+        assert stored is not None
+        assert stored.status is OutboxStatus.PENDING
+        assert session.scalar(
+            select(func.count(DecisionRequest.id)).where(
+                DecisionRequest.outbox_message_id == message.id
+            )
+        ) == 0
 
 
 def test_server_failure_is_uncertain_and_cannot_send_twice(db_session: Session) -> None:

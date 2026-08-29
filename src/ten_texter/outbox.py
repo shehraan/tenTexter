@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Protocol
 
@@ -12,6 +12,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from ten_texter.domain import DecisionService, DomainError, utc_now
 from ten_texter.enums import (
     AttemptResult,
+    DecisionCloseReason,
+    DecisionStatus,
     DestinationKind,
     MessageKind,
     OutboxCancelReason,
@@ -260,6 +262,7 @@ class OutboxWorker:
         validator: IndependentTextValidator,
         adapters: dict[Transport, TransportAdapter],
         lease_duration: timedelta = timedelta(seconds=30),
+        pending_reconciliation_grace: timedelta = timedelta(minutes=5),
         raise_validation_errors: bool = False,
         owner_chat_id: int | None = None,
     ):
@@ -268,6 +271,7 @@ class OutboxWorker:
         self.validator = validator
         self.adapters = adapters
         self.lease_duration = lease_duration
+        self.pending_reconciliation_grace = pending_reconciliation_grace
         self.raise_validation_errors = raise_validation_errors
         self.owner_chat_id = owner_chat_id
 
@@ -365,7 +369,7 @@ class OutboxWorker:
                 message.status = OutboxStatus.RECONCILING
             return message.status
 
-    def reconcile(self, outbox_id: int) -> OutboxStatus:
+    def reconcile(self, outbox_id: int, *, at: datetime | None = None) -> OutboxStatus:
         with self.sessions() as read_session:
             message = read_session.get(OutboxMessage, outbox_id)
             if message is None:
@@ -380,6 +384,7 @@ class OutboxWorker:
             )
             assert attempt is not None
             provider_message_id = attempt.provider_message_id
+            attempt_started_at = attempt.started_at.astimezone(UTC)
             detail = read_session.get(BeeperDeliveryAttemptDetail, attempt.id)
             pending_id = detail.pending_provider_id if detail else None
         adapter = self.adapters.get(request.transport)
@@ -402,6 +407,28 @@ class OutboxWorker:
                 )
                 assert latest is not None
                 latest.provider_message_id = found
+                pending_decisions = list(
+                    session.scalars(
+                        select(DecisionRequestPlaceholder).where(
+                            DecisionRequestPlaceholder.outbox_message_id == outbox_id,
+                            DecisionRequestPlaceholder.type == "UNCERTAIN_DELIVERY",
+                            DecisionRequestPlaceholder.status == DecisionStatus.PENDING,
+                        )
+                    )
+                )
+                for decision in pending_decisions:
+                    DecisionService(session).close(
+                        decision.id,
+                        DecisionCloseReason.SUBJECT_RESOLVED,
+                    )
+                return message.status
+            timestamp = at or utc_now()
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=attempt_started_at.tzinfo)
+            if (
+                pending_id is not None
+                and timestamp < attempt_started_at + self.pending_reconciliation_grace
+            ):
                 return message.status
             existing = session.scalar(
                 select(DecisionRequestPlaceholder.id).where(DecisionRequestPlaceholder.outbox_message_id == outbox_id)
