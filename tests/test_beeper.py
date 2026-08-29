@@ -356,3 +356,67 @@ def test_beeper_poll_syncs_chats_and_ingests_inbound_messages(db_session: Sessio
         revision = session.get(MessageRevision, revision_ids[0])
         assert revision.text == "yes"
         assert revision.processing_status.value == "PENDING"
+
+
+def test_beeper_poll_truncates_recent_pages_and_remains_idempotent(db_session: Session) -> None:
+    class BoundedPollClient:
+        def __init__(self) -> None:
+            self.chat_gets = 0
+            self.message_gets = 0
+
+        def get(self, url: str, **kwargs: object) -> Response:
+            params = kwargs.get("params")
+            assert params == {}
+            if url.endswith("/v1/chats"):
+                self.chat_gets += 1
+                return Response(
+                    {
+                        "items": [chat_payload()],
+                        "hasMore": True,
+                    }
+                )
+            if url.endswith("/v1/chats/%21direct%3Abeeper/messages"):
+                self.message_gets += 1
+                return Response(
+                    {
+                        "items": [
+                            {
+                                "id": "recent-incoming",
+                                "chatID": "!direct:beeper",
+                                "senderID": "@discord_123:beeper",
+                                "sortKey": "00000200",
+                                "timestamp": "2026-08-28T15:00:00Z",
+                                "type": "TEXT",
+                                "text": "recent reply",
+                                "isSender": False,
+                            }
+                        ],
+                        "hasMore": True,
+                    }
+                )
+            raise AssertionError(f"unexpected URL: {url}")
+
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    client = BoundedPollClient()
+    adapter = BeeperDesktopAdapter(
+        factory,
+        access_token="fake-token",
+        enabled=True,
+        client=client,  # type: ignore[arg-type]
+    )
+
+    first = adapter.poll_inbound()
+    second = adapter.poll_inbound()
+
+    assert first == second
+    assert client.chat_gets == 2
+    assert client.message_gets == 2
+    with factory() as session:
+        conversation = session.scalar(
+            select(Conversation).where(
+                Conversation.beeper_conversation_id == "!direct:beeper"
+            )
+        )
+        assert conversation is not None
+        assert session.scalar(select(func.count(Message.id))) == 1
+        assert session.scalar(select(func.count(MessageRevision.id))) == 1

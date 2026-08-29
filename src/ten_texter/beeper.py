@@ -178,6 +178,9 @@ class BeeperSyncService:
 class BeeperDesktopAdapter:
     """Beeper Desktop REST v1 adapter; disabled unless explicitly configured."""
 
+    POLL_CHAT_PAGES = 1
+    POLL_MESSAGE_PAGES = 1
+
     def __init__(
         self,
         sessions: sessionmaker[Session],
@@ -208,27 +211,52 @@ class BeeperDesktopAdapter:
         response.raise_for_status()
         return response.json()
 
-    def list_chats(self) -> list[dict[str, Any]]:
-        if not self.enabled:
-            return []
-        return self._list_pages(f"{self.base_url}/v1/chats")
-
-    def list_messages(self, chat_id: str) -> list[dict[str, Any]]:
+    def list_chats(
+        self,
+        *,
+        max_pages: int = 20,
+        allow_truncated: bool = False,
+    ) -> list[dict[str, Any]]:
         if not self.enabled:
             return []
         return self._list_pages(
-            f"{self.base_url}/v1/chats/{quote(chat_id, safe='')}/messages"
+            f"{self.base_url}/v1/chats",
+            max_pages=max_pages,
+            allow_truncated=allow_truncated,
         )
 
-    def _list_pages(self, url: str, *, max_pages: int = 20) -> list[dict[str, Any]]:
+    def list_messages(
+        self,
+        chat_id: str,
+        *,
+        max_pages: int = 20,
+        allow_truncated: bool = False,
+    ) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
+        return self._list_pages(
+            f"{self.base_url}/v1/chats/{quote(chat_id, safe='')}/messages",
+            max_pages=max_pages,
+            allow_truncated=allow_truncated,
+        )
+
+    def _list_pages(
+        self,
+        url: str,
+        *,
+        max_pages: int = 20,
+        allow_truncated: bool = False,
+    ) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
         params: dict[str, str] = {}
-        for _page in range(max_pages):
+        for page in range(max_pages):
             response = self.client.get(url, headers=self.headers, params=params)
             response.raise_for_status()
             payload = response.json()
             items.extend(item for item in payload.get("items") or [] if isinstance(item, dict))
             if payload.get("hasMore") is not True:
+                break
+            if allow_truncated and page + 1 == max_pages:
                 break
             cursor = payload.get("oldestCursor")
             if not isinstance(cursor, str) or not cursor:
@@ -239,14 +267,26 @@ class BeeperDesktopAdapter:
         return items
 
     def poll_inbound(self) -> list[int]:
-        """Fetch current chat/message pages, then durably ingest non-owner messages."""
-        chats = self.list_chats()
+        """Fetch bounded recent chat/message windows and ingest non-owner messages."""
+        chats = self.list_chats(
+            max_pages=self.POLL_CHAT_PAGES,
+            allow_truncated=True,
+        )
         fetched: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
         for chat in chats:
             chat_id = chat.get("id")
             if not isinstance(chat_id, str) or not chat_id:
                 continue
-            fetched.append((chat, self.list_messages(chat_id)))
+            fetched.append(
+                (
+                    chat,
+                    self.list_messages(
+                        chat_id,
+                        max_pages=self.POLL_MESSAGE_PAGES,
+                        allow_truncated=True,
+                    ),
+                )
+            )
 
         revision_ids: list[int] = []
         with self.sessions.begin() as session:
