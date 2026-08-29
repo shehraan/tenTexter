@@ -4,11 +4,16 @@ import json
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from ten_texter.domain import AwaitedResponseService
 from ten_texter.enums import AvailabilityStatus
 from ten_texter.model_clients import (
+    ClassificationOutput,
+    CorrelationOutput,
     EntityResolverAssistant,
+    EntityResolutionOutput,
+    GeneratedMessage,
     HTTPModelBackend,
     MessageClassifier,
     MessageGenerator,
@@ -16,7 +21,11 @@ from ten_texter.model_clients import (
     ModelUnavailable,
     SemanticCorrelationFallback,
     TaskParser,
+    _operation_json_schema,
+    classification_output_json_schema,
+    task_plan_json_schema,
 )
+from ten_texter.validator import validator_output_json_schema
 from tests.test_schema import seed_core
 
 
@@ -160,6 +169,199 @@ def test_task_parser_llama_schema_pairs_recurrence_and_timezone() -> None:
         assert branch["properties"]["topic_key"]["maxLength"] == 300
         assert branch["properties"]["participant_references"]["minItems"] == 1
         assert branch["properties"]["participant_references"]["maxItems"] == 100
+
+
+def test_message_classifier_llama_schema_discriminates_semantic_shapes() -> None:
+    schema = _operation_json_schema("message_classifier")
+    generated = ClassificationOutput.model_json_schema()
+
+    assert schema == classification_output_json_schema()
+    assert len(schema["oneOf"]) == 4
+    assert schema["$defs"] == generated["$defs"]
+    branches = {
+        branch["properties"]["kind"]["const"]: branch for branch in schema["oneOf"]
+    }
+    assert set(branches) == {"AVAILABILITY", "COUNTERPROPOSAL", "AMBIGUOUS", "OTHER"}
+
+    for branch in branches.values():
+        assert branch["required"] == ["kind", "availability", "evidence", "proposals"]
+        assert branch["additionalProperties"] is False
+        assert branch["properties"]["evidence"] == generated["properties"]["evidence"]
+
+    availability = branches["AVAILABILITY"]["properties"]
+    assert availability["availability"]["enum"] == [
+        "AVAILABLE",
+        "UNAVAILABLE",
+        "UNCERTAIN",
+    ]
+    assert "UNKNOWN" not in availability["availability"]["enum"]
+    assert availability["proposals"]["maxItems"] == 0
+
+    counterproposal = branches["COUNTERPROPOSAL"]["properties"]
+    assert counterproposal["availability"] == {"type": "null"}
+    assert counterproposal["proposals"]["minItems"] == 1
+    assert counterproposal["proposals"]["maxItems"] == 10
+    assert (
+        counterproposal["proposals"]["items"]
+        == generated["properties"]["proposals"]["items"]
+    )
+
+    for kind in ("AMBIGUOUS", "OTHER"):
+        properties = branches[kind]["properties"]
+        assert properties["availability"] == {"type": "null"}
+        assert properties["proposals"]["maxItems"] == 0
+
+
+@pytest.mark.parametrize("availability", ["AVAILABLE", "UNAVAILABLE", "UNCERTAIN"])
+def test_classification_output_accepts_each_availability_status(availability: str) -> None:
+    parsed = ClassificationOutput.model_validate_json(
+        json.dumps(
+            {
+                "kind": "AVAILABILITY",
+                "availability": availability,
+                "evidence": "FIRST_PARTY",
+                "proposals": [],
+            }
+        ),
+        strict=True,
+    )
+    assert parsed.availability.value == availability
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {
+            "kind": "COUNTERPROPOSAL",
+            "availability": None,
+            "evidence": "THIRD_PARTY",
+            "proposals": [
+                {
+                    "field": "scheduled_at",
+                    "operation": "replace",
+                    "old_value": "5 PM",
+                    "proposed_value": "6 PM",
+                }
+            ],
+        },
+        {
+            "kind": "AMBIGUOUS",
+            "availability": None,
+            "evidence": "FIRST_PARTY",
+            "proposals": [],
+        },
+        {
+            "kind": "OTHER",
+            "availability": None,
+            "evidence": "THIRD_PARTY",
+            "proposals": [],
+        },
+    ],
+)
+def test_classification_output_accepts_valid_nonavailability_branches(
+    value: dict[str, object],
+) -> None:
+    ClassificationOutput.model_validate_json(json.dumps(value), strict=True)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {
+            "kind": "AVAILABILITY",
+            "availability": "UNKNOWN",
+            "evidence": "FIRST_PARTY",
+            "proposals": [],
+        },
+        {
+            "kind": "AVAILABILITY",
+            "availability": "AVAILABLE",
+            "evidence": "FIRST_PARTY",
+            "proposals": [
+                {"field": "location", "operation": "replace", "old_value": None, "proposed_value": "park"}
+            ],
+        },
+        {
+            "kind": "COUNTERPROPOSAL",
+            "availability": "UNCERTAIN",
+            "evidence": "FIRST_PARTY",
+            "proposals": [
+                {"field": "location", "operation": "replace", "old_value": None, "proposed_value": "park"}
+            ],
+        },
+        {
+            "kind": "COUNTERPROPOSAL",
+            "availability": None,
+            "evidence": "FIRST_PARTY",
+            "proposals": [],
+        },
+        {
+            "kind": "COUNTERPROPOSAL",
+            "availability": None,
+            "evidence": "FIRST_PARTY",
+            "proposals": [
+                {"field": "location", "operation": "replace", "old_value": None, "proposed_value": str(index)}
+                for index in range(11)
+            ],
+        },
+        {
+            "kind": "AMBIGUOUS",
+            "availability": "UNCERTAIN",
+            "evidence": "FIRST_PARTY",
+            "proposals": [],
+        },
+        {
+            "kind": "AMBIGUOUS",
+            "availability": None,
+            "evidence": "FIRST_PARTY",
+            "proposals": [
+                {"field": "location", "operation": "replace", "old_value": None, "proposed_value": "park"}
+            ],
+        },
+        {
+            "kind": "OTHER",
+            "availability": "AVAILABLE",
+            "evidence": "FIRST_PARTY",
+            "proposals": [],
+        },
+        {
+            "kind": "OTHER",
+            "availability": None,
+            "evidence": "FIRST_PARTY",
+            "proposals": [
+                {"field": "location", "operation": "replace", "old_value": None, "proposed_value": "park"}
+            ],
+        },
+    ],
+)
+def test_classification_output_pydantic_validator_still_rejects_invalid_shapes(
+    value: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        ClassificationOutput.model_validate_json(json.dumps(value), strict=True)
+
+
+def test_classification_evidence_enum_and_default_are_preserved() -> None:
+    generated = ClassificationOutput.model_json_schema()
+    evidence = generated["properties"]["evidence"]
+    assert evidence["default"] == "FIRST_PARTY"
+    assert generated["$defs"]["AvailabilityEvidence"]["enum"] == [
+        "FIRST_PARTY",
+        "THIRD_PARTY",
+    ]
+    parsed = ClassificationOutput.model_validate_json(
+        '{"kind":"OTHER","availability":null,"proposals":[]}',
+        strict=True,
+    )
+    assert parsed.evidence.value == "FIRST_PARTY"
+
+
+def test_non_classifier_operation_schemas_are_unchanged() -> None:
+    assert _operation_json_schema("task_parser") == task_plan_json_schema()
+    assert _operation_json_schema("semantic_correlation") == CorrelationOutput.model_json_schema()
+    assert _operation_json_schema("entity_resolution") == EntityResolutionOutput.model_json_schema()
+    assert _operation_json_schema("message_generator") == GeneratedMessage.model_json_schema()
+    assert _operation_json_schema("message_validator") == validator_output_json_schema()
 
 
 def test_other_model_operation_schema_is_unchanged() -> None:
