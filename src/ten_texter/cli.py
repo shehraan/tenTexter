@@ -47,7 +47,10 @@ def _run_outbox_worker(app: Application, *, once: bool) -> None:
     )
     worker = OutboxWorker(
         app.sessions,
-        revalidator=PolicyRevalidator(facts=facts),
+        revalidator=PolicyRevalidator(
+            facts=facts,
+            owner_chat_id=getattr(app.settings, "owner_chat_id", None),
+        ),
         validator=gate,
         adapters={
             Transport.BEEPER: BeeperDesktopAdapter(

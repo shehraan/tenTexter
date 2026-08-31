@@ -597,7 +597,10 @@ def build_runtime(
     facts = DatabaseContextProvider()
     outbox = OutboxWorker(
         sessions,
-        revalidator=PolicyRevalidator(facts=facts),
+        revalidator=PolicyRevalidator(
+            facts=facts,
+            owner_chat_id=settings.owner_chat_id,
+        ),
         validator=OutboxValidatorGate(
             sessions,
             validator=independent_validator,

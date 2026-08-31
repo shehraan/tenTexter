@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from ten_texter.decision_prompts import uncertain_delivery_prompt
 from ten_texter.domain import DecisionService, DomainError, utc_now
 from ten_texter.enums import (
     AttemptResult,
@@ -450,10 +451,7 @@ class OutboxWorker:
 
                     prompt = OutboxService(session).create_owner(
                         telegram_chat_id=self.owner_chat_id,
-                        final_text=(
-                            f"Delivery for outbox {outbox_id} is uncertain. It must not be retried. "
-                            f"Reply `keep reconciling` to acknowledge while leaving it blocked."
-                        ),
+                        final_text=uncertain_delivery_prompt(outbox_id),
                         message_kind=MessageKind.NOTIFICATION,
                         idempotency_key=f"decision:{decision.id}:owner-prompt",
                         task_instance_id=message.task_instance_id,

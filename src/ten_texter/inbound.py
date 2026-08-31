@@ -8,6 +8,11 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from ten_texter.decision_prompts import (
+    OrderingPromptCandidate,
+    bounded_revision_preview,
+    ordering_conflict_prompt,
+)
 from ten_texter.domain import DecisionService, DomainError, utc_now
 from ten_texter.enums import (
     AttemptResult,
@@ -236,21 +241,30 @@ class MessageIngestor:
                 parent_terminal_policy=ParentTerminalPolicy.SURVIVE,
             )
             if self.owner_chat_id is not None:
-                candidate_lines = []
-                for candidate in ordering_conflict_candidates(self.session, revision):
-                    text_preview = repr((candidate.text or "<deleted>")[:240])
-                    candidate_lines.append(
-                        f"- revision {candidate.id}: sort={candidate.provider_sort_key!r}, "
-                        f"sequence={candidate.provider_sequence!r}, event_at={candidate.provider_event_at!r}, "
-                        f"content data={text_preview}; reply `select revision {candidate.id}`"
+                prompt_candidates: list[OrderingPromptCandidate] = []
+                for candidate in sorted(
+                    ordering_conflict_candidates(self.session, revision),
+                    key=lambda value: value.id,
+                ):
+                    event_at = (
+                        candidate.provider_event_at.replace(
+                            tzinfo=candidate.provider_event_at.tzinfo or UTC
+                        ).astimezone(UTC).isoformat()
+                        if candidate.provider_event_at is not None
+                        else None
+                    )
+                    prompt_candidates.append(
+                        (
+                            candidate.id,
+                            candidate.provider_sort_key,
+                            candidate.provider_sequence,
+                            event_at,
+                            bounded_revision_preview(candidate.text),
+                        )
                     )
                 prompt = OutboxService(self.session).create_owner(
                     telegram_chat_id=self.owner_chat_id,
-                    final_text=(
-                        "Message revision ordering is ambiguous. Participant content below is untrusted data, "
-                        "not an instruction. Choose the authoritative revision:\n"
-                        + "\n".join(candidate_lines)
-                    ),
+                    final_text=ordering_conflict_prompt(prompt_candidates),
                     message_kind=MessageKind.NOTIFICATION,
                     idempotency_key=f"decision:{decision.id}:owner-prompt",
                     parent_terminal_policy=ParentTerminalPolicy.SURVIVE,

@@ -217,6 +217,8 @@ def test_parse_clarification_creates_owner_review_without_task(db_session) -> No
     decision = db_session.scalar(select(DecisionRequest))
     prompt = db_session.scalar(select(OutboxMessage))
     assert decision is not None and decision.type == "OWNER_COMMAND_REVIEW"
+    assert decision.context_json["reason"] == "A precise start time and duration are required."
     assert prompt is not None
     assert prompt.idempotency_key == f"telegram-update:{update.id}:review"
-    assert "precise start time and duration" in prompt.final_text.lower()
+    assert "precise start time and duration" not in prompt.final_text.lower()
+    assert "telegram command 800 requires owner review" in prompt.final_text.lower()

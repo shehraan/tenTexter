@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from ten_texter.correlation import Classification, Classifier, CorrelationOrchestrator, PreparedCorrelation
+from ten_texter.decision_prompts import owner_command_review_prompt
 from ten_texter.domain import DecisionService, DomainError, ProposalService
 from ten_texter.inbound import (
     ordering_conflict_candidates,
@@ -257,10 +258,7 @@ class ProductionOwnerCommandHandler:
             )
             prompt = OutboxService(session).create_owner(
                 telegram_chat_id=self.owner_chat_id,
-                final_text=(
-                    f"{prepared.review_reason}\n"
-                    "This command cannot be applied safely. Reply `dismiss` and submit a corrected command separately."
-                ),
+                final_text=owner_command_review_prompt(update.telegram_update_id),
                 message_kind=MessageKind.NOTIFICATION,
                 idempotency_key=f"telegram-update:{update.id}:review",
                 parent_terminal_policy=ParentTerminalPolicy.SURVIVE,

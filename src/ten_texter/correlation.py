@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC
 from typing import Protocol
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from ten_texter.decision_prompts import (
+    correlation_ambiguity_prompt,
+    counterproposal_prompt,
+)
 from ten_texter.domain import (
     AvailabilityService,
     DecisionService,
@@ -428,9 +433,10 @@ class CorrelationOrchestrator:
                     prompt = OutboxService(self.session).create_owner(
                         telegram_chat_id=self.owner_chat_id,
                         task_instance_id=task.id,
-                        final_text=(
-                            f"Participant proposed {proposal.field} {proposal.operation}: "
-                            f"{proposal.proposed_value}. Reply `approve` or `reject`."
+                        final_text=counterproposal_prompt(
+                            proposal.field,
+                            proposal.operation,
+                            proposal.proposed_value,
                         ),
                         message_kind=MessageKind.NOTIFICATION,
                         idempotency_key=f"proposal:{proposal.id}:owner-prompt",
@@ -583,20 +589,28 @@ class CorrelationOrchestrator:
             ]
         )
         if self.owner_chat_id is not None and candidates:
-            lines = ["Choose the response this message belongs to:"]
-            for candidate in candidates:
+            prompt_candidates: list[tuple[int, str, str, int, int, str]] = []
+            for candidate in sorted(candidates, key=lambda value: value.id):
                 participant = self.session.get(TaskParticipant, candidate.task_participant_id)
                 assert participant is not None
                 task = self.session.get(TaskInstance, participant.task_instance_id)
                 assert task is not None
-                lines.append(
-                    f"- {candidate.id}: {task.topic_key} at {task.scheduled_at.isoformat()}, "
-                    f"participant {participant.person_id}, conversation {participant.conversation_id}, "
-                    f"expected {candidate.expected_response_type}; reply `select {candidate.id}`"
+                scheduled_at = task.scheduled_at.replace(
+                    tzinfo=task.scheduled_at.tzinfo or UTC
+                ).astimezone(UTC).isoformat()
+                prompt_candidates.append(
+                    (
+                        candidate.id,
+                        task.topic_key,
+                        scheduled_at,
+                        participant.person_id,
+                        participant.conversation_id,
+                        candidate.expected_response_type,
+                    )
                 )
             prompt = OutboxService(self.session).create_owner(
                 telegram_chat_id=self.owner_chat_id,
-                final_text="\n".join(lines),
+                final_text=correlation_ambiguity_prompt(prompt_candidates),
                 message_kind=MessageKind.NOTIFICATION,
                 idempotency_key=f"decision:{decision.id}:owner-prompt",
                 task_instance_id=decision.task_instance_id,

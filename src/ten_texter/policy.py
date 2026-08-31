@@ -7,6 +7,10 @@ from typing import Protocol
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from ten_texter.decision_prompt_context import (
+    authorize_decision_prompt,
+    decision_for_prompt,
+)
 from ten_texter.domain import normalize_topic_key, utc_now
 from ten_texter.enums import (
     ContactRuleScope,
@@ -307,10 +311,12 @@ class PolicyRevalidator(PreSendRevalidator):
         rules: ContactRuleResolver | None = None,
         disclosure: DisclosurePolicy | None = None,
         facts: ContextFactProvider | None = None,
+        owner_chat_id: int | None = None,
     ):
         self.rules = rules or ContactRuleResolver()
         self.disclosure = disclosure or DisclosurePolicy()
         self.facts = facts or EmptyContextFactProvider()
+        self.owner_chat_id = owner_chat_id
 
     def check(self, session: Session, message: OutboxMessage) -> PreSendDecision:
         task = session.get(TaskInstance, message.task_instance_id) if message.task_instance_id else None
@@ -320,6 +326,13 @@ class PolicyRevalidator(PreSendRevalidator):
         ):
             return PreSendDecision.STALE
         if message.transport is Transport.TELEGRAM:
+            decision = decision_for_prompt(session, message)
+            if decision is not None and authorize_decision_prompt(
+                session,
+                message,
+                owner_chat_id=self.owner_chat_id,
+            ) is None:
+                return PreSendDecision.STALE
             return PreSendDecision.READY
         destination = session.get(BeeperOutboxDestination, message.id)
         if destination is None or task is None:
@@ -377,7 +390,9 @@ class PolicyRevalidator(PreSendRevalidator):
                 task.location,
             )
         if message.transport is Transport.TELEGRAM:
-            return ("TELEGRAM",) + task_token
+            return (
+                "TELEGRAM",
+            ) + task_token + self._decision_prompt_token(session, message)
         destination = session.get(BeeperOutboxDestination, message.id)
         participant_ids = tuple(
             session.scalars(
@@ -434,6 +449,30 @@ class PolicyRevalidator(PreSendRevalidator):
             tuple(membership_tokens),
             tuple(rule_outcomes),
             facts,
+        )
+
+    def _decision_prompt_token(
+        self, session: Session, message: OutboxMessage
+    ) -> tuple[object, ...]:
+        decision = decision_for_prompt(session, message)
+        if decision is None:
+            return ("NO_DECISION_PROMPT",)
+        authorization = authorize_decision_prompt(
+            session,
+            message,
+            owner_chat_id=self.owner_chat_id,
+        )
+        if authorization is None:
+            return (
+                "INVALID_DECISION_PROMPT",
+                decision.id,
+                decision.type,
+            )
+        return (
+            "DECISION_PROMPT",
+            decision.id,
+            decision.type,
+            *authorization.applicability_token,
         )
 
     @staticmethod
