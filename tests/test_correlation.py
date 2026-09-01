@@ -7,7 +7,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from ten_texter.correlation import AtomicProposal, Classification, CorrelationOrchestrator
-from ten_texter.domain import AvailabilityService, DomainError, distinct_response_count
+from ten_texter.domain import AvailabilityService, DomainError, TaskService, distinct_response_count
 from ten_texter.enums import (
     AttemptResult,
     AvailabilityEvidence,
@@ -15,11 +15,13 @@ from ten_texter.enums import (
     AwaitedResponseStatus,
     ContentSupport,
     ConversationKind,
+    DecisionStatus,
     MessageKind,
     OutboxStatus,
     ParentTerminalPolicy,
     ProcessingStatus,
     ProposalStatus,
+    TaskStatus,
 )
 from ten_texter.models import (
     AwaitedResponse,
@@ -47,7 +49,7 @@ from ten_texter.correlation import MAX_AVAILABILITY_SUBJECT_CANDIDATES
 from ten_texter.telegram import TelegramControlGateway
 from ten_texter.outbox import OutboxService
 from ten_texter.policy import DatabaseContextProvider
-from ten_texter.validator import DatabaseValidatorContextProvider
+from ten_texter.validator import DatabaseValidatorContextProvider, IndependentMessageValidator
 from tests.test_schema import NOW, seed_core
 
 
@@ -1131,3 +1133,308 @@ def test_provider_reply_linkage_precedes_ambiguous_conversation(db_session: Sess
     ).process(core["revision"].id)
     assert result.awaited_response_id == chosen.id
     assert chosen.status is AwaitedResponseStatus.SATISFIED
+
+
+def test_late_terminal_reply_creates_one_owner_prompt(db_session: Session) -> None:
+    core = seed_core(db_session)
+    chosen = awaited(db_session, core)
+    sent = OutboxService(db_session).create_beeper(
+        task_instance_id=core["task"].id,
+        conversation_id=core["conversation"].id,
+        participant_ids=[core["participant"].id],
+        final_text="question",
+        message_kind=MessageKind.INITIAL,
+        idempotency_key="late-terminal-prompt",
+    )
+    sent.status = OutboxStatus.SENT
+    db_session.add_all(
+        [
+            OutboxDeliveryAttempt(
+                outbox_message_id=sent.id,
+                started_at=NOW,
+                finished_at=NOW,
+                result=AttemptResult.SUCCESS,
+                provider_message_id="provider:late-terminal-prompt",
+            ),
+            AwaitedResponsePrompt(
+                awaited_response_id=chosen.id,
+                outbox_message_id=sent.id,
+            ),
+        ]
+    )
+    core["message"].provider_reply_to_message_id = "provider:late-terminal-prompt"
+    db_session.flush()
+    TaskService(db_session).terminalize(core["task"].id, TaskStatus.COMPLETED)
+
+    service = CorrelationOrchestrator(
+        db_session,
+        semantic=Semantic(),
+        classifier=Classifier(Classification(kind="OTHER")),
+        owner_chat_id=99,
+    )
+    first = service.process(core["revision"].id)
+    second = service.process(core["revision"].id)
+
+    assert first.outcome == "LATE_TERMINAL"
+    assert second.outcome == "ALREADY_CORRELATED"
+    assert core["task"].status is TaskStatus.COMPLETED
+    assert chosen.status is AwaitedResponseStatus.CANCELLED
+    assert core["participant"].availability_status is AvailabilityStatus.UNKNOWN
+    prompts = list(
+        db_session.scalars(
+            select(OutboxMessage)
+            .join(DecisionRequestPrompt)
+            .join(DecisionRequest)
+            .where(DecisionRequest.type == "LATE_TERMINAL_MESSAGE")
+        )
+    )
+    assert len(prompts) == 1
+    assert core["revision"].text in prompts[0].final_text
+    assert "`dismiss`" in prompts[0].final_text
+    db_session.commit()
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    context = DatabaseValidatorContextProvider(
+        factory,
+        facts=DatabaseContextProvider(),
+        owner_chat_id=99,
+    ).context_for(prompts[0].id, prompts[0].message_kind)
+    assert any("terminal" in claim for claim in context.allowed_claims)
+    assert not any(core["revision"].text in claim for claim in context.allowed_claims)
+    assert any(core["revision"].text in item for item in context.untrusted_data)
+
+    class ExactLatePromptBackend:
+        def infer(self, *, operation: str, payload: dict[str, object]) -> dict[str, object]:
+            assert operation == "message_validator"
+            assert payload["exact_text"] == prompts[0].final_text
+            assert tuple(payload["allowed_claims"]) == context.allowed_claims
+            assert tuple(payload["untrusted_data"]) == context.untrusted_data
+            return {"category": "VALID", "critique": None}
+
+    result = IndependentMessageValidator(ExactLatePromptBackend()).review(
+        text=prompts[0].final_text,
+        context=context,
+    )
+    assert result.category.value == "VALID"
+
+
+def test_late_terminal_prompt_dismisses_only_by_reply_to_current_revision(
+    db_session: Session,
+) -> None:
+    core = seed_core(db_session)
+    chosen = awaited(db_session, core)
+    sent = OutboxService(db_session).create_beeper(
+        task_instance_id=core["task"].id,
+        conversation_id=core["conversation"].id,
+        participant_ids=[core["participant"].id],
+        final_text="question",
+        message_kind=MessageKind.INITIAL,
+        idempotency_key="late-terminal-dismiss-source",
+    )
+    sent.status = OutboxStatus.SENT
+    db_session.add_all(
+        [
+            OutboxDeliveryAttempt(
+                outbox_message_id=sent.id,
+                started_at=NOW,
+                finished_at=NOW,
+                result=AttemptResult.SUCCESS,
+                provider_message_id="provider:late-terminal-dismiss-source",
+            ),
+            AwaitedResponsePrompt(
+                awaited_response_id=chosen.id,
+                outbox_message_id=sent.id,
+            ),
+        ]
+    )
+    core["message"].provider_reply_to_message_id = (
+        "provider:late-terminal-dismiss-source"
+    )
+    db_session.flush()
+    TaskService(db_session).terminalize(core["task"].id, TaskStatus.CANCELLED)
+    result = CorrelationOrchestrator(
+        db_session,
+        semantic=Semantic(),
+        classifier=Classifier(Classification(kind="OTHER")),
+        owner_chat_id=99,
+    ).process(core["revision"].id)
+    prompt = db_session.scalar(
+        select(OutboxMessage)
+        .join(DecisionRequestPrompt)
+        .where(DecisionRequestPrompt.decision_request_id == result.decision_request_id)
+    )
+    assert prompt is not None
+    prompt.status = OutboxStatus.SENT
+    db_session.add(
+        OutboxDeliveryAttempt(
+            outbox_message_id=prompt.id,
+            started_at=NOW,
+            finished_at=NOW,
+            result=AttemptResult.SUCCESS,
+            provider_message_id="901",
+        )
+    )
+    db_session.commit()
+
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    handler = ProductionOwnerCommandHandler(
+        factory,
+        owner_chat_id=99,
+        resolver=object(),  # type: ignore[arg-type]
+        generation=object(),  # type: ignore[arg-type]
+    )
+    control = TelegramControlGateway(
+        factory,
+        owner_id=7,
+        parser=object(),  # type: ignore[arg-type]
+        handler=handler,
+    )
+    standalone = {
+        "update_id": 900,
+        "message": {
+            "message_id": 900,
+            "from": {"id": 7},
+            "chat": {"id": 99, "type": "private"},
+            "text": "dismiss",
+        },
+    }
+    with factory() as session:
+        assert control._resolve_decision(session, standalone, None) is None
+
+    reply = {
+        "update_id": 901,
+        "message": {
+            "message_id": 902,
+            "from": {"id": 7},
+            "chat": {"id": 99, "type": "private"},
+            "text": "dismiss",
+            "reply_to_message": {"message_id": 901},
+        },
+    }
+    received = control.receive(reply)
+    control.process(received.telegram_update_row_id)
+    with factory() as session:
+        decision = session.get(DecisionRequest, result.decision_request_id)
+        assert decision.status is DecisionStatus.CLOSED
+        assert decision.close_reason.value == "DISMISSED"
+        assert decision.resolution_json is None
+        assert session.get(TaskInstance, core["task"].id).status is TaskStatus.CANCELLED
+        assert (
+            session.get(TaskParticipant, core["participant"].id).availability_status
+            is AvailabilityStatus.UNKNOWN
+        )
+
+
+def test_edit_makes_old_late_terminal_decision_subject_resolved(
+    db_session: Session,
+) -> None:
+    core = seed_core(db_session)
+    chosen = awaited(db_session, core)
+    sent = OutboxService(db_session).create_beeper(
+        task_instance_id=core["task"].id,
+        conversation_id=core["conversation"].id,
+        participant_ids=[core["participant"].id],
+        final_text="question",
+        message_kind=MessageKind.INITIAL,
+        idempotency_key="late-terminal-edit-source",
+    )
+    sent.status = OutboxStatus.SENT
+    db_session.add_all(
+        [
+            OutboxDeliveryAttempt(
+                outbox_message_id=sent.id,
+                started_at=NOW,
+                finished_at=NOW,
+                result=AttemptResult.SUCCESS,
+                provider_message_id="provider:late-terminal-edit-source",
+            ),
+            AwaitedResponsePrompt(
+                awaited_response_id=chosen.id,
+                outbox_message_id=sent.id,
+            ),
+        ]
+    )
+    core["message"].provider_reply_to_message_id = "provider:late-terminal-edit-source"
+    db_session.flush()
+    TaskService(db_session).terminalize(core["task"].id, TaskStatus.COMPLETED)
+    service = CorrelationOrchestrator(
+        db_session,
+        semantic=Semantic(),
+        classifier=Classifier(Classification(kind="OTHER")),
+        owner_chat_id=99,
+    )
+    old_result = service.process(core["revision"].id)
+    old_prompt = db_session.scalar(
+        select(OutboxMessage)
+        .join(DecisionRequestPrompt)
+        .where(DecisionRequestPrompt.decision_request_id == old_result.decision_request_id)
+    )
+    assert old_prompt is not None
+    old_prompt.status = OutboxStatus.SENT
+    db_session.add(
+        OutboxDeliveryAttempt(
+            outbox_message_id=old_prompt.id,
+            started_at=NOW,
+            finished_at=NOW,
+            result=AttemptResult.SUCCESS,
+            provider_message_id="902",
+        )
+    )
+    edited = MessageRevision(
+        message_id=core["message"].id,
+        provider_revision_key="r2",
+        provider_sequence=2,
+        content_hash="b" * 64,
+        text="Actually, this is the edited late reply.",
+        content_support=ContentSupport.SUPPORTED,
+        processing_status=ProcessingStatus.PENDING,
+    )
+    db_session.add(edited)
+    db_session.flush()
+    core["message"].current_revision_id = edited.id
+    new_result = service.process(edited.id)
+    db_session.commit()
+
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    handler = ProductionOwnerCommandHandler(
+        factory,
+        owner_chat_id=99,
+        resolver=object(),  # type: ignore[arg-type]
+        generation=object(),  # type: ignore[arg-type]
+    )
+    control = TelegramControlGateway(
+        factory,
+        owner_id=7,
+        parser=object(),  # type: ignore[arg-type]
+        handler=handler,
+    )
+    reply = {
+        "update_id": 902,
+        "message": {
+            "message_id": 903,
+            "from": {"id": 7},
+            "chat": {"id": 99, "type": "private"},
+            "text": "dismiss",
+            "reply_to_message": {"message_id": 902},
+        },
+    }
+    received = control.receive(reply)
+    control.process(received.telegram_update_row_id)
+
+    with factory() as session:
+        old_decision = session.get(DecisionRequest, old_result.decision_request_id)
+        current_decision = session.get(DecisionRequest, new_result.decision_request_id)
+        assert old_decision.close_reason.value == "SUBJECT_RESOLVED"
+        assert current_decision.status is DecisionStatus.PENDING
+        assert current_decision.message_revision_id == edited.id
+        assert session.get(TaskInstance, core["task"].id).status is TaskStatus.COMPLETED
+        assert (
+            session.get(TaskParticipant, core["participant"].id).availability_status
+            is AvailabilityStatus.UNKNOWN
+        )
+        assert session.scalar(
+            select(func.count(DecisionRequestPrompt.outbox_message_id)).where(
+                DecisionRequestPrompt.decision_request_id.in_(
+                    [old_decision.id, current_decision.id]
+                )
+            )
+        ) == 2

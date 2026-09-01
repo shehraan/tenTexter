@@ -16,6 +16,7 @@ from ten_texter.correlation import (
     third_party_subject_context,
 )
 from ten_texter.decision_prompts import owner_command_review_prompt
+from ten_texter.decision_prompt_context import late_terminal_subject
 from ten_texter.domain import DecisionService, DomainError, ProposalService
 from ten_texter.inbound import (
     ordering_conflict_candidates,
@@ -23,6 +24,7 @@ from ten_texter.inbound import (
 )
 from ten_texter.enums import (
     AwaitedResponseStatus,
+    DecisionCloseReason,
     DecisionStatus,
     MessageKind,
     OutboxCancelReason,
@@ -138,6 +140,14 @@ class ProductionOwnerCommandHandler:
                 return PreparedOwnerDecision(
                     "select_revision", message_revision_id=selected_id
                 )
+            if decision.type == "LATE_TERMINAL_MESSAGE":
+                if action != "dismiss":
+                    raise DomainError(
+                        "late terminal message decisions require `dismiss`"
+                    )
+                if late_terminal_subject(session, decision) is None:
+                    return PreparedOwnerDecision("stale")
+                return PreparedOwnerDecision("dismiss")
             if decision.message_revision_id is not None:
                 if action != "select" or selected_id is None:
                     raise DomainError("correlation decisions require `select <awaited-response-id>`")
@@ -385,6 +395,17 @@ class ProductionOwnerCommandHandler:
                 subject_still_requires_decision=still_requires_ordering,
                 apply=apply_ordering,
             )
+            return
+        if decision.type == "LATE_TERMINAL_MESSAGE":
+            if payload.action not in {"dismiss", "stale"}:
+                raise DomainError("late terminal message decisions require `dismiss`")
+            reason = (
+                DecisionCloseReason.DISMISSED
+                if payload.action == "dismiss"
+                and late_terminal_subject(session, decision) is not None
+                else DecisionCloseReason.SUBJECT_RESOLVED
+            )
+            DecisionService(session).close(decision.id, reason)
             return
         if decision.message_revision_id is not None:
             revision = session.get(MessageRevision, decision.message_revision_id)

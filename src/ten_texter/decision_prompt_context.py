@@ -11,6 +11,9 @@ from ten_texter.decision_prompts import (
     bounded_revision_preview,
     correlation_ambiguity_prompt,
     counterproposal_prompt,
+    late_terminal_message_prompt,
+    late_terminal_message_trusted_claims,
+    late_terminal_message_untrusted_data,
     ordering_conflict_prompt,
     ordering_conflict_trusted_claims,
     ordering_conflict_untrusted_data,
@@ -25,6 +28,7 @@ from ten_texter.enums import (
     MessageKind,
     OutboxStatus,
     ProposalStatus,
+    TaskStatus,
     Transport,
 )
 from ten_texter.models import (
@@ -32,10 +36,12 @@ from ten_texter.models import (
     DecisionRequest,
     DecisionRequestAwaitedResponseCandidate,
     DecisionRequestPrompt,
+    Identity,
     Message,
     MessageRevision,
     OutboxMessage,
     Proposal,
+    Person,
     TaskInstance,
     TaskParticipant,
     TelegramOutboxDestination,
@@ -63,6 +69,66 @@ class DecisionPromptAuthorization:
             self.allowed_claims,
             self.untrusted_data,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class LateTerminalSubject:
+    task_id: int
+    topic_key: str
+    task_status: str
+    sender_name: str
+    revision_id: int
+    participant_text: str | None
+
+
+def late_terminal_subject(
+    session: Session, decision: DecisionRequest
+) -> LateTerminalSubject | None:
+    if decision.type != "LATE_TERMINAL_MESSAGE" or decision.message_revision_id is None:
+        return None
+    revision = session.get(MessageRevision, decision.message_revision_id)
+    inbound = session.get(Message, revision.message_id) if revision is not None else None
+    awaited = (
+        session.get(AwaitedResponse, revision.awaited_response_id)
+        if revision is not None and revision.awaited_response_id is not None
+        else None
+    )
+    participant = (
+        session.get(TaskParticipant, awaited.task_participant_id)
+        if awaited is not None
+        else None
+    )
+    task = (
+        session.get(TaskInstance, participant.task_instance_id)
+        if participant is not None
+        else None
+    )
+    sender = (
+        session.get(Identity, inbound.sender_identity_id)
+        if inbound is not None
+        else None
+    )
+    person = session.get(Person, sender.person_id) if sender is not None else None
+    if (
+        revision is None
+        or inbound is None
+        or inbound.current_revision_id != revision.id
+        or awaited is None
+        or participant is None
+        or task is None
+        or task.status is TaskStatus.ACTIVE
+        or decision.task_instance_id != task.id
+        or person is None
+    ):
+        return None
+    return LateTerminalSubject(
+        task_id=task.id,
+        topic_key=task.topic_key,
+        task_status=task.status.value,
+        sender_name=person.display_name,
+        revision_id=revision.id,
+        participant_text=revision.text,
+    )
 
 
 def decision_for_prompt(
@@ -165,6 +231,36 @@ def _authorization_for_subject(
             proposal.proposed_value,
         )
         return DecisionPromptAuthorization(text, (text,))
+
+    if decision.type == "LATE_TERMINAL_MESSAGE":
+        subject = late_terminal_subject(session, decision)
+        if (
+            subject is None
+            or prompt.idempotency_key != f"decision:{decision.id}:owner-prompt"
+        ):
+            return None
+        text = late_terminal_message_prompt(
+            task_id=subject.task_id,
+            topic_key=subject.topic_key,
+            task_status=subject.task_status,
+            sender_name=subject.sender_name,
+            revision_id=subject.revision_id,
+            participant_text=subject.participant_text,
+        )
+        return DecisionPromptAuthorization(
+            text,
+            late_terminal_message_trusted_claims(
+                task_id=subject.task_id,
+                topic_key=subject.topic_key,
+                task_status=subject.task_status,
+                sender_name=subject.sender_name,
+                revision_id=subject.revision_id,
+            ),
+            late_terminal_message_untrusted_data(
+                revision_id=subject.revision_id,
+                participant_text=subject.participant_text,
+            ),
+        )
 
     if (
         decision.type in _CORRELATION_DECISION_TYPES

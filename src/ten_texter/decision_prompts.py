@@ -46,6 +46,46 @@ def counterproposal_prompt(field: str, operation: str, proposed_value: object) -
     )
 
 
+def late_terminal_message_prompt(
+    *,
+    task_id: int,
+    topic_key: str,
+    task_status: str,
+    sender_name: str,
+    revision_id: int,
+    participant_text: str | None,
+) -> str:
+    text = "<deleted>" if participant_text is None else repr(participant_text)
+    return (
+        f"Late message from {sender_name} for terminal {topic_key} task {task_id} "
+        f"({task_status.lower()}), revision {revision_id}.\n"
+        f"Untrusted participant text (quoted exactly): {text}\n"
+        "Reply to this Telegram message with `dismiss` to acknowledge it."
+    )
+
+
+def late_terminal_message_trusted_claims(
+    *,
+    task_id: int,
+    topic_key: str,
+    task_status: str,
+    sender_name: str,
+    revision_id: int,
+) -> tuple[str, ...]:
+    return (
+        f"Task {task_id} for {topic_key} is terminal with status {task_status.lower()}.",
+        f"Revision {revision_id} is a late message from {sender_name} for task {task_id}.",
+        "The owner may acknowledge the late message by replying to this Telegram message with `dismiss`.",
+    )
+
+
+def late_terminal_message_untrusted_data(
+    *, revision_id: int, participant_text: str | None
+) -> tuple[str, ...]:
+    text = "<deleted>" if participant_text is None else participant_text
+    return (f"revision {revision_id} participant text={text!r}",)
+
+
 def correlation_ambiguity_prompt(
     candidates: Iterable[tuple[int, str, str, int, int, str]],
 ) -> str:

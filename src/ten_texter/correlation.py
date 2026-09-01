@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from ten_texter.decision_prompts import (
     correlation_ambiguity_prompt,
     counterproposal_prompt,
+    late_terminal_message_prompt,
 )
 from ten_texter.domain import (
     AvailabilityService,
@@ -460,7 +461,44 @@ class CorrelationOrchestrator:
                 "LATE_TERMINAL_MESSAGE",
                 {"awaited_response_id": awaited.id, "correlation_source": source},
                 [],
+                task_instance_id=task.id,
             )
+            if self.owner_chat_id is not None:
+                message = self.session.get(Message, revision.message_id)
+                sender = (
+                    self.session.get(Identity, message.sender_identity_id)
+                    if message is not None
+                    else None
+                )
+                person = self.session.get(Person, sender.person_id) if sender is not None else None
+                if person is None:
+                    raise DomainError("late terminal message sender is unavailable")
+                prompt = OutboxService(self.session).create_owner(
+                    telegram_chat_id=self.owner_chat_id,
+                    final_text=late_terminal_message_prompt(
+                        task_id=task.id,
+                        topic_key=task.topic_key,
+                        task_status=task.status.value,
+                        sender_name=person.display_name,
+                        revision_id=revision.id,
+                        participant_text=revision.text,
+                    ),
+                    message_kind=MessageKind.NOTIFICATION,
+                    idempotency_key=f"decision:{decision.id}:owner-prompt",
+                    task_instance_id=task.id,
+                    parent_terminal_policy=ParentTerminalPolicy.SURVIVE,
+                )
+                if self.session.scalar(
+                    select(DecisionRequestPrompt).where(
+                        DecisionRequestPrompt.outbox_message_id == prompt.id
+                    )
+                ) is None:
+                    self.session.add(
+                        DecisionRequestPrompt(
+                            decision_request_id=decision.id,
+                            outbox_message_id=prompt.id,
+                        )
+                    )
             self.session.flush()
             return CorrelationResult("LATE_TERMINAL", awaited.id, decision.id)
 
@@ -787,6 +825,8 @@ class CorrelationOrchestrator:
         decision_type: str,
         context: dict[str, object],
         candidates: list[AwaitedResponse],
+        *,
+        task_instance_id: int | None = None,
     ) -> DecisionRequest:
         existing = self.session.scalar(
             select(DecisionRequest).where(
@@ -801,6 +841,7 @@ class CorrelationOrchestrator:
             subject_kind="message_revision",
             subject_id=revision.id,
             context=context,
+            task_instance_id=task_instance_id,
             parent_terminal_policy=ParentTerminalPolicy.SURVIVE,
         )
         self.session.add_all(
