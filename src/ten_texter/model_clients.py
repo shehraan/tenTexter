@@ -11,7 +11,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from ten_texter.correlation import AtomicProposal, Classification
+from ten_texter.correlation import (
+    AtomicProposal,
+    AvailabilitySubjectCandidate,
+    AvailabilitySubjectContext,
+    Classification,
+)
 from ten_texter.enums import AvailabilityEvidence, AvailabilityStatus
 from ten_texter.models import AwaitedResponse, MessageRevision, TaskParticipant, TaskTrigger
 
@@ -210,6 +215,14 @@ class ClassificationOutput(StrictOutput):
             "availability; THIRD_PARTY means the sender is reporting another person's availability."
         ),
     )
+    subject_task_participant_id: int | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "For THIRD_PARTY availability only, the exact task_participant_id selected from "
+            "third_party_subject_candidates; null for FIRST_PARTY and every other kind."
+        ),
+    )
     proposals: list[AtomicProposalOutput] = Field(default_factory=list, max_length=10)
 
     @model_validator(mode="after")
@@ -217,10 +230,23 @@ class ClassificationOutput(StrictOutput):
         if self.kind is ClassificationKind.AVAILABILITY:
             if self.availability in {None, AvailabilityStatus.UNKNOWN} or self.proposals:
                 raise ValueError("availability classification requires one non-UNKNOWN availability")
+            if self.evidence is AvailabilityEvidence.FIRST_PARTY:
+                if self.subject_task_participant_id is not None:
+                    raise ValueError("first-party availability cannot select another subject")
+            elif self.subject_task_participant_id is None:
+                raise ValueError("third-party availability requires one candidate subject")
         elif self.kind is ClassificationKind.COUNTERPROPOSAL:
-            if not self.proposals or self.availability is not None:
+            if (
+                not self.proposals
+                or self.availability is not None
+                or self.subject_task_participant_id is not None
+            ):
                 raise ValueError("counterproposal classification requires atomic proposals")
-        elif self.availability is not None or self.proposals:
+        elif (
+            self.availability is not None
+            or self.proposals
+            or self.subject_task_participant_id is not None
+        ):
             raise ValueError("ambiguous/other classification cannot carry semantic effects")
         return self
 
@@ -230,6 +256,7 @@ def classification_output_json_schema() -> dict[str, Any]:
     generated = ClassificationOutput.model_json_schema()
     definitions = generated["$defs"]
     evidence = generated["properties"]["evidence"]
+    subject = generated["properties"]["subject_task_participant_id"]
     proposals = generated["properties"]["proposals"]
     availability = {
         **definitions["AvailabilityStatus"],
@@ -239,11 +266,19 @@ def classification_output_json_schema() -> dict[str, Any]:
             if value != AvailabilityStatus.UNKNOWN.value
         ],
     }
-    required = ["kind", "availability", "evidence", "proposals"]
+    required = [
+        "kind",
+        "availability",
+        "evidence",
+        "subject_task_participant_id",
+        "proposals",
+    ]
 
     def branch(
         kind: ClassificationKind,
         availability_schema: dict[str, Any],
+        evidence_schema: dict[str, Any],
+        subject_schema: dict[str, Any],
         proposals_schema: dict[str, Any],
     ) -> dict[str, Any]:
         return {
@@ -251,7 +286,8 @@ def classification_output_json_schema() -> dict[str, Any]:
             "properties": {
                 "kind": {"const": kind.value},
                 "availability": availability_schema,
-                "evidence": evidence,
+                "evidence": evidence_schema,
+                "subject_task_participant_id": subject_schema,
                 "proposals": proposals_schema,
             },
             "required": required,
@@ -259,18 +295,57 @@ def classification_output_json_schema() -> dict[str, Any]:
         }
 
     empty_proposals = {**proposals, "maxItems": 0}
+    subject_id = next(
+        option for option in subject["anyOf"] if option.get("type") == "integer"
+    )
+    evidence_description = evidence["description"]
     return {
         "title": generated.get("title", "ClassificationOutput"),
         "$defs": definitions,
         "oneOf": [
-            branch(ClassificationKind.AVAILABILITY, availability, empty_proposals),
+            branch(
+                ClassificationKind.AVAILABILITY,
+                availability,
+                {
+                    "type": "string",
+                    "const": AvailabilityEvidence.FIRST_PARTY.value,
+                    "description": evidence_description,
+                },
+                {"type": "null"},
+                empty_proposals,
+            ),
+            branch(
+                ClassificationKind.AVAILABILITY,
+                availability,
+                {
+                    "type": "string",
+                    "const": AvailabilityEvidence.THIRD_PARTY.value,
+                    "description": evidence_description,
+                },
+                subject_id,
+                empty_proposals,
+            ),
             branch(
                 ClassificationKind.COUNTERPROPOSAL,
                 {"type": "null"},
+                evidence,
+                {"type": "null"},
                 {**proposals, "minItems": 1},
             ),
-            branch(ClassificationKind.AMBIGUOUS, {"type": "null"}, empty_proposals),
-            branch(ClassificationKind.OTHER, {"type": "null"}, empty_proposals),
+            branch(
+                ClassificationKind.AMBIGUOUS,
+                {"type": "null"},
+                evidence,
+                {"type": "null"},
+                empty_proposals,
+            ),
+            branch(
+                ClassificationKind.OTHER,
+                {"type": "null"},
+                evidence,
+                {"type": "null"},
+                empty_proposals,
+            ),
         ],
     }
 
@@ -410,7 +485,12 @@ class MessageClassifier:
     def __init__(self, backend: ModelBackend):
         self.backend = backend
 
-    def classify(self, revision: MessageRevision, awaited_response: AwaitedResponse) -> Classification:
+    def classify(
+        self,
+        revision: MessageRevision,
+        awaited_response: AwaitedResponse,
+        third_party_subject_context: AvailabilitySubjectContext,
+    ) -> Classification:
         output = self.backend.infer(
             operation="message_classifier",
             payload={
@@ -424,17 +504,57 @@ class MessageClassifier:
                     "own availability, for example: \"Yeah I am.\", \"I'm free\", \"I can't make "
                     "it\", or \"works for me\". THIRD_PARTY means the sender is reporting another "
                     "person's availability, for example: \"Kyran is free\", \"Amith said he can "
-                    "come\", or \"she can't make it\"."
+                    "come\", or \"she can't make it\". For FIRST_PARTY set "
+                    "subject_task_participant_id to null. For THIRD_PARTY select exactly one "
+                    "task_participant_id from third_party_subject_candidates. If the subject is "
+                    "absent, outside those candidates, ambiguous, or multiple people are reported, "
+                    "return AMBIGUOUS with a null subject instead. If "
+                    "third_party_subject_candidates_complete is false, no third-party subject can "
+                    "be selected; FIRST_PARTY remains valid. Names listed in "
+                    "ambiguous_third_party_display_names are duplicate display names and cannot "
+                    "identify one candidate, so return AMBIGUOUS for those reports."
                 ),
                 "untrusted_participant_text": revision.text,
                 "expected_response_type": awaited_response.expected_response_type,
+                "third_party_subject_candidates": [
+                    {
+                        "task_participant_id": candidate.task_participant_id,
+                        "display_name": candidate.display_name,
+                    }
+                    for candidate in third_party_subject_context.candidates
+                ],
+                "third_party_subject_candidates_complete": (
+                    third_party_subject_context.complete
+                ),
+                "ambiguous_third_party_display_names": list(
+                    third_party_subject_context.ambiguous_display_names
+                ),
             },
         )
         parsed: ClassificationOutput = _validate(ClassificationOutput, output)
+        subject_id = parsed.subject_task_participant_id
+        if subject_id is not None:
+            candidate_ids = {
+                candidate.task_participant_id
+                for candidate in third_party_subject_context.candidates
+            }
+            if not third_party_subject_context.complete:
+                raise ModelOutputError(
+                    "message classifier selected a subject from an incomplete candidate set"
+                )
+            if subject_id not in candidate_ids:
+                raise ModelOutputError(
+                    "message classifier selected a non-candidate availability subject"
+                )
+            if subject_id not in third_party_subject_context.selectable_ids:
+                raise ModelOutputError(
+                    "message classifier selected an ambiguous availability subject"
+                )
         return Classification(
             kind=parsed.kind.value,
             availability=parsed.availability,
             evidence=parsed.evidence,
+            subject_task_participant_id=parsed.subject_task_participant_id,
             proposals=tuple(
                 AtomicProposal(
                     field=item.field,

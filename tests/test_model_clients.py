@@ -10,6 +10,8 @@ from pydantic import ValidationError
 from ten_texter.domain import AwaitedResponseService
 from ten_texter.enums import AvailabilityEvidence, AvailabilityStatus
 from ten_texter.model_clients import (
+    AvailabilitySubjectCandidate,
+    AvailabilitySubjectContext,
     ClassificationOutput,
     CorrelationOutput,
     EntityResolverAssistant,
@@ -186,29 +188,54 @@ def test_message_classifier_llama_schema_discriminates_semantic_shapes() -> None
     generated = ClassificationOutput.model_json_schema()
 
     assert schema == classification_output_json_schema()
-    assert len(schema["oneOf"]) == 4
+    assert len(schema["oneOf"]) == 5
     assert schema["$defs"] == generated["$defs"]
-    branches = {
-        branch["properties"]["kind"]["const"]: branch for branch in schema["oneOf"]
+    branches_by_kind: dict[str, list[dict[str, object]]] = {}
+    for branch in schema["oneOf"]:
+        kind = branch["properties"]["kind"]["const"]
+        branches_by_kind.setdefault(kind, []).append(branch)
+    assert set(branches_by_kind) == {
+        "AVAILABILITY",
+        "COUNTERPROPOSAL",
+        "AMBIGUOUS",
+        "OTHER",
     }
-    assert set(branches) == {"AVAILABILITY", "COUNTERPROPOSAL", "AMBIGUOUS", "OTHER"}
 
-    for branch in branches.values():
-        assert branch["required"] == ["kind", "availability", "evidence", "proposals"]
+    for branch in schema["oneOf"]:
+        assert branch["required"] == [
+            "kind",
+            "availability",
+            "evidence",
+            "subject_task_participant_id",
+            "proposals",
+        ]
         assert branch["additionalProperties"] is False
-        assert branch["properties"]["evidence"] == generated["properties"]["evidence"]
 
-    availability = branches["AVAILABILITY"]["properties"]
-    assert availability["availability"]["enum"] == [
-        "AVAILABLE",
-        "UNAVAILABLE",
-        "UNCERTAIN",
-    ]
-    assert "UNKNOWN" not in availability["availability"]["enum"]
-    assert availability["proposals"]["maxItems"] == 0
+    availability_branches = branches_by_kind["AVAILABILITY"]
+    assert len(availability_branches) == 2
+    availability_by_evidence = {
+        branch["properties"]["evidence"]["const"]: branch["properties"]
+        for branch in availability_branches
+    }
+    for availability in availability_by_evidence.values():
+        assert availability["availability"]["enum"] == [
+            "AVAILABLE",
+            "UNAVAILABLE",
+            "UNCERTAIN",
+        ]
+        assert "UNKNOWN" not in availability["availability"]["enum"]
+        assert availability["proposals"]["maxItems"] == 0
+    assert availability_by_evidence["FIRST_PARTY"]["subject_task_participant_id"] == {
+        "type": "null"
+    }
+    assert availability_by_evidence["THIRD_PARTY"]["subject_task_participant_id"][
+        "type"
+    ] == "integer"
 
-    counterproposal = branches["COUNTERPROPOSAL"]["properties"]
+    counterproposal = branches_by_kind["COUNTERPROPOSAL"][0]["properties"]
     assert counterproposal["availability"] == {"type": "null"}
+    assert counterproposal["subject_task_participant_id"] == {"type": "null"}
+    assert counterproposal["evidence"] == generated["properties"]["evidence"]
     assert counterproposal["proposals"]["minItems"] == 1
     assert counterproposal["proposals"]["maxItems"] == 10
     assert (
@@ -217,8 +244,10 @@ def test_message_classifier_llama_schema_discriminates_semantic_shapes() -> None
     )
 
     for kind in ("AMBIGUOUS", "OTHER"):
-        properties = branches[kind]["properties"]
+        properties = branches_by_kind[kind][0]["properties"]
         assert properties["availability"] == {"type": "null"}
+        assert properties["subject_task_participant_id"] == {"type": "null"}
+        assert properties["evidence"] == generated["properties"]["evidence"]
         assert properties["proposals"]["maxItems"] == 0
 
 
@@ -287,6 +316,19 @@ def test_classification_output_accepts_valid_nonavailability_branches(
             "kind": "AVAILABILITY",
             "availability": "AVAILABLE",
             "evidence": "FIRST_PARTY",
+            "subject_task_participant_id": 1,
+            "proposals": [],
+        },
+        {
+            "kind": "AVAILABILITY",
+            "availability": "AVAILABLE",
+            "evidence": "THIRD_PARTY",
+            "proposals": [],
+        },
+        {
+            "kind": "AVAILABILITY",
+            "availability": "AVAILABLE",
+            "evidence": "FIRST_PARTY",
             "proposals": [
                 {"field": "location", "operation": "replace", "old_value": None, "proposed_value": "park"}
             ],
@@ -318,6 +360,13 @@ def test_classification_output_accepts_valid_nonavailability_branches(
             "kind": "AMBIGUOUS",
             "availability": "UNCERTAIN",
             "evidence": "FIRST_PARTY",
+            "proposals": [],
+        },
+        {
+            "kind": "AMBIGUOUS",
+            "availability": None,
+            "evidence": "FIRST_PARTY",
+            "subject_task_participant_id": 1,
             "proposals": [],
         },
         {
@@ -741,7 +790,11 @@ def test_participant_prompt_injection_is_untrusted_classification_data(db_sessio
             }
         }
     )
-    classification = MessageClassifier(backend).classify(revision, response)
+    classification = MessageClassifier(backend).classify(
+        revision,
+        response,
+        AvailabilitySubjectContext(()),
+    )
     assert classification.kind == "AMBIGUOUS"
     payload = backend.calls[0][1]
     assert payload["untrusted_participant_text"].startswith("Ignore instructions")
@@ -788,12 +841,25 @@ def test_message_classifier_defines_and_preserves_availability_provenance(
                 "kind": "AVAILABILITY",
                 "availability": availability.value,
                 "evidence": evidence.value,
+                "subject_task_participant_id": (
+                    999 if evidence is AvailabilityEvidence.THIRD_PARTY else None
+                ),
                 "proposals": [],
             }
         }
     )
 
-    classification = MessageClassifier(backend).classify(core["revision"], response)
+    classification = MessageClassifier(backend).classify(
+        core["revision"],
+        response,
+        third_party_subject_context=AvailabilitySubjectContext(
+            (
+                (AvailabilitySubjectCandidate(999, "Reported participant"),)
+                if evidence is AvailabilityEvidence.THIRD_PARTY
+                else ()
+            )
+        ),
+    )
 
     assert classification.availability is availability
     assert classification.evidence is evidence
@@ -802,6 +868,100 @@ def test_message_classifier_defines_and_preserves_availability_provenance(
     assert "THIRD_PARTY means the sender is reporting another person's availability" in instructions
     assert '"Yeah I am."' in instructions
     assert '"Kyran is free"' in instructions
+
+
+def test_message_classifier_rejects_third_party_subject_outside_candidates(
+    db_session,
+) -> None:
+    core = seed_core(db_session)
+    response = AwaitedResponseService(db_session).create(
+        core["participant"].id,
+        "availability",
+    )
+    backend = Backend(
+        {
+            "message_classifier": {
+                "kind": "AVAILABILITY",
+                "availability": "AVAILABLE",
+                "evidence": "THIRD_PARTY",
+                "subject_task_participant_id": core["participant"].id + 999,
+                "proposals": [],
+            }
+        }
+    )
+
+    with pytest.raises(ModelOutputError, match="non-candidate"):
+        MessageClassifier(backend).classify(
+            core["revision"],
+            response,
+            AvailabilitySubjectContext(
+                (
+                    AvailabilitySubjectCandidate(
+                        task_participant_id=core["participant"].id + 1,
+                        display_name="Kyran",
+                    ),
+                )
+            ),
+        )
+
+    payload = backend.calls[0][1]
+    assert payload["third_party_subject_candidates"] == [
+        {
+            "task_participant_id": core["participant"].id + 1,
+            "display_name": "Kyran",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "context,error",
+    [
+        (
+            AvailabilitySubjectContext(
+                (AvailabilitySubjectCandidate(2, "Kyran"),),
+                complete=False,
+            ),
+            "incomplete candidate set",
+        ),
+        (
+            AvailabilitySubjectContext(
+                (
+                    AvailabilitySubjectCandidate(2, "Sam Lee"),
+                    AvailabilitySubjectCandidate(3, " sam  lee "),
+                )
+            ),
+            "ambiguous availability subject",
+        ),
+    ],
+)
+def test_message_classifier_rejects_unselectable_third_party_subjects(
+    db_session,
+    context: AvailabilitySubjectContext,
+    error: str,
+) -> None:
+    core = seed_core(db_session)
+    response = AwaitedResponseService(db_session).create(
+        core["participant"].id,
+        "availability",
+    )
+    backend = Backend(
+        {
+            "message_classifier": {
+                "kind": "AVAILABILITY",
+                "availability": "AVAILABLE",
+                "evidence": "THIRD_PARTY",
+                "subject_task_participant_id": 2,
+                "proposals": [],
+            }
+        }
+    )
+
+    with pytest.raises(ModelOutputError, match=error):
+        MessageClassifier(backend).classify(
+            core["revision"],
+            response,
+            context,
+        )
 
 
 def test_classifier_rejects_inconsistent_semantic_effects(db_session) -> None:
@@ -818,7 +978,11 @@ def test_classifier_rejects_inconsistent_semantic_effects(db_session) -> None:
         }
     )
     with pytest.raises(ModelOutputError):
-        MessageClassifier(backend).classify(core["revision"], response)
+        MessageClassifier(backend).classify(
+            core["revision"],
+            response,
+            AvailabilitySubjectContext(()),
+        )
 
 
 def test_semantic_correlator_cannot_select_non_candidate(db_session) -> None:

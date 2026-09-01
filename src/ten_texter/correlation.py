@@ -62,15 +62,106 @@ class AtomicProposal:
 
 
 @dataclass(frozen=True, slots=True)
+class AvailabilitySubjectCandidate:
+    task_participant_id: int
+    display_name: str
+
+
+# Matches TaskPlan's v1 maximum participant-reference contract. Exact-task state
+# created outside that path can exceed it, so completeness is reported explicitly.
+MAX_AVAILABILITY_SUBJECT_CANDIDATES = 100
+
+
+@dataclass(frozen=True, slots=True)
+class AvailabilitySubjectContext:
+    candidates: tuple[AvailabilitySubjectCandidate, ...]
+    complete: bool = True
+    ambiguous_display_names: tuple[str, ...] = field(init=False)
+
+    def __post_init__(self) -> None:
+        counts: dict[str, int] = {}
+        for candidate in self.candidates:
+            normalized = " ".join(candidate.display_name.casefold().split())
+            counts[normalized] = counts.get(normalized, 0) + 1
+        object.__setattr__(
+            self,
+            "ambiguous_display_names",
+            tuple(
+                sorted(
+                    name
+                    for name, count in counts.items()
+                    if not name or count > 1
+                )
+            ),
+        )
+
+    @property
+    def selectable_ids(self) -> frozenset[int]:
+        if not self.complete:
+            return frozenset()
+        ambiguous = set(self.ambiguous_display_names)
+        return frozenset(
+            candidate.task_participant_id
+            for candidate in self.candidates
+            if " ".join(candidate.display_name.casefold().split()) not in ambiguous
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class Classification:
     kind: str
     availability: AvailabilityStatus | None = None
     evidence: AvailabilityEvidence = AvailabilityEvidence.FIRST_PARTY
+    subject_task_participant_id: int | None = None
     proposals: tuple[AtomicProposal, ...] = field(default_factory=tuple)
 
 
 class Classifier(Protocol):
-    def classify(self, revision: MessageRevision, awaited_response: AwaitedResponse) -> Classification: ...
+    def classify(
+        self,
+        revision: MessageRevision,
+        awaited_response: AwaitedResponse,
+        third_party_subject_context: AvailabilitySubjectContext,
+    ) -> Classification: ...
+
+
+def third_party_subject_context(
+    session: Session,
+    revision: MessageRevision,
+    awaited_response: AwaitedResponse,
+) -> AvailabilitySubjectContext:
+    """Return other participants from the exact correlated task as a bounded model set."""
+    awaited_participant = session.get(
+        TaskParticipant,
+        awaited_response.task_participant_id,
+    )
+    message = session.get(Message, revision.message_id)
+    sender = session.get(Identity, message.sender_identity_id) if message is not None else None
+    if awaited_participant is None or sender is None:
+        raise DomainError("availability subject context is unavailable")
+    rows = list(
+        session.execute(
+            select(TaskParticipant.id, Person.display_name)
+            .join(Person, Person.id == TaskParticipant.person_id)
+            .where(
+                TaskParticipant.task_instance_id == awaited_participant.task_instance_id,
+                TaskParticipant.person_id != sender.person_id,
+            )
+            .order_by(TaskParticipant.id)
+            .limit(MAX_AVAILABILITY_SUBJECT_CANDIDATES + 1)
+        )
+    )
+    complete = len(rows) <= MAX_AVAILABILITY_SUBJECT_CANDIDATES
+    return AvailabilitySubjectContext(
+        candidates=tuple(
+            AvailabilitySubjectCandidate(
+                task_participant_id=participant_id,
+                display_name=display_name,
+            )
+            for participant_id, display_name in rows[:MAX_AVAILABILITY_SUBJECT_CANDIDATES]
+        ),
+        complete=complete,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,7 +293,11 @@ class CorrelationOrchestrator:
             outcome="KNOWN",
             awaited_response_id=awaited.id,
             source=source,
-            classification=self.classifier.classify(revision, awaited),
+            classification=self.classifier.classify(
+                revision,
+                awaited,
+                third_party_subject_context(self.session, revision, awaited),
+            ),
         )
 
     @staticmethod
@@ -369,28 +464,66 @@ class CorrelationOrchestrator:
             self.session.flush()
             return CorrelationResult("LATE_TERMINAL", awaited.id, decision.id)
 
-        classification = classification or self.classifier.classify(revision, awaited)
+        classification = classification or self.classifier.classify(
+            revision,
+            awaited,
+            third_party_subject_context(self.session, revision, awaited),
+        )
+        availability_target: TaskParticipant | None = None
+        if classification.kind == "AVAILABILITY" and classification.availability is not None:
+            availability_target = self._availability_target(
+                revision,
+                task,
+                classification,
+            )
+        prior_revision_ids = list(
+            self.session.scalars(
+                select(MessageRevision.id).where(
+                    MessageRevision.message_id == revision.message_id,
+                    MessageRevision.id != revision.id,
+                )
+            )
+        )
+        lineage_owns_prior_effect, independent_effect_exists = (
+            self._awaited_response_effect_ownership(
+                revision,
+                awaited,
+                participant,
+                prior_revision_ids,
+            )
+        )
+        may_replace_awaited_status = (
+            awaited.status is not AwaitedResponseStatus.SATISFIED
+            or (lineage_owns_prior_effect and not independent_effect_exists)
+        )
         proposals_to_create = self._reconcile_previous_effects(
             revision,
             participant,
             classification,
+            availability_target,
+            prior_revision_ids,
         )
         if classification.kind == "AMBIGUOUS":
-            awaited.status = AwaitedResponseStatus.AMBIGUOUS
+            if may_replace_awaited_status:
+                awaited.status = AwaitedResponseStatus.AMBIGUOUS
             self.session.flush()
             return CorrelationResult("INTERPRETATION_AMBIGUOUS", awaited.id)
         if classification.kind == "AVAILABILITY" and classification.availability is not None:
-            AvailabilityService(self.session).apply(
-                participant.id,
+            assert availability_target is not None
+            applied = AvailabilityService(self.session).apply(
+                availability_target.id,
                 revision.id,
                 classification.availability,
                 classification.evidence,
             )
-            awaited.status = AwaitedResponseStatus.SATISFIED
-            if self.owner_chat_id is not None:
-                person = self.session.get(Person, participant.person_id)
+            if availability_target.id == participant.id:
+                awaited.status = AwaitedResponseStatus.SATISFIED
+            elif may_replace_awaited_status:
+                awaited.status = AwaitedResponseStatus.OPEN
+            if self.owner_chat_id is not None and applied:
+                person = self.session.get(Person, availability_target.person_id)
                 assert person is not None
-                status = classification.availability.value.lower()
+                status = availability_target.availability_status.value.lower()
                 OutboxService(self.session).create_owner(
                     telegram_chat_id=self.owner_chat_id,
                     task_instance_id=task.id,
@@ -399,7 +532,7 @@ class CorrelationOrchestrator:
                     ),
                     message_kind=MessageKind.NOTIFICATION,
                     idempotency_key=(
-                        f"task:{task.id}:availability:{participant.id}:revision:{revision.id}"
+                        f"task:{task.id}:availability:{availability_target.id}:revision:{revision.id}"
                     ),
                     parent_terminal_policy=ParentTerminalPolicy.SURVIVE,
                 )
@@ -450,42 +583,133 @@ class CorrelationOrchestrator:
                     )
             awaited.status = AwaitedResponseStatus.SATISFIED
         else:
-            awaited.status = AwaitedResponseStatus.AMBIGUOUS
+            if may_replace_awaited_status:
+                awaited.status = AwaitedResponseStatus.AMBIGUOUS
             self.session.flush()
             return CorrelationResult("INTERPRETATION_AMBIGUOUS", awaited.id)
         self.session.flush()
         return CorrelationResult("CORRELATED", awaited.id)
+
+    def _awaited_response_effect_ownership(
+        self,
+        revision: MessageRevision,
+        awaited: AwaitedResponse,
+        participant: TaskParticipant,
+        prior_revision_ids: list[int],
+    ) -> tuple[bool, bool]:
+        """Reconstruct semantic ownership from exact revision-backed state."""
+        source_revision = (
+            self.session.get(
+                MessageRevision,
+                participant.availability_source_revision_id,
+            )
+            if participant.availability_source_revision_id is not None
+            else None
+        )
+        lineage_availability = (
+            participant.availability_source_revision_id in prior_revision_ids
+        )
+        independent_availability = (
+            source_revision is not None
+            and source_revision.message_id != revision.message_id
+            and source_revision.awaited_response_id == awaited.id
+        )
+        lineage_proposal = self.session.scalar(
+            select(Proposal.id).where(
+                Proposal.source_message_revision_id.in_(prior_revision_ids),
+                Proposal.proposed_by_participant_id == participant.id,
+                Proposal.status != ProposalStatus.SUPERSEDED,
+            )
+        )
+        independent_proposal = self.session.scalar(
+            select(Proposal.id)
+            .join(
+                MessageRevision,
+                MessageRevision.id == Proposal.source_message_revision_id,
+            )
+            .where(
+                MessageRevision.message_id != revision.message_id,
+                MessageRevision.awaited_response_id == awaited.id,
+                Proposal.proposed_by_participant_id == participant.id,
+                Proposal.status != ProposalStatus.SUPERSEDED,
+            )
+        )
+        return (
+            lineage_availability or lineage_proposal is not None,
+            independent_availability or independent_proposal is not None,
+        )
+
+    def _availability_target(
+        self,
+        revision: MessageRevision,
+        task: TaskInstance,
+        classification: Classification,
+    ) -> TaskParticipant:
+        message = self.session.get(Message, revision.message_id)
+        sender = (
+            self.session.get(Identity, message.sender_identity_id)
+            if message is not None
+            else None
+        )
+        if sender is None:
+            raise DomainError("availability sender identity is unavailable")
+        if classification.evidence is AvailabilityEvidence.FIRST_PARTY:
+            if classification.subject_task_participant_id is not None:
+                raise DomainError("first-party availability cannot select another subject")
+            target = self.session.scalar(
+                select(TaskParticipant).where(
+                    TaskParticipant.task_instance_id == task.id,
+                    TaskParticipant.person_id == sender.person_id,
+                )
+            )
+            if target is None:
+                raise DomainError("first-party availability sender is not a task participant")
+            return target
+        subject_id = classification.subject_task_participant_id
+        if subject_id is None:
+            raise DomainError("third-party availability requires an exact subject")
+        target = self.session.get(TaskParticipant, subject_id)
+        if target is None or target.task_instance_id != task.id:
+            raise DomainError("availability subject must belong to the same task")
+        if target.person_id == sender.person_id:
+            raise DomainError("third-party availability subject must be another person")
+        return target
 
     def _reconcile_previous_effects(
         self,
         revision: MessageRevision,
         participant: TaskParticipant,
         classification: Classification,
+        availability_target: TaskParticipant | None,
+        prior_revision_ids: list[int],
     ) -> tuple[AtomicProposal, ...]:
         """Diff semantic effects owned by earlier revisions of the same message."""
-        prior_revision_ids = list(
-            self.session.scalars(
-                select(MessageRevision.id).where(
-                    MessageRevision.message_id == revision.message_id,
-                    MessageRevision.id != revision.id,
-                )
-            )
-        )
         if not prior_revision_ids:
             return classification.proposals
 
-        if (
-            participant.availability_source_revision_id in prior_revision_ids
-            and classification.kind != "AVAILABILITY"
-        ):
-            participant.availability_status = AvailabilityStatus.UNKNOWN
-            participant.availability_evidence = None
-            participant.availability_source_revision_id = None
-            participant.updated_at = utc_now()
+        prior_effect_participants = list(
+            self.session.scalars(
+                select(TaskParticipant).where(
+                    TaskParticipant.task_instance_id == participant.task_instance_id,
+                    TaskParticipant.availability_source_revision_id.in_(prior_revision_ids),
+                )
+            )
+        )
+        for prior_participant in prior_effect_participants:
+            if (
+                classification.kind == "AVAILABILITY"
+                and availability_target is not None
+                and prior_participant.id == availability_target.id
+            ):
+                continue
+            prior_participant.availability_status = AvailabilityStatus.UNKNOWN
+            prior_participant.availability_evidence = None
+            prior_participant.availability_source_revision_id = None
+            prior_participant.updated_at = utc_now()
             self.session.add(
                 TaskEvent(
-                    task_instance_id=participant.task_instance_id,
-                    task_participant_id=participant.id,
+                    task_instance_id=prior_participant.task_instance_id,
+                    task_participant_id=prior_participant.id,
                     source_message_revision_id=revision.id,
                     event_type="AVAILABILITY_RETRACTED_BY_EDIT",
                     payload_json={},

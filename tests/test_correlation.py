@@ -2,13 +2,15 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+import pytest
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from ten_texter.correlation import Classification, CorrelationOrchestrator
-from ten_texter.domain import distinct_response_count
+from ten_texter.correlation import AtomicProposal, Classification, CorrelationOrchestrator
+from ten_texter.domain import AvailabilityService, DomainError, distinct_response_count
 from ten_texter.enums import (
     AttemptResult,
+    AvailabilityEvidence,
     AvailabilityStatus,
     AwaitedResponseStatus,
     ContentSupport,
@@ -17,6 +19,7 @@ from ten_texter.enums import (
     OutboxStatus,
     ParentTerminalPolicy,
     ProcessingStatus,
+    ProposalStatus,
 )
 from ten_texter.models import (
     AwaitedResponse,
@@ -30,11 +33,17 @@ from ten_texter.models import (
     MessageRevision,
     OutboxDeliveryAttempt,
     OutboxMessage,
+    Person,
     Proposal,
+    TaskInstance,
+    TaskParticipant,
+    TaskEvent,
     DecisionRequest,
     DecisionRequestPrompt,
 )
 from ten_texter.control import ProductionOwnerCommandHandler
+from ten_texter.model_clients import MessageClassifier
+from ten_texter.correlation import MAX_AVAILABILITY_SUBJECT_CANDIDATES
 from ten_texter.telegram import TelegramControlGateway
 from ten_texter.outbox import OutboxService
 from ten_texter.policy import DatabaseContextProvider
@@ -79,6 +88,48 @@ def awaited(session: Session, core: dict[str, object], *, created_at=NOW - timed
     return row
 
 
+def add_participant(
+    session: Session,
+    core: dict[str, object],
+    *,
+    name: str,
+    task_instance_id: int | None = None,
+) -> TaskParticipant:
+    person = Person(display_name=name, metadata_json={})
+    session.add(person)
+    session.flush()
+    identity = Identity(
+        person_id=person.id,
+        beeper_user_id=f"beeper:{name.casefold()}:{person.id}",
+        network="discord",
+        metadata_json={},
+    )
+    conversation = Conversation(
+        beeper_conversation_id=f"conv:{name.casefold()}:{person.id}",
+        network="discord",
+        kind=ConversationKind.DIRECT,
+        counterparty_person_id=person.id,
+        metadata_json={},
+    )
+    session.add_all([identity, conversation])
+    session.flush()
+    session.add(
+        ConversationParticipant(
+            conversation_id=conversation.id,
+            identity_id=identity.id,
+        )
+    )
+    participant = TaskParticipant(
+        task_instance_id=task_instance_id or core["task"].id,
+        person_id=person.id,
+        conversation_id=conversation.id,
+        availability_status=AvailabilityStatus.UNKNOWN,
+    )
+    session.add(participant)
+    session.flush()
+    return participant
+
+
 def test_exact_conversation_single_open_response_correlates(db_session: Session) -> None:
     core = seed_core(db_session)
     response = awaited(db_session, core)
@@ -90,6 +141,760 @@ def test_exact_conversation_single_open_response_correlates(db_session: Session)
     assert response.status is AwaitedResponseStatus.SATISFIED
     assert core["revision"].awaited_response_id == response.id
     assert core["participant"].availability_status is AvailabilityStatus.AVAILABLE
+
+
+def test_first_party_availability_mutates_and_satisfies_sender(
+    db_session: Session,
+) -> None:
+    core = seed_core(db_session)
+    response = awaited(db_session, core)
+
+    orchestrator(
+        db_session,
+        Classification(
+            kind="AVAILABILITY",
+            availability=AvailabilityStatus.AVAILABLE,
+            evidence=AvailabilityEvidence.FIRST_PARTY,
+        ),
+    ).process(core["revision"].id)
+
+    assert core["participant"].availability_status is AvailabilityStatus.AVAILABLE
+    assert core["participant"].availability_evidence is AvailabilityEvidence.FIRST_PARTY
+    assert response.status is AwaitedResponseStatus.SATISFIED
+
+
+def test_first_party_unavailability_mutates_sender(db_session: Session) -> None:
+    core = seed_core(db_session)
+    response = awaited(db_session, core)
+
+    orchestrator(
+        db_session,
+        Classification(
+            kind="AVAILABILITY",
+            availability=AvailabilityStatus.UNAVAILABLE,
+            evidence=AvailabilityEvidence.FIRST_PARTY,
+        ),
+    ).process(core["revision"].id)
+
+    assert core["participant"].availability_status is AvailabilityStatus.UNAVAILABLE
+    assert core["participant"].availability_evidence is AvailabilityEvidence.FIRST_PARTY
+    assert response.status is AwaitedResponseStatus.SATISFIED
+
+
+def test_third_party_availability_without_subject_fails_closed(
+    db_session: Session,
+) -> None:
+    core = seed_core(db_session)
+    response = awaited(db_session, core)
+
+    with pytest.raises(DomainError, match="requires an exact subject"):
+        orchestrator(
+            db_session,
+            Classification(
+                kind="AVAILABILITY",
+                availability=AvailabilityStatus.AVAILABLE,
+                evidence=AvailabilityEvidence.THIRD_PARTY,
+            ),
+        ).process(core["revision"].id)
+
+    assert core["participant"].availability_status is AvailabilityStatus.UNKNOWN
+    assert response.status is AwaitedResponseStatus.OPEN
+
+
+@pytest.mark.parametrize(
+    "status",
+    [AvailabilityStatus.AVAILABLE, AvailabilityStatus.UNAVAILABLE],
+)
+def test_third_party_availability_mutates_named_participant_only(
+    db_session: Session,
+    status: AvailabilityStatus,
+) -> None:
+    core = seed_core(db_session)
+    response = awaited(db_session, core)
+    kyran = add_participant(db_session, core, name="Kyran")
+
+    orchestrator(
+        db_session,
+        Classification(
+            kind="AVAILABILITY",
+            availability=status,
+            evidence=AvailabilityEvidence.THIRD_PARTY,
+            subject_task_participant_id=kyran.id,
+        ),
+    ).process(core["revision"].id)
+
+    assert kyran.availability_status is status
+    assert kyran.availability_evidence is AvailabilityEvidence.THIRD_PARTY
+    assert core["participant"].availability_status is AvailabilityStatus.UNKNOWN
+    assert response.status is AwaitedResponseStatus.OPEN
+
+
+def test_real_classifier_receives_only_other_participants_from_exact_task(
+    db_session: Session,
+) -> None:
+    core = seed_core(db_session)
+    response = awaited(db_session, core)
+    kyran = add_participant(db_session, core, name="Kyran")
+    other_task = TaskInstance(
+        scheduled_at=NOW + timedelta(days=2),
+        duration_minutes=60,
+        topic_key="dinner",
+    )
+    db_session.add(other_task)
+    db_session.flush()
+    outsider = add_participant(
+        db_session,
+        core,
+        name="Outside",
+        task_instance_id=other_task.id,
+    )
+
+    class Backend:
+        def __init__(self) -> None:
+            self.payload: dict[str, object] | None = None
+
+        def infer(self, *, operation: str, payload: dict[str, object]) -> dict[str, object]:
+            assert operation == "message_classifier"
+            self.payload = payload
+            return {
+                "kind": "AVAILABILITY",
+                "availability": "AVAILABLE",
+                "evidence": "THIRD_PARTY",
+                "subject_task_participant_id": kyran.id,
+                "proposals": [],
+            }
+
+    backend = Backend()
+    CorrelationOrchestrator(
+        db_session,
+        semantic=Semantic(),
+        classifier=MessageClassifier(backend),
+    ).process(core["revision"].id)
+
+    assert backend.payload is not None
+    candidates = backend.payload["third_party_subject_candidates"]
+    assert candidates == [
+        {"task_participant_id": kyran.id, "display_name": "Kyran"}
+    ]
+    candidate_ids = {candidate["task_participant_id"] for candidate in candidates}
+    assert core["participant"].id not in candidate_ids
+    assert outsider.id not in candidate_ids
+    assert kyran.availability_status is AvailabilityStatus.AVAILABLE
+    assert response.status is AwaitedResponseStatus.OPEN
+
+
+def test_over_bound_subject_context_preserves_first_party_and_disallows_third_party(
+    db_session: Session,
+) -> None:
+    core = seed_core(db_session)
+    response = awaited(db_session, core)
+    for index in range(MAX_AVAILABILITY_SUBJECT_CANDIDATES + 1):
+        add_participant(db_session, core, name=f"Person {index}")
+
+    class Backend:
+        def __init__(self) -> None:
+            self.payload: dict[str, object] | None = None
+
+        def infer(self, *, operation: str, payload: dict[str, object]) -> dict[str, object]:
+            self.payload = payload
+            return {
+                "kind": "AVAILABILITY",
+                "availability": "AVAILABLE",
+                "evidence": "FIRST_PARTY",
+                "subject_task_participant_id": None,
+                "proposals": [],
+            }
+
+    backend = Backend()
+    CorrelationOrchestrator(
+        db_session,
+        semantic=Semantic(),
+        classifier=MessageClassifier(backend),
+    ).process(core["revision"].id)
+
+    assert backend.payload is not None
+    assert len(backend.payload["third_party_subject_candidates"]) <= (
+        MAX_AVAILABILITY_SUBJECT_CANDIDATES
+    )
+    assert backend.payload["third_party_subject_candidates_complete"] is False
+    assert core["participant"].availability_status is AvailabilityStatus.AVAILABLE
+    assert response.status is AwaitedResponseStatus.SATISFIED
+
+
+def test_duplicate_candidate_names_force_real_classifier_ambiguity(
+    db_session: Session,
+) -> None:
+    core = seed_core(db_session)
+    response = awaited(db_session, core)
+    first = add_participant(db_session, core, name="Sam Lee")
+    second = add_participant(db_session, core, name="  sam   lee ")
+
+    class Backend:
+        def __init__(self) -> None:
+            self.payload: dict[str, object] | None = None
+
+        def infer(self, *, operation: str, payload: dict[str, object]) -> dict[str, object]:
+            self.payload = payload
+            return {
+                "kind": "AMBIGUOUS",
+                "availability": None,
+                "evidence": "FIRST_PARTY",
+                "subject_task_participant_id": None,
+                "proposals": [],
+            }
+
+    backend = Backend()
+    result = CorrelationOrchestrator(
+        db_session,
+        semantic=Semantic(),
+        classifier=MessageClassifier(backend),
+    ).process(core["revision"].id)
+
+    assert backend.payload is not None
+    assert backend.payload["ambiguous_third_party_display_names"] == ["sam lee"]
+    assert len(backend.payload["third_party_subject_candidates"]) == 2
+    assert "duplicate display names" in backend.payload["trusted_instructions"]
+    assert result.outcome == "INTERPRETATION_AMBIGUOUS"
+    assert first.availability_status is AvailabilityStatus.UNKNOWN
+    assert second.availability_status is AvailabilityStatus.UNKNOWN
+    assert core["participant"].availability_status is AvailabilityStatus.UNKNOWN
+    assert response.status is AwaitedResponseStatus.AMBIGUOUS
+
+
+def test_multiple_named_candidates_force_real_classifier_ambiguity(
+    db_session: Session,
+) -> None:
+    core = seed_core(db_session)
+    response = awaited(db_session, core)
+    kyran = add_participant(db_session, core, name="Kyran")
+    amith = add_participant(db_session, core, name="Amith")
+    classified_revision = MessageRevision(
+        message_id=core["message"].id,
+        provider_revision_key="r2",
+        provider_sequence=2,
+        content_hash="f" * 64,
+        text="Kyran and Amith are free",
+        content_support=ContentSupport.SUPPORTED,
+        processing_status=ProcessingStatus.PENDING,
+    )
+    db_session.add(classified_revision)
+    db_session.flush()
+    core["message"].current_revision_id = classified_revision.id
+    db_session.flush()
+
+    class Backend:
+        def __init__(self) -> None:
+            self.payload: dict[str, object] | None = None
+
+        def infer(self, *, operation: str, payload: dict[str, object]) -> dict[str, object]:
+            self.payload = payload
+            return {
+                "kind": "AMBIGUOUS",
+                "availability": None,
+                "evidence": "FIRST_PARTY",
+                "subject_task_participant_id": None,
+                "proposals": [],
+            }
+
+    backend = Backend()
+    result = CorrelationOrchestrator(
+        db_session,
+        semantic=Semantic(),
+        classifier=MessageClassifier(backend),
+    ).process(classified_revision.id)
+
+    assert backend.payload is not None
+    assert backend.payload["untrusted_participant_text"] == "Kyran and Amith are free"
+    assert backend.payload["third_party_subject_candidates"] == [
+        {"task_participant_id": kyran.id, "display_name": "Kyran"},
+        {"task_participant_id": amith.id, "display_name": "Amith"},
+    ]
+    assert "multiple people are reported" in backend.payload["trusted_instructions"]
+    assert result.outcome == "INTERPRETATION_AMBIGUOUS"
+    assert core["participant"].availability_status is AvailabilityStatus.UNKNOWN
+    assert kyran.availability_status is AvailabilityStatus.UNKNOWN
+    assert amith.availability_status is AvailabilityStatus.UNKNOWN
+    assert response.status is AwaitedResponseStatus.AMBIGUOUS
+
+
+def test_unresolved_third_party_subject_does_not_mutate_availability(
+    db_session: Session,
+) -> None:
+    core = seed_core(db_session)
+    response = awaited(db_session, core)
+    kyran = add_participant(db_session, core, name="Kyran")
+
+    result = orchestrator(
+        db_session,
+        Classification(kind="AMBIGUOUS"),
+    ).process(core["revision"].id)
+
+    assert result.outcome == "INTERPRETATION_AMBIGUOUS"
+    assert core["participant"].availability_status is AvailabilityStatus.UNKNOWN
+    assert kyran.availability_status is AvailabilityStatus.UNKNOWN
+    assert response.status is AwaitedResponseStatus.AMBIGUOUS
+
+
+def test_non_task_third_party_subject_is_rejected_without_mutation(
+    db_session: Session,
+) -> None:
+    core = seed_core(db_session)
+    response = awaited(db_session, core)
+    other_task = TaskInstance(
+        scheduled_at=NOW + timedelta(days=2),
+        duration_minutes=60,
+        topic_key="dinner",
+    )
+    db_session.add(other_task)
+    db_session.flush()
+    outsider = add_participant(
+        db_session,
+        core,
+        name="Outsider",
+        task_instance_id=other_task.id,
+    )
+
+    with pytest.raises(DomainError, match="same task"):
+        orchestrator(
+            db_session,
+            Classification(
+                kind="AVAILABILITY",
+                availability=AvailabilityStatus.AVAILABLE,
+                evidence=AvailabilityEvidence.THIRD_PARTY,
+                subject_task_participant_id=outsider.id,
+            ),
+        ).process(core["revision"].id)
+
+    assert core["participant"].availability_status is AvailabilityStatus.UNKNOWN
+    assert response.status is AwaitedResponseStatus.OPEN
+
+
+def test_third_party_availability_replay_is_idempotent(db_session: Session) -> None:
+    core = seed_core(db_session)
+    awaited(db_session, core)
+    kyran = add_participant(db_session, core, name="Kyran")
+    service = orchestrator(
+        db_session,
+        Classification(
+            kind="AVAILABILITY",
+            availability=AvailabilityStatus.AVAILABLE,
+            evidence=AvailabilityEvidence.THIRD_PARTY,
+            subject_task_participant_id=kyran.id,
+        ),
+    )
+
+    service.process(core["revision"].id)
+    service.process(core["revision"].id)
+
+    events = list(
+        db_session.scalars(
+            select(TaskEvent).where(
+                TaskEvent.task_participant_id == kyran.id,
+                TaskEvent.event_type == "AVAILABILITY_UPDATED",
+            )
+        )
+    )
+    assert len(events) == 1
+
+
+def test_edit_retracts_third_party_effect_and_applies_first_party_effect(
+    db_session: Session,
+) -> None:
+    core = seed_core(db_session)
+    response = awaited(db_session, core)
+    kyran = add_participant(db_session, core, name="Kyran")
+    orchestrator(
+        db_session,
+        Classification(
+            kind="AVAILABILITY",
+            availability=AvailabilityStatus.AVAILABLE,
+            evidence=AvailabilityEvidence.THIRD_PARTY,
+            subject_task_participant_id=kyran.id,
+        ),
+    ).process(core["revision"].id)
+    edit = MessageRevision(
+        message_id=core["message"].id,
+        provider_revision_key="r2",
+        provider_sequence=2,
+        content_hash="b" * 64,
+        text="Actually, I can't make it",
+        content_support=ContentSupport.SUPPORTED,
+        processing_status=ProcessingStatus.PENDING,
+    )
+    db_session.add(edit)
+    db_session.flush()
+    core["message"].current_revision_id = edit.id
+    db_session.flush()
+
+    orchestrator(
+        db_session,
+        Classification(
+            kind="AVAILABILITY",
+            availability=AvailabilityStatus.UNAVAILABLE,
+            evidence=AvailabilityEvidence.FIRST_PARTY,
+        ),
+    ).process(edit.id)
+
+    assert kyran.availability_status is AvailabilityStatus.UNKNOWN
+    assert kyran.availability_evidence is None
+    assert core["participant"].availability_status is AvailabilityStatus.UNAVAILABLE
+    assert core["participant"].availability_evidence is AvailabilityEvidence.FIRST_PARTY
+    assert response.status is AwaitedResponseStatus.SATISFIED
+
+
+def test_edit_retracts_first_party_effect_and_opens_sender_for_third_party(
+    db_session: Session,
+) -> None:
+    core = seed_core(db_session)
+    response = awaited(db_session, core)
+    kyran = add_participant(db_session, core, name="Kyran")
+    orchestrator(
+        db_session,
+        Classification(
+            kind="AVAILABILITY",
+            availability=AvailabilityStatus.AVAILABLE,
+            evidence=AvailabilityEvidence.FIRST_PARTY,
+        ),
+    ).process(core["revision"].id)
+    edit = MessageRevision(
+        message_id=core["message"].id,
+        provider_revision_key="r2",
+        provider_sequence=2,
+        content_hash="c" * 64,
+        text="Actually, Kyran is free",
+        content_support=ContentSupport.SUPPORTED,
+        processing_status=ProcessingStatus.PENDING,
+    )
+    db_session.add(edit)
+    db_session.flush()
+    core["message"].current_revision_id = edit.id
+    db_session.flush()
+
+    orchestrator(
+        db_session,
+        Classification(
+            kind="AVAILABILITY",
+            availability=AvailabilityStatus.AVAILABLE,
+            evidence=AvailabilityEvidence.THIRD_PARTY,
+            subject_task_participant_id=kyran.id,
+        ),
+    ).process(edit.id)
+
+    assert core["participant"].availability_status is AvailabilityStatus.UNKNOWN
+    assert core["participant"].availability_evidence is None
+    assert kyran.availability_status is AvailabilityStatus.AVAILABLE
+    assert kyran.availability_evidence is AvailabilityEvidence.THIRD_PARTY
+    assert response.status is AwaitedResponseStatus.OPEN
+
+
+def test_third_party_edit_does_not_reopen_response_satisfied_by_separate_message(
+    db_session: Session,
+) -> None:
+    core = seed_core(db_session)
+    response = awaited(db_session, core)
+    kyran = add_participant(db_session, core, name="Kyran")
+    orchestrator(
+        db_session,
+        Classification(
+            kind="AVAILABILITY",
+            availability=AvailabilityStatus.AVAILABLE,
+            evidence=AvailabilityEvidence.THIRD_PARTY,
+            subject_task_participant_id=kyran.id,
+        ),
+    ).process(core["revision"].id)
+    assert response.status is AwaitedResponseStatus.OPEN
+
+    own_message = Message(
+        conversation_id=core["conversation"].id,
+        provider_message_id="own-message",
+        sender_identity_id=core["identity"].id,
+        created_at=NOW + timedelta(minutes=1),
+    )
+    db_session.add(own_message)
+    db_session.flush()
+    own_revision = MessageRevision(
+        message_id=own_message.id,
+        provider_revision_key="r1",
+        provider_sequence=2,
+        content_hash="d" * 64,
+        text="I'm free",
+        content_support=ContentSupport.SUPPORTED,
+        processing_status=ProcessingStatus.PENDING,
+    )
+    db_session.add(own_revision)
+    db_session.flush()
+    own_message.current_revision_id = own_revision.id
+    db_session.flush()
+    orchestrator(
+        db_session,
+        Classification(
+            kind="AVAILABILITY",
+            availability=AvailabilityStatus.AVAILABLE,
+            evidence=AvailabilityEvidence.FIRST_PARTY,
+        ),
+    ).process(own_revision.id)
+    assert response.status is AwaitedResponseStatus.SATISFIED
+
+    third_party_edit = MessageRevision(
+        message_id=core["message"].id,
+        provider_revision_key="r2",
+        provider_sequence=3,
+        content_hash="e" * 64,
+        text="Actually, Kyran can't make it",
+        content_support=ContentSupport.SUPPORTED,
+        processing_status=ProcessingStatus.PENDING,
+    )
+    db_session.add(third_party_edit)
+    db_session.flush()
+    core["message"].current_revision_id = third_party_edit.id
+    db_session.flush()
+    orchestrator(
+        db_session,
+        Classification(
+            kind="AVAILABILITY",
+            availability=AvailabilityStatus.UNAVAILABLE,
+            evidence=AvailabilityEvidence.THIRD_PARTY,
+            subject_task_participant_id=kyran.id,
+        ),
+    ).process(third_party_edit.id)
+
+    assert response.status is AwaitedResponseStatus.SATISFIED
+    assert core["participant"].availability_status is AvailabilityStatus.AVAILABLE
+    assert core["participant"].availability_evidence is AvailabilityEvidence.FIRST_PARTY
+    assert core["participant"].availability_source_revision_id == own_revision.id
+    assert kyran.availability_status is AvailabilityStatus.UNAVAILABLE
+    assert kyran.availability_evidence is AvailabilityEvidence.THIRD_PARTY
+    assert kyran.availability_source_revision_id == third_party_edit.id
+
+
+def test_counterproposal_edit_to_third_party_reopens_sender_response(
+    db_session: Session,
+) -> None:
+    core = seed_core(db_session)
+    response = awaited(db_session, core)
+    kyran = add_participant(db_session, core, name="Kyran")
+    orchestrator(
+        db_session,
+        Classification(
+            kind="COUNTERPROPOSAL",
+            proposals=(
+                AtomicProposal(
+                    field="scheduled_at",
+                    operation="SET",
+                    old_value="2026-08-27T15:00:00Z",
+                    proposed_value="2026-08-27T16:00:00Z",
+                ),
+            ),
+        ),
+    ).process(core["revision"].id)
+    proposal = db_session.scalar(select(Proposal))
+    assert proposal is not None
+    assert response.status is AwaitedResponseStatus.SATISFIED
+
+    edit = MessageRevision(
+        message_id=core["message"].id,
+        provider_revision_key="r2",
+        provider_sequence=2,
+        content_hash="1" * 64,
+        text="Actually, Kyran is free",
+        content_support=ContentSupport.SUPPORTED,
+        processing_status=ProcessingStatus.PENDING,
+    )
+    db_session.add(edit)
+    db_session.flush()
+    core["message"].current_revision_id = edit.id
+    db_session.flush()
+    orchestrator(
+        db_session,
+        Classification(
+            kind="AVAILABILITY",
+            availability=AvailabilityStatus.AVAILABLE,
+            evidence=AvailabilityEvidence.THIRD_PARTY,
+            subject_task_participant_id=kyran.id,
+        ),
+    ).process(edit.id)
+
+    assert proposal.status is ProposalStatus.SUPERSEDED
+    assert response.status is AwaitedResponseStatus.OPEN
+    assert core["participant"].availability_status is AvailabilityStatus.UNKNOWN
+    assert kyran.availability_status is AvailabilityStatus.AVAILABLE
+
+
+@pytest.mark.parametrize("edited_kind", ["AMBIGUOUS", "OTHER"])
+def test_older_message_edit_does_not_override_independent_satisfied_response(
+    db_session: Session,
+    edited_kind: str,
+) -> None:
+    core = seed_core(db_session)
+    response = awaited(db_session, core)
+    kyran = add_participant(db_session, core, name="Kyran")
+    orchestrator(
+        db_session,
+        Classification(
+            kind="AVAILABILITY",
+            availability=AvailabilityStatus.AVAILABLE,
+            evidence=AvailabilityEvidence.THIRD_PARTY,
+            subject_task_participant_id=kyran.id,
+        ),
+    ).process(core["revision"].id)
+
+    own_message = Message(
+        conversation_id=core["conversation"].id,
+        provider_message_id=f"own-{edited_kind.casefold()}",
+        sender_identity_id=core["identity"].id,
+        created_at=NOW + timedelta(minutes=1),
+    )
+    db_session.add(own_message)
+    db_session.flush()
+    own_revision = MessageRevision(
+        message_id=own_message.id,
+        provider_revision_key="r1",
+        provider_sequence=2,
+        content_hash=("2" if edited_kind == "AMBIGUOUS" else "3") * 64,
+        text="I'm free",
+        content_support=ContentSupport.SUPPORTED,
+        processing_status=ProcessingStatus.PENDING,
+    )
+    db_session.add(own_revision)
+    db_session.flush()
+    own_message.current_revision_id = own_revision.id
+    db_session.flush()
+    orchestrator(
+        db_session,
+        Classification(
+            kind="AVAILABILITY",
+            availability=AvailabilityStatus.AVAILABLE,
+            evidence=AvailabilityEvidence.FIRST_PARTY,
+        ),
+    ).process(own_revision.id)
+
+    old_edit = MessageRevision(
+        message_id=core["message"].id,
+        provider_revision_key="r2",
+        provider_sequence=3,
+        content_hash=("4" if edited_kind == "AMBIGUOUS" else "5") * 64,
+        text="unclear edit",
+        content_support=ContentSupport.SUPPORTED,
+        processing_status=ProcessingStatus.PENDING,
+    )
+    db_session.add(old_edit)
+    db_session.flush()
+    core["message"].current_revision_id = old_edit.id
+    db_session.flush()
+    orchestrator(
+        db_session,
+        Classification(kind=edited_kind),
+    ).process(old_edit.id)
+
+    assert response.status is AwaitedResponseStatus.SATISFIED
+    assert core["participant"].availability_status is AvailabilityStatus.AVAILABLE
+    assert core["participant"].availability_source_revision_id == own_revision.id
+    assert kyran.availability_status is AvailabilityStatus.UNKNOWN
+
+
+def add_evidence_revision(
+    db_session: Session,
+    core: dict[str, object],
+    *,
+    provider_message_id: str,
+    provider_sequence: int,
+) -> MessageRevision:
+    message = Message(
+        conversation_id=core["conversation"].id,
+        provider_message_id=provider_message_id,
+        sender_identity_id=core["identity"].id,
+        created_at=NOW - timedelta(minutes=1),
+    )
+    db_session.add(message)
+    db_session.flush()
+    revision = MessageRevision(
+        message_id=message.id,
+        provider_revision_key="r1",
+        provider_sequence=provider_sequence,
+        content_hash=provider_message_id[0] * 64,
+        text="prior evidence",
+        content_support=ContentSupport.SUPPORTED,
+        processing_status=ProcessingStatus.PROCESSED,
+    )
+    db_session.add(revision)
+    db_session.flush()
+    message.current_revision_id = revision.id
+    db_session.flush()
+    return revision
+
+
+def test_older_availability_does_not_enqueue_stale_owner_notification(
+    db_session: Session,
+) -> None:
+    core = seed_core(db_session)
+    awaited(db_session, core)
+    newer = add_evidence_revision(
+        db_session,
+        core,
+        provider_message_id="newer",
+        provider_sequence=2,
+    )
+    AvailabilityService(db_session).apply(
+        core["participant"].id,
+        newer.id,
+        AvailabilityStatus.AVAILABLE,
+        AvailabilityEvidence.FIRST_PARTY,
+    )
+    service = CorrelationOrchestrator(
+        db_session,
+        semantic=Semantic(),
+        classifier=Classifier(
+            Classification(
+                kind="AVAILABILITY",
+                availability=AvailabilityStatus.UNAVAILABLE,
+                evidence=AvailabilityEvidence.FIRST_PARTY,
+            )
+        ),
+        owner_chat_id=99,
+    )
+
+    service.process(core["revision"].id)
+
+    assert core["participant"].availability_status is AvailabilityStatus.AVAILABLE
+    assert db_session.scalar(select(func.count(OutboxMessage.id))) == 0
+
+
+def test_owner_notification_uses_committed_uncertain_availability(
+    db_session: Session,
+) -> None:
+    core = seed_core(db_session)
+    awaited(db_session, core)
+    equal_order = add_evidence_revision(
+        db_session,
+        core,
+        provider_message_id="equal",
+        provider_sequence=1,
+    )
+    AvailabilityService(db_session).apply(
+        core["participant"].id,
+        equal_order.id,
+        AvailabilityStatus.AVAILABLE,
+        AvailabilityEvidence.FIRST_PARTY,
+    )
+    service = CorrelationOrchestrator(
+        db_session,
+        semantic=Semantic(),
+        classifier=Classifier(
+            Classification(
+                kind="AVAILABILITY",
+                availability=AvailabilityStatus.UNAVAILABLE,
+                evidence=AvailabilityEvidence.FIRST_PARTY,
+            )
+        ),
+        owner_chat_id=99,
+    )
+
+    service.process(core["revision"].id)
+
+    notice = db_session.scalar(select(OutboxMessage))
+    assert core["participant"].availability_status is AvailabilityStatus.UNCERTAIN
+    assert notice is not None
+    assert notice.final_text == "Alex is uncertain for tennis."
 
 
 def test_availability_reply_creates_one_durable_owner_notification(

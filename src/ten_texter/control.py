@@ -8,7 +8,13 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from ten_texter.correlation import Classification, Classifier, CorrelationOrchestrator, PreparedCorrelation
+from ten_texter.correlation import (
+    Classification,
+    Classifier,
+    CorrelationOrchestrator,
+    PreparedCorrelation,
+    third_party_subject_context,
+)
 from ten_texter.decision_prompts import owner_command_review_prompt
 from ten_texter.domain import DecisionService, DomainError, ProposalService
 from ten_texter.inbound import (
@@ -158,7 +164,11 @@ class ProductionOwnerCommandHandler:
                 return PreparedOwnerDecision(
                     "select",
                     selected_id,
-                    self.classifier.classify(revision, awaited),
+                    self.classifier.classify(
+                        revision,
+                        awaited,
+                        third_party_subject_context(session, revision, awaited),
+                    ),
                 )
         return PreparedOwnerDecision(action, selected_id)
 
