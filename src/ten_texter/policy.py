@@ -38,6 +38,10 @@ from ten_texter.models import (
     TaskInstance,
     TaskParticipant,
 )
+from ten_texter.nobody_available import (
+    authorize_nobody_available_notification,
+    is_nobody_available_notification,
+)
 from ten_texter.outbox import PreSendDecision, PreSendRevalidator
 
 
@@ -326,6 +330,15 @@ class PolicyRevalidator(PreSendRevalidator):
         ):
             return PreSendDecision.STALE
         if message.transport is Transport.TELEGRAM:
+            if is_nobody_available_notification(message) and (
+                authorize_nobody_available_notification(
+                    session,
+                    message,
+                    owner_chat_id=self.owner_chat_id,
+                )
+                is None
+            ):
+                return PreSendDecision.STALE
             decision = decision_for_prompt(session, message)
             if decision is not None and authorize_decision_prompt(
                 session,
@@ -390,9 +403,19 @@ class PolicyRevalidator(PreSendRevalidator):
                 task.location,
             )
         if message.transport is Transport.TELEGRAM:
+            nobody_available_token: tuple[object, ...] = ()
+            if is_nobody_available_notification(message):
+                nobody_available_token = (
+                    "NOBODY_AVAILABLE",
+                    authorize_nobody_available_notification(
+                        session,
+                        message,
+                        owner_chat_id=self.owner_chat_id,
+                    ),
+                )
             return (
                 "TELEGRAM",
-            ) + task_token + self._decision_prompt_token(session, message)
+            ) + task_token + nobody_available_token + self._decision_prompt_token(session, message)
         destination = session.get(BeeperOutboxDestination, message.id)
         participant_ids = tuple(
             session.scalars(

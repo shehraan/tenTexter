@@ -56,6 +56,7 @@ from ten_texter.models import (
     TaskTrigger,
     TelegramUpdate,
 )
+from ten_texter.nobody_available import NobodyAvailableNotifier
 from ten_texter.outbox import OutboxService, OutboxWorker
 from ten_texter.policy import (
     ContactRuleResolver,
@@ -247,6 +248,10 @@ class AgentRuntime:
             ("beeper", self._poll_beeper),
             ("inbound-worker", self._process_revisions),
             ("task-lifecycle", lambda: self._sweep_tasks(timestamp)),
+            (
+                "owner-notifications",
+                lambda: self._notify_nobody_available(timestamp),
+            ),
             ("scheduler", lambda: self._poll_recurrence(timestamp)),
             ("recurring-coordination", self._initialize_recurring_tasks),
             ("trigger-worker", lambda: self._poll_triggers(timestamp)),
@@ -422,6 +427,12 @@ class AgentRuntime:
         for definition_id in definition_ids:
             with self.sessions.begin() as session:
                 self.recurrence.poll_definition(session, definition_id, now=now)
+
+    def _notify_nobody_available(self, now: datetime) -> None:
+        NobodyAvailableNotifier(
+            self.sessions,
+            owner_chat_id=self.owner_chat_id,
+        ).run(now=now)
 
     def _poll_triggers(self, now: datetime) -> None:
         with self.sessions() as session:

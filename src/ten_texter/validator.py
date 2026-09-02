@@ -19,6 +19,7 @@ from ten_texter.enums import (
 )
 from ten_texter.model_clients import MessageGenerator, ModelBackend, StrictOutput, _validate
 from ten_texter.health import owner_health_claim, owner_telegram_update_failure_claim
+from ten_texter.nobody_available import authorize_nobody_available_notification
 from ten_texter.models import (
     DecisionRequest,
     DecisionRequestPrompt,
@@ -180,9 +181,23 @@ class DatabaseValidatorContextProvider:
                 if message_kind is message.message_kind
                 else None
             )
-            operational_claim = health_claim or update_failure_claim
+            nobody_available_claim = (
+                authorize_nobody_available_notification(
+                    session,
+                    message,
+                    owner_chat_id=self.owner_chat_id,
+                )
+                if message_kind is message.message_kind
+                else None
+            )
+            operational_claim = health_claim or update_failure_claim or nobody_available_claim
             if operational_claim is not None:
-                claim_kind = "health-status" if health_claim is not None else "operational-status"
+                if health_claim is not None:
+                    claim_kind = "health-status"
+                elif nobody_available_claim is not None:
+                    claim_kind = "task-availability-status"
+                else:
+                    claim_kind = "operational-status"
                 return ValidatorContext(
                     message_kind=message_kind,
                     allowed_claims=(operational_claim,),

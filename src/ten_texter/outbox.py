@@ -284,11 +284,25 @@ class OutboxWorker:
             return snapshot["status"]
         policy_token: object | None = None
         token_builder = getattr(self.revalidator, "context_token", None)
-        if token_builder is not None:
-            with self.sessions() as session:
-                message = session.get(OutboxMessage, outbox_id)
-                if message is None or message.status is not OutboxStatus.PENDING:
-                    return message.status if message is not None else OutboxStatus.CANCELLED
+        with self.sessions.begin() as session:
+            message = session.get(OutboxMessage, outbox_id)
+            if message is None or message.status is not OutboxStatus.PENDING:
+                return message.status if message is not None else OutboxStatus.CANCELLED
+            initial_decision = self.revalidator.check(session, message)
+            if initial_decision is PreSendDecision.UNAVAILABLE:
+                return OutboxStatus.PENDING
+            if initial_decision in {
+                PreSendDecision.STALE,
+                PreSendDecision.POLICY_BLOCKED,
+            }:
+                message.status = OutboxStatus.CANCELLED
+                message.cancel_reason = (
+                    OutboxCancelReason.STALE
+                    if initial_decision is PreSendDecision.STALE
+                    else OutboxCancelReason.POLICY_BLOCKED
+                )
+                return message.status
+            if token_builder is not None:
                 policy_token = token_builder(session, message)
         try:
             valid = self.validator.validate(
