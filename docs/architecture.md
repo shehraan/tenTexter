@@ -405,7 +405,7 @@ Examples:
 - ambiguous participant reply with two active requests => ASK_PARTICIPANT
 - counterproposal => ASK_ME
 - unauthorized new recipient => ASK_ME
-- mass contact => ASK_ME
+- more than 25 distinct logical TaskParticipants in one TaskInstance => ASK_ME before any participant send; approval is scoped to that TaskInstance only
 - participant asks not to be contacted about a topic => persistent ContactRule
 
 Explicit owner-approved narrow exception points to exactly one original blocking ContactRule; one original may have multiple exceptions over time.

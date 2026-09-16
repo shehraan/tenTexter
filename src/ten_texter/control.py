@@ -17,7 +17,14 @@ from ten_texter.correlation import (
 )
 from ten_texter.decision_prompts import owner_command_review_prompt
 from ten_texter.decision_prompt_context import late_terminal_subject
-from ten_texter.domain import ContactRuleService, DecisionService, DomainError, ProposalService, normalize_topic_key
+from ten_texter.domain import (
+    ContactRuleService,
+    DecisionService,
+    DomainError,
+    ProposalService,
+    TaskService,
+    normalize_topic_key,
+)
 from ten_texter.inbound import (
     ordering_conflict_candidates,
     ordering_conflict_still_requires_decision,
@@ -34,6 +41,7 @@ from ten_texter.enums import (
     ContactRuleScope,
     ContactRuleSource,
     RuleStrength,
+    TaskStatus,
 )
 from ten_texter.model_clients import EntityResolverAssistant, TaskParseReview, TaskPlan
 from ten_texter.models import (
@@ -58,6 +66,11 @@ from ten_texter.models import (
 )
 from ten_texter.outbox import OutboxService
 from ten_texter.contact_boundaries import boundary_context, contact_rule_exception_subject
+from ten_texter.mass_contact import (
+    MASS_CONTACT_THRESHOLD,
+    MASS_CONTACT_DECISION_TYPE,
+    mass_contact_subject,
+)
 from ten_texter.validator import (
     GenerationOutcome,
     ValidatedGenerationPipeline,
@@ -174,6 +187,14 @@ class ProductionOwnerCommandHandler:
             if decision.type == "CONTACT_RULE_EXCEPTION" and decision.contact_rule_id is not None:
                 if action not in {"allow_this", "respect_boundary"}:
                     raise DomainError("contact rule decision requires `allow this task` or `respect boundary`")
+                return PreparedOwnerDecision(action)
+            if decision.type == MASS_CONTACT_DECISION_TYPE:
+                if action not in {"approve_mass_contact", "cancel_task"}:
+                    raise DomainError(
+                        "mass-contact decisions require `approve mass contact` or `cancel task`"
+                    )
+                if mass_contact_subject(session, decision) is None:
+                    return PreparedOwnerDecision("stale")
                 return PreparedOwnerDecision(action)
             if decision.message_revision_id is not None:
                 if action != "select" or selected_id is None:
@@ -570,6 +591,40 @@ class ProductionOwnerCommandHandler:
             DecisionService(session).answer(decision.id, {"action": payload.action},
                 subject_still_requires_decision=still_requires_rule, apply=apply_rule)
             return
+        if decision.type == MASS_CONTACT_DECISION_TYPE:
+            if payload.action not in {"approve_mass_contact", "cancel_task", "stale"}:
+                raise DomainError(
+                    "mass-contact decisions require `approve mass contact` or `cancel task`"
+                )
+            subject = mass_contact_subject(session, decision)
+            if payload.action == "stale" or subject is None:
+                DecisionService(session).close(
+                    decision.id, DecisionCloseReason.SUBJECT_RESOLVED
+                )
+                return
+            resolution = {
+                "action": payload.action,
+                "participant_count": subject.participant_count,
+                "threshold": MASS_CONTACT_THRESHOLD,
+            }
+            resolved = DecisionService(session).answer(
+                decision.id,
+                resolution,
+                subject_still_requires_decision=lambda item: mass_contact_subject(
+                    session, item
+                )
+                is not None,
+                apply=lambda _decision, _resolution: True,
+            )
+            if (
+                payload.action == "cancel_task"
+                and resolved.close_reason is DecisionCloseReason.ANSWERED
+            ):
+                assert decision.task_instance_id is not None
+                TaskService(session).terminalize(
+                    decision.task_instance_id, TaskStatus.CANCELLED
+                )
+            return
         if decision.message_revision_id is not None:
             revision = session.get(MessageRevision, decision.message_revision_id)
             message = session.get(Message, revision.message_id) if revision is not None else None
@@ -681,7 +736,13 @@ class ProductionOwnerCommandHandler:
             message = payload.get("message") or {}
             raw = str(message.get("text") or "").strip().casefold()
             parts = raw.split()
-            if len(parts) == 3 and parts[:2] == ["select", "revision"]:
+            if parts == ["approve", "mass", "contact"]:
+                value = "approve_mass_contact"
+                selected = None
+            elif parts == ["cancel", "task"]:
+                value = "cancel_task"
+                selected = None
+            elif len(parts) == 3 and parts[:2] == ["select", "revision"]:
                 value = "select_revision"
                 selected = int(parts[2]) if parts[2].isdigit() else None
             else:

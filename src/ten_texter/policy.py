@@ -51,6 +51,12 @@ from ten_texter.nobody_available import (
     authorize_nobody_available_notification,
     is_nobody_available_notification,
 )
+from ten_texter.mass_contact import (
+    MASS_CONTACT_THRESHOLD,
+    ensure_mass_contact_decision,
+    mass_contact_is_approved,
+    mass_contact_participant_count,
+)
 from ten_texter.outbox import PreSendDecision, PreSendRevalidator
 
 
@@ -445,6 +451,19 @@ class PolicyRevalidator(PreSendRevalidator):
                 task.id,
             )
             return PreSendDecision.AWAITING_OWNER
+        participant_count = mass_contact_participant_count(session, task.id)
+        if participant_count > MASS_CONTACT_THRESHOLD:
+            if mass_contact_is_approved(session, task.id):
+                return PreSendDecision.READY
+            if self.owner_chat_id is None:
+                return PreSendDecision.POLICY_BLOCKED
+            if ensure_mass_contact_decision(
+                session,
+                task_id=task.id,
+                owner_chat_id=self.owner_chat_id,
+            ) is None:
+                return PreSendDecision.POLICY_BLOCKED
+            return PreSendDecision.AWAITING_OWNER
         return PreSendDecision.READY
 
     def _ensure_contact_rule_decision(self, session: Session, rule_id: int, task_id: int) -> None:
@@ -591,6 +610,14 @@ class PolicyRevalidator(PreSendRevalidator):
             tuple(membership_tokens),
             tuple(rule_outcomes),
             facts,
+            (
+                "MASS_CONTACT",
+                mass_contact_participant_count(session, task.id),
+                MASS_CONTACT_THRESHOLD,
+                mass_contact_is_approved(session, task.id),
+            )
+            if task is not None
+            else (),
         )
 
     def _decision_prompt_token(

@@ -18,6 +18,7 @@ from ten_texter.decision_prompts import (
     ordering_conflict_trusted_claims,
     ordering_conflict_untrusted_data,
     owner_command_review_prompt,
+    mass_contact_confirmation_prompt,
     uncertain_delivery_prompt,
     validator_block_prompt,
     contact_boundary_ambiguity_prompt,
@@ -183,6 +184,30 @@ def _authorization_for_subject(
     decision: DecisionRequest,
     prompt: OutboxMessage,
 ) -> DecisionPromptAuthorization | None:
+    if decision.type == "MASS_CONTACT_CONFIRMATION":
+        from ten_texter.mass_contact import MASS_CONTACT_THRESHOLD, mass_contact_subject
+
+        subject = mass_contact_subject(session, decision)
+        if (
+            subject is None
+            or prompt.idempotency_key != f"decision:{decision.id}:owner-prompt"
+        ):
+            return None
+        text = mass_contact_confirmation_prompt(
+            task_id=subject.task.id,
+            participant_count=subject.participant_count,
+            threshold=MASS_CONTACT_THRESHOLD,
+        )
+        return DecisionPromptAuthorization(
+            text,
+            (
+                f"Task {subject.task.id} targets {subject.participant_count} distinct participants.",
+                f"The mass-contact threshold is {MASS_CONTACT_THRESHOLD} distinct participants.",
+                "No participant messages for this task may be sent before owner approval.",
+                "The owner may approve this task's mass contact or cancel this task by replying to this Telegram message.",
+            ),
+        )
+
     if decision.type == "CONTACT_BOUNDARY_AMBIGUITY" and decision.message_revision_id is not None:
         from ten_texter.contact_boundaries import boundary_context
         revision = session.get(MessageRevision, decision.message_revision_id)

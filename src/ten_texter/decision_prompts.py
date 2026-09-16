@@ -45,6 +45,17 @@ def owner_command_review_prompt(telegram_update_id: int) -> str:
     )
 
 
+def mass_contact_confirmation_prompt(
+    *, task_id: int, participant_count: int, threshold: int
+) -> str:
+    return (
+        f"Task {task_id} would contact {participant_count} distinct participants, "
+        f"which exceeds the mass-contact threshold of {threshold}. "
+        "No participant messages will be sent until you decide. Reply to this "
+        "Telegram message with `approve mass contact` or `cancel task`."
+    )
+
+
 def counterproposal_prompt(field: str, operation: str, proposed_value: object) -> str:
     return (
         f"Participant proposed {field} {operation}: {proposed_value}. "

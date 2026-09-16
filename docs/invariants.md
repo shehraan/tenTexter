@@ -155,6 +155,16 @@ Boundary classification is a bounded semantic effect separate from availability/
 
 ContactRules apply to logical targets, not every incidental member of a group conversation. Do not let one group member implicitly veto a whole group merely because they are present.
 
+### Mass contact
+
+Mass contact is more than 25 distinct logical TaskParticipants in one TaskInstance. Every
+participant Outbox for that task remains PENDING until the owner approves that exact
+TaskInstance through its reply-correlated DecisionRequest. Approval never carries to a
+different TaskInstance, including another occurrence of the same TaskDefinition. Owner
+cancellation terminalizes the task through the normal TaskService transition.
+
+Incidental ConversationParticipants do not count toward the threshold.
+
 ## 10. Disclosure
 
 Cross-conversation disclosure is destination-aware.
