@@ -164,6 +164,7 @@ def test_task_parser_llama_schema_pairs_recurrence_and_timezone() -> None:
             "participant_references",
             "recurrence_rule",
             "timezone",
+            "grounding",
         ]
         assert branch["additionalProperties"] is False
         assert branch["properties"]["duration_minutes"]["exclusiveMinimum"] == 0
@@ -505,6 +506,13 @@ def test_task_parser_strict_structured_output() -> None:
                 "participant_references": ["Alex"],
                 "recurrence_rule": None,
                 "timezone": None,
+                "grounding": {
+                    "scheduled_at_source": "tomorrow at 5 PM",
+                    "duration_source": "60 minutes",
+                    "topic_source": "tennis",
+                    "participant_sources": ["Alex"],
+                    "location_source": "courts",
+                },
             }
         }
     )
@@ -512,7 +520,7 @@ def test_task_parser_strict_structured_output() -> None:
         backend,
         owner_timezone="America/Toronto",
         clock=lambda: datetime(2026, 8, 26, 16, tzinfo=UTC),
-    ).parse("Ask Alex about tennis tomorrow at 5 PM for 60 minutes")
+    ).parse("Ask Alex about tennis tomorrow at 5 PM for 60 minutes at the courts")
     assert parsed.topic_key == "tennis"
     assert parsed.duration_minutes == 60
     instructions = backend.calls[0][1]["trusted_instructions"]
@@ -558,6 +566,21 @@ def test_task_parser_normalizes_absolute_time_from_trusted_temporal_context(
                 "participant_references": ["Alex"],
                 "recurrence_rule": None,
                 "timezone": None,
+                "grounding": {
+                    "scheduled_at_source": (
+                        "August 30, 2026 at 5 PM Eastern"
+                        if "Eastern" in instruction
+                        else (
+                            "August 30, 2026 at 21:00 UTC"
+                            if "UTC" in instruction
+                            else "tomorrow at 5 PM"
+                        )
+                    ),
+                    "duration_source": "60 minutes",
+                    "topic_source": "tennis",
+                    "participant_sources": ["Alex"],
+                    "location_source": None,
+                },
             }
         }
     )
@@ -633,6 +656,13 @@ def test_task_parser_missing_time_and_duration_requires_review() -> None:
                 "participant_references": ["Shehraan Canada"],
                 "recurrence_rule": None,
                 "timezone": None,
+                "grounding": {
+                    "scheduled_at_source": "tomorrow at 5 PM",
+                    "duration_source": "60 minutes",
+                    "topic_source": "Shehraan Canada",
+                    "participant_sources": ["Shehraan Canada"],
+                    "location_source": None,
+                },
             }
         }
     )
@@ -659,6 +689,13 @@ def test_task_parser_participant_name_cannot_replace_explicit_topic() -> None:
                 "participant_references": ["Shehraan Canada"],
                 "recurrence_rule": None,
                 "timezone": None,
+                "grounding": {
+                    "scheduled_at_source": "tomorrow at 5 PM",
+                    "duration_source": "60 minutes",
+                    "topic_source": "tennis",
+                    "participant_sources": ["Shehraan Canada"],
+                    "location_source": None,
+                },
             }
         }
     )
@@ -673,6 +710,94 @@ def test_task_parser_participant_name_cannot_replace_explicit_topic() -> None:
 
     assert isinstance(parsed, TaskParseReview)
     assert "activity/topic" in parsed.review_reason
+
+
+@pytest.mark.parametrize(
+    ("scheduled_at", "duration_minutes", "location", "participants", "grounding"),
+    [
+        (
+            "2026-08-30T22:00:00Z",
+            60,
+            None,
+            ["Alex"],
+            {
+                "scheduled_at_source": "tomorrow at 5 PM",
+                "duration_source": "60 minutes",
+                "topic_source": "tennis",
+                "participant_sources": ["Alex"],
+                "location_source": None,
+            },
+        ),
+        (
+            "2026-08-30T21:00:00Z",
+            15,
+            None,
+            ["Alex"],
+            {
+                "scheduled_at_source": "tomorrow at 5 PM",
+                "duration_source": "15 minutes",
+                "topic_source": "tennis",
+                "participant_sources": ["Alex"],
+                "location_source": None,
+            },
+        ),
+        (
+            "2026-08-30T21:00:00Z",
+            60,
+            "invented private address",
+            ["Alex"],
+            {
+                "scheduled_at_source": "tomorrow at 5 PM",
+                "duration_source": "60 minutes",
+                "topic_source": "tennis",
+                "participant_sources": ["Alex"],
+                "location_source": "invented private address",
+            },
+        ),
+        (
+            "2026-08-30T21:00:00Z",
+            60,
+            None,
+            ["Bob"],
+            {
+                "scheduled_at_source": "tomorrow at 5 PM",
+                "duration_source": "60 minutes",
+                "topic_source": "tennis",
+                "participant_sources": ["Bob"],
+                "location_source": None,
+            },
+        ),
+    ],
+)
+def test_task_parser_requires_every_plan_fact_to_be_grounded(
+    scheduled_at: str,
+    duration_minutes: int,
+    location: str | None,
+    participants: list[str],
+    grounding: dict[str, object],
+) -> None:
+    backend = Backend(
+        {
+            "task_parser": {
+                "scheduled_at": scheduled_at,
+                "duration_minutes": duration_minutes,
+                "location": location,
+                "topic_key": "tennis",
+                "participant_references": participants,
+                "recurrence_rule": None,
+                "timezone": None,
+                "grounding": grounding,
+            }
+        }
+    )
+
+    parsed = TaskParser(
+        backend,
+        owner_timezone="America/Toronto",
+        clock=lambda: datetime(2026, 8, 29, 17, tzinfo=UTC),
+    ).parse("Ask Alex about tennis tomorrow at 5 PM for 60 minutes")
+
+    assert isinstance(parsed, TaskParseReview)
 
 
 def test_task_parser_accepts_model_clarification_outcome() -> None:
@@ -737,19 +862,28 @@ def test_task_parser_accepts_valid_recurring_plan() -> None:
     backend = Backend(
         {
             "task_parser": {
-                "scheduled_at": "2026-08-27T17:00:00-04:00",
+                "scheduled_at": "2026-08-30T17:00:00-04:00",
                 "duration_minutes": 60,
                 "location": None,
                 "topic_key": "tennis",
                 "participant_references": ["Alex"],
                 "recurrence_rule": "FREQ=WEEKLY",
                 "timezone": "America/Toronto",
+                "grounding": {
+                    "scheduled_at_source": "every Sunday at 5 PM",
+                    "duration_source": "60 minutes",
+                    "topic_source": "tennis",
+                    "participant_sources": ["Alex"],
+                    "location_source": None,
+                },
             }
         }
     )
-    parsed = TaskParser(backend).parse(
-        "Coordinate weekly tennis at 5 PM for 60 minutes"
-    )
+    parsed = TaskParser(
+        backend,
+        owner_timezone="America/Toronto",
+        clock=lambda: datetime(2026, 8, 29, 17, tzinfo=UTC),
+    ).parse("Coordinate Alex for weekly tennis every Sunday at 5 PM for 60 minutes")
     assert parsed.recurrence_rule == "FREQ=WEEKLY"
     assert parsed.timezone == "America/Toronto"
 

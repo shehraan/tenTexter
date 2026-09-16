@@ -315,6 +315,7 @@ class AvailabilityService:
 
 class ProposalService:
     MUTABLE_FIELDS = {"scheduled_at", "duration_minutes", "location"}
+    MAX_DURATION_MINUTES = 24 * 60
 
     def __init__(self, session: Session):
         self.session = session
@@ -335,21 +336,80 @@ class ProposalService:
         elif proposal.field not in self.MUTABLE_FIELDS or proposal.operation != "SET":
             proposal.status = ProposalStatus.SUPERSEDED
         else:
-            current = getattr(task, proposal.field)
-            expected = proposal.old_value
-            comparable = current.isoformat() if isinstance(current, datetime) else current
-            if comparable != expected:
+            if not self._old_value_matches(task, proposal):
                 proposal.status = ProposalStatus.SUPERSEDED
             else:
-                value = proposal.proposed_value
-                if proposal.field == "scheduled_at":
-                    value = datetime.fromisoformat(value)
-                setattr(task, proposal.field, value)
-                task.updated_at = timestamp
-                proposal.status = ProposalStatus.ACCEPTED
+                try:
+                    value = self._validated_value(proposal.field, proposal.proposed_value)
+                except (DomainError, TypeError, ValueError):
+                    proposal.status = ProposalStatus.SUPERSEDED
+                else:
+                    if proposal.field == "scheduled_at":
+                        TaskService(self.session).reschedule(task.id, value)
+                    else:
+                        setattr(task, proposal.field, value)
+                        task.updated_at = timestamp
+                    proposal.status = ProposalStatus.ACCEPTED
         proposal.resolved_at = timestamp
         self.session.flush()
         return proposal
+
+    def _old_value_matches(self, task: TaskInstance, proposal: Proposal) -> bool:
+        current = getattr(task, proposal.field)
+        if proposal.field == "scheduled_at":
+            if not isinstance(proposal.old_value, str):
+                return False
+            try:
+                expected = self._parse_scheduled_at(proposal.old_value)
+                # SQLite does not round-trip timezone offsets for DateTime
+                # columns. TaskService always stores normalized UTC values, so
+                # a naive value loaded from SQLite is the stored UTC instant.
+                stored_current = (
+                    current
+                    if current.tzinfo is not None
+                    else current.replace(tzinfo=UTC)
+                )
+                actual = _normalize_absolute_instant(
+                    stored_current,
+                    field="scheduled_at",
+                )
+            except (DomainError, TypeError, ValueError):
+                return False
+            return actual == expected
+        if proposal.field == "duration_minutes":
+            return type(proposal.old_value) is int and current == proposal.old_value
+        return (proposal.old_value is None and current is None) or (
+            type(proposal.old_value) is str and current == proposal.old_value
+        )
+
+    def _validated_value(self, field: str, value: Any) -> Any:
+        if field == "scheduled_at":
+            if not isinstance(value, str):
+                raise DomainError("scheduled_at proposal must be an ISO timestamp")
+            return self._parse_scheduled_at(value)
+        if field == "duration_minutes":
+            if (
+                type(value) is not int
+                or value <= 0
+                or value > self.MAX_DURATION_MINUTES
+            ):
+                raise DomainError("duration_minutes proposal is outside the v1 range")
+            return value
+        if field == "location":
+            if value is not None and (
+                type(value) is not str or len(value) > 500
+            ):
+                raise DomainError("location proposal must be null or a short string")
+            return value
+        raise DomainError("unsupported proposal field")
+
+    @staticmethod
+    def _parse_scheduled_at(value: str) -> datetime:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (TypeError, ValueError) as exc:
+            raise DomainError("scheduled_at proposal must be an ISO timestamp") from exc
+        return _normalize_absolute_instant(parsed, field="scheduled_at")
 
 
 class DecisionService:

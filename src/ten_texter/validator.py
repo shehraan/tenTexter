@@ -12,6 +12,7 @@ from ten_texter.decision_prompt_context import authorize_decision_prompt
 from ten_texter.decision_prompts import validator_block_prompt
 from ten_texter.domain import DecisionService
 from ten_texter.enums import (
+    DecisionStatus,
     MessageKind,
     ParentTerminalPolicy,
     Transport,
@@ -282,6 +283,9 @@ class OutboxValidatorGate:
     """Adapter used by OutboxWorker; invalid immutable text is escalated, never repaired there."""
 
     AUTHORITY_CATEGORIES = _VALIDATOR_AUTHORITY_CATEGORIES
+    DECISION_TYPES = frozenset(
+        {"VALIDATOR_AUTHORITY_VIOLATION", "VALIDATOR_REPAIR_REQUIRED"}
+    )
 
     def __init__(
         self,
@@ -297,12 +301,16 @@ class OutboxValidatorGate:
         self.owner_chat_id = owner_chat_id
 
     def validate(self, *, text: str, message_kind: MessageKind, outbox_id: int) -> bool:
+        if self._has_pending_decision(outbox_id, text=text):
+            return False
         result = self.validator.review(
             text=text,
             context=self.contexts.context_for(outbox_id, message_kind),
         )
         if result.category is ValidatorCategory.VALID:
-            return True
+            # A validator result is not an owner approval. A decision created by
+            # an earlier result remains authoritative until it is resolved.
+            return not self._has_pending_decision(outbox_id, text=text)
         decision_type = (
             "VALIDATOR_AUTHORITY_VIOLATION"
             if result.category in self.AUTHORITY_CATEGORIES
@@ -312,9 +320,19 @@ class OutboxValidatorGate:
             message = session.get(OutboxMessage, outbox_id)
             if message is None or message.final_text != text:
                 return False
+            # Decision prompts are already bounded owner-facing artifacts. If a
+            # prompt itself fails validation, do not create a nested decision.
             if session.scalar(
-                select(DecisionRequestPrompt.outbox_message_id).where(
+                select(DecisionRequestPrompt.decision_request_id).where(
                     DecisionRequestPrompt.outbox_message_id == outbox_id
+                )
+            ) is not None:
+                return False
+            if session.scalar(
+                select(DecisionRequest.id).where(
+                    DecisionRequest.outbox_message_id == outbox_id,
+                    DecisionRequest.status == DecisionStatus.PENDING,
+                    DecisionRequest.type.in_(self.DECISION_TYPES),
                 )
             ) is not None:
                 return False
@@ -322,6 +340,7 @@ class OutboxValidatorGate:
                 select(DecisionRequest).where(
                     DecisionRequest.outbox_message_id == outbox_id,
                     DecisionRequest.type == decision_type,
+                    DecisionRequest.status == DecisionStatus.PENDING,
                 )
             )
             if existing is None:
@@ -347,6 +366,22 @@ class OutboxValidatorGate:
                     )
                     session.add(DecisionRequestPrompt(decision_request_id=decision.id, outbox_message_id=prompt.id))
         return False
+
+    def _has_pending_decision(self, outbox_id: int, *, text: str) -> bool:
+        with self.sessions() as session:
+            message = session.get(OutboxMessage, outbox_id)
+            if message is None or message.final_text != text:
+                return True
+            return (
+                session.scalar(
+                    select(DecisionRequest.id).where(
+                        DecisionRequest.outbox_message_id == outbox_id,
+                        DecisionRequest.status == DecisionStatus.PENDING,
+                        DecisionRequest.type.in_(self.DECISION_TYPES),
+                    )
+                )
+                is not None
+            )
 
 
 class GenerationOutcome(str, Enum):

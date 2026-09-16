@@ -150,6 +150,52 @@ def test_health_notification_still_passes_through_independent_validator_gate(db_
     assert result.category is ValidatorCategory.UNSUPPORTED_CLAIM
 
 
+def test_pending_validator_decision_cannot_be_bypassed_by_later_valid_result(
+    db_session,
+) -> None:
+    message = OutboxService(db_session).create_owner(
+        telegram_chat_id=99,
+        final_text="ask",
+        message_kind=MessageKind.NOTIFICATION,
+        idempotency_key="validator:flapping",
+    )
+    db_session.commit()
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    backend = Backend(
+        [
+            {"category": "UNSUPPORTED_CLAIM", "critique": "not authorized"},
+            {"category": "VALID", "critique": None},
+        ]
+    )
+    gate = OutboxValidatorGate(
+        factory,
+        validator=IndependentMessageValidator(backend),
+        contexts=MinimalValidatorContextProvider(allowed_claims=("ask",)),
+    )
+
+    assert not gate.validate(
+        text=message.final_text,
+        message_kind=message.message_kind,
+        outbox_id=message.id,
+    )
+    assert not gate.validate(
+        text=message.final_text,
+        message_kind=message.message_kind,
+        outbox_id=message.id,
+    )
+
+    with factory() as session:
+        decision = session.scalar(
+            select(DecisionRequest).where(
+                DecisionRequest.outbox_message_id == message.id,
+                DecisionRequest.status == "PENDING",
+            )
+        )
+        assert decision is not None
+        assert session.get(OutboxMessage, message.id).status is OutboxStatus.PENDING
+    assert len(backend.payloads) == 1
+
+
 def test_health_notification_without_configured_owner_fails_closed(db_session) -> None:
     HealthMonitor(owner_chat_id=99).record(
         db_session,

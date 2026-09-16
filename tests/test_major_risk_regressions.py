@@ -327,13 +327,20 @@ def test_production_runtime_composes_owner_command_through_durable_send(
         def infer(self, *, operation: str, payload: dict[str, object]) -> dict[str, object]:
             if operation == "task_parser":
                 return {
-                    "scheduled_at": (NOW + timedelta(days=2)).isoformat(),
+                    "scheduled_at": (NOW + timedelta(days=1)).replace(hour=17).isoformat(),
                     "duration_minutes": 60,
                     "location": "courts",
                     "topic_key": "tennis",
                     "participant_references": ["Alex"],
                     "recurrence_rule": None,
                     "timezone": None,
+                    "grounding": {
+                        "scheduled_at_source": "tomorrow at 5 PM",
+                        "duration_source": "60 minutes",
+                        "topic_source": "tennis",
+                        "participant_sources": ["Alex"],
+                        "location_source": "courts",
+                    },
                 }
             if operation == "message_generator":
                 return {"text": "Are you available for tennis at the courts?"}
@@ -359,7 +366,7 @@ def test_production_runtime_composes_owner_command_through_durable_send(
                     "message": {
                         "from": {"id": 7},
                         "chat": {"id": 9, "type": "private"},
-                        "text": "Set up tennis with Alex at 5 PM for 60 minutes.",
+                        "text": "Set up tennis with Alex tomorrow at 5 PM for 60 minutes at the courts.",
                     },
                 }
             ]

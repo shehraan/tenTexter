@@ -24,14 +24,23 @@ from ten_texter.models import (
 from ten_texter.outbox import DeliveryRequest, DeliveryResult
 
 
-def _parse_time(value: str | None) -> datetime:
-    if not value:
-        return utc_now()
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+def _parse_time(value: object) -> datetime:
+    if not isinstance(value, str) or not value:
+        raise RuntimeError("Beeper timestamp is missing or malformed")
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise RuntimeError("Beeper timestamp is malformed") from exc
 
 
 def _aware(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def _optional_provider_time(value: object) -> datetime | None:
+    if value is None:
+        return None
+    return _aware(_parse_time(value))
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,17 +93,20 @@ class BeeperSyncService:
             conversation.network = str(payload.get("network") or conversation.network)
             conversation.kind = ConversationKind.DIRECT if chat_type == "single" else ConversationKind.GROUP
             conversation.title = payload.get("title")
-        participant_payload = payload.get("participants") or {}
-        items = participant_payload.get("items") if isinstance(participant_payload, dict) else []
-        participants_complete = (
-            participant_payload.get("hasMore") is False
-            if isinstance(participant_payload, dict)
-            else False
-        )
+        participant_payload = payload.get("participants")
+        if not isinstance(participant_payload, dict):
+            raise DomainError("Beeper chat participants payload is malformed")
+        items = participant_payload.get("items")
+        has_more = participant_payload.get("hasMore")
+        if not isinstance(items, list) or not isinstance(has_more, bool):
+            raise DomainError("Beeper chat participants page is malformed")
+        if any(not isinstance(user, dict) for user in items):
+            raise DomainError("Beeper chat participants contain a malformed item")
+        participants_complete = not has_more
         counterparty_person_id: int | None = None
         current_identity_ids: set[int] = set()
-        for user in items or []:
-            if not isinstance(user, dict) or user.get("isSelf") is True:
+        for user in items:
+            if user.get("isSelf") is True:
                 continue
             identity = self._sync_identity(user, network=conversation.network)
             membership = self.session.get(
@@ -208,15 +220,21 @@ class BeeperSyncService:
             supported = True
         body_hash = hashlib.sha256((text_value or "<deleted>").encode()).hexdigest()
         revision_marker = payload.get("editedTimestamp") or payload.get("timestamp") or "unknown"
+        arrival = _aware(received_at or utc_now())
+        provider_time = payload.get("editedTimestamp") or payload.get("timestamp")
         event = InboundEvent(
             conversation_id=conversation.id,
             provider_message_id=message_id,
             sender_identity_id=identity.id,
             provider_revision_key=f"{revision_marker}:{body_hash}",
             provider_sort_key=str(payload.get("sortKey")) if payload.get("sortKey") is not None else None,
-            provider_event_at=_parse_time(payload.get("editedTimestamp") or payload.get("timestamp")),
-            created_at=_parse_time(payload.get("timestamp")),
-            received_at=received_at or utc_now(),
+            provider_event_at=(
+                _optional_provider_time(provider_time)
+                if provider_time is not None
+                else None
+            ),
+            created_at=arrival,
+            received_at=arrival,
             text=text_value if isinstance(text_value, str) else None,
             provider_reply_to_message_id=payload.get("linkedMessageID"),
             is_deleted=is_deleted,
@@ -328,9 +346,9 @@ class BeeperDesktopAdapter:
         payload = response.json()
         if not isinstance(payload, dict):
             raise RuntimeError("Beeper page response must be an object")
-        raw_items = payload.get("items") or []
-        if not isinstance(raw_items, list):
+        if "items" not in payload or not isinstance(payload["items"], list):
             raise RuntimeError("Beeper page items must be an array")
+        raw_items = payload["items"]
         if any(not isinstance(item, dict) for item in raw_items):
             raise RuntimeError("Beeper page contains a malformed item")
         newest = payload.get("newestCursor")
@@ -341,7 +359,9 @@ class BeeperDesktopAdapter:
             raise RuntimeError("Beeper oldest cursor is malformed")
         if require_cursors and (newest is None or oldest is None):
             raise RuntimeError("Beeper synchronized page is missing required cursors")
-        has_more = payload.get("hasMore") is True
+        if "hasMore" not in payload or not isinstance(payload["hasMore"], bool):
+            raise RuntimeError("Beeper page hasMore flag is missing or malformed")
+        has_more = payload["hasMore"]
         continuation = newest if direction == "after" else oldest
         if has_more and continuation is None:
             raise RuntimeError("Beeper pagination indicated more data without a cursor")
@@ -641,8 +661,6 @@ class BeeperDesktopAdapter:
     def _optional_time(value: object) -> datetime | None:
         if value is None:
             return None
-        if not isinstance(value, str) or not value:
-            raise RuntimeError("Beeper timestamp is malformed")
         return _aware(_parse_time(value))
 
     @classmethod
@@ -847,12 +865,18 @@ class BeeperDesktopAdapter:
         if not response.is_success:
             return None
         payload = response.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+            return None
         started_at = self._attempt_started_at(request.outbox_id)
         matches: list[str] = []
-        for item in payload.get("items") or []:
+        for item in payload["items"]:
+            if not isinstance(item, dict):
+                return None
             if item.get("isSender") is not True or item.get("text") != request.text:
                 continue
-            timestamp = _parse_time(item.get("timestamp"))
+            timestamp = _optional_provider_time(item.get("timestamp"))
+            if timestamp is None:
+                continue
             if abs(timestamp - started_at) <= timedelta(minutes=2) and isinstance(item.get("id"), str):
                 matches.append(item["id"])
         return matches[0] if len(matches) == 1 else None

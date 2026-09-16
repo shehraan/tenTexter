@@ -399,8 +399,15 @@ class ProductionOwnerCommandHandler:
                 return proposal.status is ProposalStatus.PENDING
 
             def apply(_decision: DecisionRequest, _resolution: dict[str, object]) -> bool:
-                ProposalService(session).resolve(proposal.id, accept=accepted)
-                return True
+                resolved = ProposalService(session).resolve(
+                    proposal.id,
+                    accept=accepted,
+                )
+                return (
+                    resolved.status is ProposalStatus.ACCEPTED
+                    if accepted
+                    else resolved.status is ProposalStatus.REJECTED
+                )
 
             DecisionService(session).answer(
                 decision.id,

@@ -670,6 +670,7 @@ def test_beeper_poll_syncs_chats_and_ingests_inbound_messages(db_session: Sessio
                 return Response(
                     {
                         "items": [chat_payload()],
+                        "hasMore": False,
                         "newestCursor": "chat-head",
                         "oldestCursor": "chat-tail",
                     }
@@ -689,6 +690,7 @@ def test_beeper_poll_syncs_chats_and_ingests_inbound_messages(db_session: Sessio
                                 "isSender": False,
                             }
                         ],
+                        "hasMore": False,
                         "newestCursor": "message-head",
                         "oldestCursor": "message-tail",
                     }
@@ -1101,6 +1103,70 @@ def test_pagination_without_required_cursor_fails_closed(db_session: Session) ->
         adapter.poll_inbound(now=SYNC_NOW)
     with factory() as session:
         assert session.scalar(select(func.count(BeeperSyncCheckpoint.checkpoint_key))) == 0
+
+
+@pytest.mark.parametrize(
+    "page",
+    [
+        {"hasMore": False, "newestCursor": "head", "oldestCursor": "tail"},
+        {"items": [], "newestCursor": "head", "oldestCursor": "tail"},
+    ],
+)
+def test_incomplete_beeper_page_envelope_does_not_advance_checkpoint(
+    db_session: Session,
+    page: dict[str, object],
+) -> None:
+    client = ScriptedPollClient([("/v1/chats", {}, page)])
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    adapter = BeeperDesktopAdapter(
+        factory,
+        access_token="fake",
+        enabled=True,
+        client=client,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(RuntimeError):
+        adapter.poll_inbound(now=SYNC_NOW)
+
+    with factory() as session:
+        assert session.scalar(select(func.count(BeeperSyncCheckpoint.checkpoint_key))) == 0
+
+
+def test_missing_beeper_provider_timestamp_never_becomes_ordering_metadata(
+    db_session: Session,
+) -> None:
+    service = BeeperSyncService(db_session)
+    conversation = service.sync_chat(chat_payload())
+    first = service.ingest_message(
+        {
+            "id": "edited-without-time",
+            "chatID": conversation.beeper_conversation_id,
+            "senderID": "@discord_123:beeper",
+            "timestamp": "2026-08-26T15:00:00Z",
+            "type": "TEXT",
+            "text": "yes",
+        },
+        received_at=NOW,
+    )
+    second = service.ingest_message(
+        {
+            "id": "edited-without-time",
+            "chatID": conversation.beeper_conversation_id,
+            "senderID": "@discord_123:beeper",
+            "type": "TEXT",
+            "text": "no",
+        },
+        received_at=NOW + timedelta(minutes=1),
+    )
+
+    message = db_session.get(Message, first.message_id)
+    revision = db_session.get(MessageRevision, second.revision_id)
+    assert message is not None and revision is not None
+    assert second.ordering_conflict
+    assert message.current_revision_id == first.revision_id
+    assert revision.provider_event_at is None
+    assert revision.received_at.replace(tzinfo=UTC) == NOW + timedelta(minutes=1)
+    assert message.created_at.replace(tzinfo=UTC) == NOW
 
 
 def test_malformed_incremental_page_retains_last_committed_checkpoint(

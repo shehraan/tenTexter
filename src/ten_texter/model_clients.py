@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
+from dateutil import parser as date_parser
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from ten_texter.correlation import (
@@ -120,6 +121,9 @@ class TaskPlan(StrictOutput):
     participant_references: list[str] = Field(min_length=1, max_length=100)
     recurrence_rule: str | None = None
     timezone: str | None = None
+    # Optional for callers constructing an already-authorized plan in Python. The
+    # model JSON schema requires it, and TaskParser rejects parsed plans without it.
+    grounding: "TaskPlanGrounding | None" = None
 
     @model_validator(mode="after")
     def recurrence_fields_pair(self) -> "TaskPlan":
@@ -134,6 +138,16 @@ class TaskPlan(StrictOutput):
                 raise ValueError("recurrence timezone must be a valid IANA timezone") from exc
         self.scheduled_at = self.scheduled_at.astimezone(UTC)
         return self
+
+
+class TaskPlanGrounding(StrictOutput):
+    """Exact source phrases from the owner command for each parsed fact."""
+
+    scheduled_at_source: str = Field(min_length=1, max_length=300)
+    duration_source: str = Field(min_length=1, max_length=100)
+    topic_source: str = Field(min_length=1, max_length=300)
+    participant_sources: list[str] = Field(min_length=1, max_length=100)
+    location_source: str | None = Field(default=None, max_length=500)
 
 
 class TaskParseReview(StrictOutput):
@@ -152,6 +166,7 @@ def task_plan_json_schema() -> dict[str, Any]:
         *generated["required"],
         "recurrence_rule",
         "timezone",
+        "grounding",
     ]
 
     def branch(
@@ -464,6 +479,8 @@ class TaskParser:
                     "Respect any explicit timezone in the owner instruction. scheduled_at must "
                     "include a UTC offset and represent the absolute instant, preferably in UTC. "
                     "Never invent an activity, start time, duration, participant, or location. "
+                    "Include exact source phrases for every returned fact in grounding; each "
+                    "phrase must be copied from owner_instruction. "
                     "When any required fact is absent or ambiguous, return only review_reason "
                     "explaining what the owner must clarify. The topic is the activity, never a "
                     "participant's name. "
@@ -488,10 +505,9 @@ class TaskParser:
                     "The command must explicitly provide " + ", ".join(missing) + "."
                 )
             )
-        if not self._topic_is_supported_by_instruction(text, parsed):
-            return TaskParseReview(
-                review_reason="The activity/topic could not be grounded in the owner command."
-            )
+        grounding_failure = self._grounding_failure(text, parsed, now=now)
+        if grounding_failure is not None:
+            return TaskParseReview(review_reason=grounding_failure)
         return parsed
 
     @staticmethod
@@ -519,16 +535,213 @@ class TaskParser:
             if not present
         )
 
-    @staticmethod
-    def _topic_is_supported_by_instruction(text: str, parsed: TaskPlan) -> bool:
-        instruction_tokens = set(re.findall(r"[^\W_]+", text.casefold()))
-        participant_tokens = {
-            token
-            for reference in parsed.participant_references
-            for token in re.findall(r"[^\W_]+", reference.casefold())
-        }
-        topic_tokens = set(re.findall(r"[^\W_]+", parsed.topic_key.casefold()))
-        return bool(topic_tokens & (instruction_tokens - participant_tokens))
+    def _grounding_failure(
+        self,
+        text: str,
+        parsed: TaskPlan,
+        *,
+        now: datetime,
+    ) -> str | None:
+        grounding = parsed.grounding
+        if grounding is None:
+            return "The parsed task facts could not be verified against the owner command."
+
+        normalized_instruction = _grounding_tokens(text)
+        if not _contains_grounding_phrase(normalized_instruction, grounding.scheduled_at_source):
+            return "The start time could not be grounded in the owner command."
+        if not _contains_grounding_phrase(normalized_instruction, grounding.duration_source):
+            return "The duration could not be grounded in the owner command."
+        if not _contains_grounding_phrase(normalized_instruction, grounding.topic_source):
+            return "The activity/topic could not be grounded in the owner command."
+        if len(grounding.participant_sources) != len(parsed.participant_references):
+            return "The participant list could not be grounded in the owner command."
+        for reference, source in zip(
+            parsed.participant_references,
+            grounding.participant_sources,
+            strict=True,
+        ):
+            if not _contains_grounding_phrase(normalized_instruction, source):
+                return "A participant could not be grounded in the owner command."
+            if _grounding_tokens(reference) != _grounding_tokens(source):
+                return "A participant reference does not match its owner-command source."
+
+        if _grounding_tokens(parsed.topic_key.replace("-", " ")) != _grounding_tokens(
+            grounding.topic_source
+        ):
+            return "The returned activity/topic adds facts not present in the owner command."
+
+        if parsed.location is None:
+            if grounding.location_source is not None:
+                return "The location evidence does not match the returned task plan."
+        else:
+            if grounding.location_source is None:
+                return "The returned location has no owner-command source."
+            if not _contains_grounding_phrase(
+                normalized_instruction, grounding.location_source
+            ):
+                return "The location could not be grounded in the owner command."
+            if _grounding_tokens(parsed.location) != _grounding_tokens(
+                grounding.location_source
+            ):
+                return "The returned location adds facts not present in the owner command."
+
+        duration = _parse_grounding_duration(grounding.duration_source)
+        if duration is None or duration != parsed.duration_minutes:
+            return "The returned duration does not match the owner command."
+
+        expected_start = _parse_grounding_start(
+            grounding.scheduled_at_source,
+            now=now,
+            owner_timezone=self.owner_timezone,
+            recurring=parsed.recurrence_rule is not None,
+        )
+        if expected_start is None:
+            return "The start time/date could not be deterministically resolved."
+        if expected_start != parsed.scheduled_at:
+            return "The returned start time does not match the owner command."
+        return None
+
+
+def _grounding_tokens(value: str) -> str:
+    return " ".join(re.findall(r"[^\W_]+", value.casefold()))
+
+
+def _contains_grounding_phrase(instruction_tokens: str, source: str) -> bool:
+    source_tokens = _grounding_tokens(source)
+    return bool(source_tokens) and f" {source_tokens} " in f" {instruction_tokens} "
+
+
+_DURATION_NUMBER_WORDS: dict[str, float] = {
+    "a": 1,
+    "an": 1,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "half": 0.5,
+}
+_DURATION_RE = re.compile(
+    r"\b(?:for\s+)?(?P<number>\d+(?:\.\d+)?|a|an|one|two|three|four|five|six|seven|eight|nine|ten|half)"
+    r"\s*(?P<unit>minutes?|mins?|hours?|hrs?)\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_grounding_duration(source: str) -> int | None:
+    match = _DURATION_RE.search(source)
+    if match is None:
+        return None
+    raw_number = match.group("number").casefold()
+    try:
+        number = float(raw_number)
+    except ValueError:
+        number = _DURATION_NUMBER_WORDS.get(raw_number, -1)
+    if number <= 0:
+        return None
+    minutes = number * (60 if match.group("unit").casefold().startswith("h") else 1)
+    if not minutes.is_integer():
+        return None
+    return int(minutes)
+
+
+_TIME_RE = re.compile(
+    r"\b(?:[01]?\d|2[0-3]):[0-5]\d\b"
+    r"|\b(?:1[0-2]|0?[1-9])(?:\s*:\s*[0-5]\d)?\s*(?:a\.?m\.?|p\.?m\.?)\b"
+    r"|\b(?:noon|midnight)\b",
+    re.IGNORECASE,
+)
+_WEEKDAYS = {
+    name: index
+    for index, name in enumerate(
+        ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+    )
+}
+_EXPLICIT_DATE_RE = re.compile(
+    r"\b(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}/\d{1,2}(?:/\d{2,4})?|"
+    r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|"
+    r"nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:,\s*\d{4})?)\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_grounding_start(
+    source: str,
+    *,
+    now: datetime,
+    owner_timezone: ZoneInfo,
+    recurring: bool,
+) -> datetime | None:
+    time_match = _TIME_RE.search(source)
+    if time_match is None:
+        return None
+    time_text = time_match.group(0).casefold().replace(".", "")
+    if time_text == "noon":
+        hour, minute = 12, 0
+    elif time_text == "midnight":
+        hour, minute = 0, 0
+    else:
+        try:
+            parsed_time = date_parser.parse(time_text)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        hour, minute = parsed_time.hour, parsed_time.minute
+
+    local_now = now.astimezone(owner_timezone)
+    lowered = source.casefold()
+    if re.search(r"\btomorrow\b", lowered):
+        target_date = local_now.date() + timedelta(days=1)
+    elif re.search(r"\btoday\b", lowered):
+        target_date = local_now.date()
+    else:
+        weekday_match = re.search(
+            r"\b(?:next|this|every)?\s*(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+            lowered,
+        )
+        if weekday_match is not None:
+            target_weekday = _WEEKDAYS[weekday_match.group(1)]
+            delta = (target_weekday - local_now.weekday()) % 7
+            if delta == 0:
+                delta = 7 if recurring or "next" in lowered else 0
+            target_date = local_now.date() + timedelta(days=delta)
+        else:
+            date_match = _EXPLICIT_DATE_RE.search(source)
+            if date_match is None:
+                return None
+            try:
+                target_date = date_parser.parse(date_match.group(0)).date()
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+    zone: timezone | ZoneInfo = owner_timezone
+    if re.search(r"\b(?:utc|gmt|z)\b", lowered):
+        zone = UTC
+    else:
+        offset_match = re.search(r"(?<!\w)([+-]\d{2}:?\d{2})(?!\w)", source)
+        if offset_match is not None:
+            raw_offset = offset_match.group(1)
+            sign = 1 if raw_offset[0] == "+" else -1
+            compact_offset = raw_offset[1:].replace(":", "")
+            zone = timezone(
+                sign
+                * timedelta(
+                    hours=int(compact_offset[:2]),
+                    minutes=int(compact_offset[2:]),
+                )
+            )
+
+    local_start = datetime.combine(
+        target_date,
+        datetime.min.time().replace(hour=hour, minute=minute),
+        tzinfo=zone,
+    )
+    return local_start.astimezone(UTC)
 
 
 class MessageClassifier:

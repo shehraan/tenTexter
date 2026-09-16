@@ -30,7 +30,11 @@ from ten_texter.outbox import (
     OutboxWorker,
 )
 from ten_texter.policy import DatabaseContextProvider
-from ten_texter.telegram import TelegramBotAdapter, TelegramControlGateway
+from ten_texter.telegram import (
+    TelegramBotAdapter,
+    TelegramControlGateway,
+    TelegramTransportError,
+)
 from ten_texter.runtime import AgentRuntime
 from ten_texter.validator import DatabaseValidatorContextProvider
 from tests.test_schema import NOW, seed_core
@@ -85,10 +89,93 @@ def test_unauthorized_sender_never_reaches_parser_or_domain(db_session: Session)
     parser = Parser()
     handler = Handler()
     result = gateway(db_session, parser, handler).receive(raw(1, sender=8))
-    assert result.outcome == "UNAUTHORIZED"
+    assert result.outcome == "FAILED"
     assert parser.calls == []
     assert handler.commands == 0
-    assert db_session.scalar(select(func.count(TelegramUpdate.id))) == 0
+    assert db_session.scalar(select(func.count(TelegramUpdate.id))) == 1
+    update = db_session.scalar(select(TelegramUpdate))
+    assert update is not None
+    assert update.status is TelegramUpdateStatus.FAILED
+    assert update.error_details == "unauthorized sender"
+
+
+def test_structurally_unsupported_update_is_durable_and_does_not_reach_parser(
+    db_session: Session,
+) -> None:
+    parser = Parser()
+    handler = Handler()
+    malformed = raw(2)
+    malformed["message"]["chat"] = {"type": "private"}  # type: ignore[index]
+
+    result = gateway(db_session, parser, handler).receive(malformed)
+
+    assert result.outcome == "FAILED"
+    update = db_session.get(TelegramUpdate, result.telegram_update_row_id)
+    assert update is not None
+    assert update.status is TelegramUpdateStatus.FAILED
+    assert update.chat_id is None
+    assert update.error_details == "update has no supported chat"
+    assert parser.calls == []
+    assert handler.commands == 0
+
+
+def test_boolean_sender_id_cannot_match_numeric_owner_id(db_session: Session) -> None:
+    parser = Parser()
+    handler = Handler()
+    malformed = raw(4, sender=True)
+
+    result = gateway(db_session, parser, handler).receive(malformed)
+
+    assert result.outcome == "FAILED"
+    update = db_session.get(TelegramUpdate, result.telegram_update_row_id)
+    assert update is not None
+    assert update.status is TelegramUpdateStatus.FAILED
+    assert update.error_details == "unauthorized sender"
+    assert parser.calls == []
+    assert handler.commands == 0
+
+
+def test_failed_telegram_update_advances_runtime_offset(db_session: Session) -> None:
+    parser = Parser()
+    handler = Handler()
+    control = gateway(db_session, parser, handler)
+    rejected = control.receive(raw(3, sender=8))
+    assert rejected.outcome == "FAILED"
+
+    class RecordingTelegram:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def poll(self, **kwargs: object) -> list[dict[str, object]]:
+            self.calls.append(kwargs)
+            return []
+
+    telegram = RecordingTelegram()
+    runtime = AgentRuntime.__new__(AgentRuntime)
+    runtime.sessions = sessionmaker(
+        bind=db_session.bind, expire_on_commit=False, autoflush=False
+    )
+    runtime.telegram = telegram
+    runtime.control = control
+    runtime.owner_chat_id = 99
+
+    runtime._poll_telegram()
+
+    assert telegram.calls == [{"offset": 4, "timeout": 0}]
+
+
+def test_telegram_poll_rejects_update_without_stable_id() -> None:
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True, "result": [{"message": {}}]})
+
+    adapter = TelegramBotAdapter(
+        token="fake-token",
+        enabled=True,
+        client=httpx.Client(transport=httpx.MockTransport(respond)),
+    )
+
+    with pytest.raises(TelegramTransportError, match="invalid update item"):
+        adapter.poll(timeout=0)
 
 
 def test_receipt_is_durable_before_effects_and_resumes_from_pending(db_session: Session) -> None:

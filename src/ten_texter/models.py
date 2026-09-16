@@ -596,8 +596,8 @@ class TelegramUpdate(Base):
     __tablename__ = "telegram_update"
     id: Mapped[int] = mapped_column(primary_key=True)
     telegram_update_id: Mapped[int] = mapped_column(unique=True)
-    sender_user_id: Mapped[int] = mapped_column()
-    chat_id: Mapped[int] = mapped_column()
+    sender_user_id: Mapped[int | None] = mapped_column()
+    chat_id: Mapped[int | None] = mapped_column()
     payload_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     status: Mapped[TelegramUpdateStatus] = mapped_column(

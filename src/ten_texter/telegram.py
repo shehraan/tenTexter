@@ -85,15 +85,21 @@ class ReceivedUpdate:
 def _extract(raw: dict[str, Any]) -> tuple[int | None, int | None, str | None, str | None, int | None]:
     callback = raw.get("callback_query")
     if isinstance(callback, dict):
-        sender = callback.get("from", {}).get("id")
-        message = callback.get("message") or {}
-        chat = message.get("chat") or {}
+        sender_payload = callback.get("from")
+        sender = sender_payload.get("id") if isinstance(sender_payload, dict) else None
+        message = callback.get("message")
+        message = message if isinstance(message, dict) else {}
+        chat = message.get("chat")
+        chat = chat if isinstance(chat, dict) else {}
         return sender, chat.get("id"), chat.get("type"), callback.get("data"), None
     message = raw.get("message")
     if isinstance(message, dict):
-        sender = message.get("from", {}).get("id")
-        chat = message.get("chat") or {}
-        reply = message.get("reply_to_message") or {}
+        sender_payload = message.get("from")
+        sender = sender_payload.get("id") if isinstance(sender_payload, dict) else None
+        chat = message.get("chat")
+        chat = chat if isinstance(chat, dict) else {}
+        reply = message.get("reply_to_message")
+        reply = reply if isinstance(reply, dict) else {}
         return sender, chat.get("id"), chat.get("type"), message.get("text"), reply.get("message_id")
     return None, None, None, None, None
 
@@ -117,12 +123,43 @@ class TelegramControlGateway:
     def receive(self, raw: dict[str, Any]) -> ReceivedUpdate:
         update_id = raw.get("update_id")
         sender_id, chat_id, chat_type, _text, _reply = _extract(raw)
-        if not isinstance(update_id, int) or sender_id != self.owner_id:
-            return ReceivedUpdate("UNAUTHORIZED")
-        if self.require_private_chat and chat_type != "private":
-            return ReceivedUpdate("UNAUTHORIZED")
-        if not isinstance(chat_id, int):
+        if not isinstance(update_id, int) or isinstance(update_id, bool):
             return ReceivedUpdate("UNSUPPORTED")
+        rejection: str | None = None
+        if (
+            not isinstance(sender_id, int)
+            or isinstance(sender_id, bool)
+            or sender_id != self.owner_id
+        ):
+            rejection = "unauthorized sender"
+        elif self.require_private_chat and chat_type != "private":
+            rejection = "owner control requires a private chat"
+        elif not isinstance(chat_id, int) or isinstance(chat_id, bool):
+            rejection = "update has no supported chat"
+        if rejection is not None:
+            with self.sessions.begin() as session:
+                existing = session.scalar(
+                    select(TelegramUpdate).where(
+                        TelegramUpdate.telegram_update_id == update_id
+                    )
+                )
+                if existing is not None:
+                    return ReceivedUpdate("DUPLICATE", existing.id)
+                row = TelegramUpdate(
+                    telegram_update_id=update_id,
+                    sender_user_id=sender_id
+                    if isinstance(sender_id, int) and not isinstance(sender_id, bool)
+                    else None,
+                    chat_id=chat_id
+                    if isinstance(chat_id, int) and not isinstance(chat_id, bool)
+                    else None,
+                    payload_json=raw,
+                    status=TelegramUpdateStatus.FAILED,
+                    error_details=rejection,
+                )
+                session.add(row)
+                session.flush()
+                return ReceivedUpdate("FAILED", row.id)
         with self.sessions.begin() as session:
             existing = session.scalar(
                 select(TelegramUpdate).where(TelegramUpdate.telegram_update_id == update_id)
@@ -272,6 +309,20 @@ class TelegramBotAdapter:
                     token=self.token,
                     response=response,
                     fallback="invalid response payload",
+                )
+            )
+        if any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("update_id"), int)
+            or isinstance(item.get("update_id"), bool)
+            for item in payload["result"]
+        ):
+            raise TelegramTransportError(
+                _telegram_failure(
+                    "getUpdates",
+                    token=self.token,
+                    response=response,
+                    fallback="invalid update item",
                 )
             )
         return payload["result"]
