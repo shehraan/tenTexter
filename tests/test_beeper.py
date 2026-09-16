@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import func, select
@@ -9,9 +9,9 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from ten_texter.beeper import BeeperDesktopAdapter, BeeperSyncService
 from ten_texter.enums import DecisionCloseReason, DecisionStatus, MessageKind, OutboxStatus, Transport
-from ten_texter.models import BeeperOutboxDestination, Conversation, ConversationParticipant, DecisionRequest, DecisionRequestPrompt, Identity, Message, MessageRevision, OutboxDeliveryAttempt, OutboxMessage, Person, TaskInstance, TaskParticipant
+from ten_texter.models import BeeperOutboxDestination, BeeperSyncCheckpoint, Conversation, ConversationParticipant, DecisionRequest, DecisionRequestPrompt, Identity, Message, MessageRevision, OutboxDeliveryAttempt, OutboxMessage, Person, TaskInstance, TaskParticipant
 from ten_texter.enums import AvailabilityStatus, TaskStatus
-from ten_texter.domain import utc_now
+from ten_texter.domain import DomainError, utc_now
 from ten_texter.control import ProductionOwnerCommandHandler
 from ten_texter.telegram import TelegramControlGateway
 from ten_texter.outbox import AllowingRevalidator, DeliveryRequest, OutboxService, OutboxWorker
@@ -161,6 +161,23 @@ class Response:
     def raise_for_status(self) -> None:
         if not self.is_success:
             raise RuntimeError("HTTP error")
+
+
+class ScriptedPollClient:
+    def __init__(
+        self,
+        calls: list[tuple[str, dict[str, str], dict[str, object] | Exception]],
+    ) -> None:
+        self.calls = calls
+
+    def get(self, url: str, **kwargs: object) -> Response:
+        assert self.calls, f"unexpected GET {url}"
+        suffix, expected_params, result = self.calls.pop(0)
+        assert url.endswith(suffix)
+        assert kwargs.get("params") == expected_params
+        if isinstance(result, Exception):
+            raise result
+        return Response(result)
 
 
 class Client:
@@ -650,7 +667,13 @@ def test_beeper_poll_syncs_chats_and_ingests_inbound_messages(db_session: Sessio
     class PollClient:
         def get(self, url: str, **_: object) -> Response:
             if url.endswith("/v1/chats"):
-                return Response({"items": [chat_payload()]})
+                return Response(
+                    {
+                        "items": [chat_payload()],
+                        "newestCursor": "chat-head",
+                        "oldestCursor": "chat-tail",
+                    }
+                )
             if url.endswith("/v1/chats/%21direct%3Abeeper/messages"):
                 return Response(
                     {
@@ -665,7 +688,9 @@ def test_beeper_poll_syncs_chats_and_ingests_inbound_messages(db_session: Sessio
                                 "text": "yes",
                                 "isSender": False,
                             }
-                        ]
+                        ],
+                        "newestCursor": "message-head",
+                        "oldestCursor": "message-tail",
                     }
                 )
             raise AssertionError(f"unexpected URL: {url}")
@@ -687,7 +712,7 @@ def test_beeper_poll_syncs_chats_and_ingests_inbound_messages(db_session: Sessio
         assert revision.processing_status.value == "PENDING"
 
 
-def test_beeper_poll_truncates_recent_pages_and_remains_idempotent(db_session: Session) -> None:
+def test_beeper_poll_uses_durable_cursors_and_remains_idempotent(db_session: Session) -> None:
     class BoundedPollClient:
         def __init__(self) -> None:
             self.chat_gets = 0
@@ -695,17 +720,29 @@ def test_beeper_poll_truncates_recent_pages_and_remains_idempotent(db_session: S
 
         def get(self, url: str, **kwargs: object) -> Response:
             params = kwargs.get("params")
-            assert params == {}
             if url.endswith("/v1/chats"):
                 self.chat_gets += 1
+                if params == {"cursor": "chat-new", "direction": "after"}:
+                    return Response(
+                        {
+                            "items": [],
+                            "hasMore": False,
+                            "newestCursor": "chat-new",
+                            "oldestCursor": "chat-new",
+                        }
+                    )
+                assert params == {}
                 return Response(
                     {
                         "items": [chat_payload()],
-                        "hasMore": True,
+                        "hasMore": False,
+                        "newestCursor": "chat-new",
+                        "oldestCursor": "chat-old",
                     }
                 )
             if url.endswith("/v1/chats/%21direct%3Abeeper/messages"):
                 self.message_gets += 1
+                assert params == {}
                 return Response(
                     {
                         "items": [
@@ -720,7 +757,9 @@ def test_beeper_poll_truncates_recent_pages_and_remains_idempotent(db_session: S
                                 "isSender": False,
                             }
                         ],
-                        "hasMore": True,
+                        "hasMore": False,
+                        "newestCursor": "message-new",
+                        "oldestCursor": "message-old",
                     }
                 )
             raise AssertionError(f"unexpected URL: {url}")
@@ -764,7 +803,14 @@ def test_poll_ingests_stable_sender_missing_from_incomplete_participants(
     class MissingParticipantClient:
         def get(self, url: str, **_: object) -> Response:
             if url.endswith("/v1/chats"):
-                return Response({"items": [incomplete_chat], "hasMore": False})
+                return Response(
+                    {
+                        "items": [incomplete_chat],
+                        "hasMore": False,
+                        "newestCursor": "chat-head",
+                        "oldestCursor": "chat-tail",
+                    }
+                )
             if url.endswith("/v1/chats/%21incomplete%3Abeeper/messages"):
                 return Response(
                     {
@@ -782,6 +828,8 @@ def test_poll_ingests_stable_sender_missing_from_incomplete_participants(
                             }
                         ],
                         "hasMore": False,
+                        "newestCursor": "message-head",
+                        "oldestCursor": "message-tail",
                     }
                 )
             raise AssertionError(f"unexpected URL: {url}")
@@ -824,3 +872,461 @@ def test_poll_ingests_stable_sender_missing_from_incomplete_participants(
         assert message.sender_identity_id == identity.id
         assert session.scalar(select(func.count(Message.id))) == 1
         assert session.scalar(select(func.count(MessageRevision.id))) == 1
+
+
+SYNC_NOW = datetime(2026, 9, 14, 16, 0, tzinfo=UTC)
+
+
+def _sync_chat(chat_id: str, *, activity: str = "2026-09-14T15:00:00Z") -> dict[str, object]:
+    payload = chat_payload(chat_id=chat_id)
+    payload["lastActivity"] = activity
+    return payload
+
+
+def _sync_message(
+    message_id: str,
+    chat_id: str,
+    *,
+    text: str | None = "yes",
+    timestamp: str = "2026-09-14T15:00:00Z",
+    sort_key: str = "00000100",
+    edited_timestamp: str | None = None,
+    deleted: bool = False,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "id": message_id,
+        "chatID": chat_id,
+        "senderID": "@discord_123:beeper",
+        "sortKey": sort_key,
+        "timestamp": timestamp,
+        "type": "TEXT",
+        "text": text,
+        "isSender": False,
+    }
+    if edited_timestamp is not None:
+        payload["editedTimestamp"] = edited_timestamp
+    if deleted:
+        payload["isDeleted"] = True
+    return payload
+
+
+def _page(
+    items: list[dict[str, object]],
+    *,
+    newest: str,
+    oldest: str,
+    more: bool = False,
+) -> dict[str, object]:
+    return {
+        "items": items,
+        "hasMore": more,
+        "newestCursor": newest,
+        "oldestCursor": oldest,
+    }
+
+
+def test_chat_feed_page_two_resumes_from_durable_checkpoint_after_restart(
+    db_session: Session,
+) -> None:
+    chat_one = "!page-one:beeper"
+    chat_two = "!page-two:beeper"
+    client = ScriptedPollClient(
+        [
+            (
+                "/v1/chats",
+                {},
+                _page([_sync_chat(chat_one)], newest="chat-head", oldest="chat-page-2", more=True),
+            ),
+            (
+                "/v1/chats/%21page-one%3Abeeper/messages",
+                {},
+                _page([_sync_message("page-one-message", chat_one)], newest="one-head", oldest="one-tail"),
+            ),
+            (
+                "/v1/chats",
+                {"cursor": "chat-page-2", "direction": "before"},
+                _page([_sync_chat(chat_two)], newest="chat-page-2", oldest="chat-tail"),
+            ),
+            (
+                "/v1/chats/%21page-two%3Abeeper/messages",
+                {},
+                _page([_sync_message("page-two-message", chat_two)], newest="two-head", oldest="two-tail"),
+            ),
+            (
+                "/v1/chats/%21page-one%3Abeeper/messages",
+                {},
+                _page([_sync_message("page-one-message", chat_one)], newest="one-head", oldest="one-tail"),
+            ),
+        ]
+    )
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    first = BeeperDesktopAdapter(
+        factory, access_token="fake", enabled=True, client=client  # type: ignore[arg-type]
+    )
+    first.poll_inbound(now=SYNC_NOW)
+    restarted = BeeperDesktopAdapter(
+        factory, access_token="fake", enabled=True, client=client  # type: ignore[arg-type]
+    )
+    restarted.poll_inbound(now=SYNC_NOW + timedelta(seconds=2))
+
+    with factory() as session:
+        assert session.scalar(select(func.count(Message.id))) == 2
+        checkpoint = session.get(BeeperSyncCheckpoint, "chat-feed")
+        assert checkpoint is not None
+        assert checkpoint.bootstrap_complete
+        assert checkpoint.newest_cursor == "chat-head"
+    assert client.calls == []
+
+
+def test_message_page_two_resumes_from_durable_checkpoint_after_restart(
+    db_session: Session,
+) -> None:
+    chat_id = "!message-pages:beeper"
+    client = ScriptedPollClient(
+        [
+            ("/v1/chats", {}, _page([_sync_chat(chat_id)], newest="chat-head", oldest="chat-tail")),
+            (
+                "/v1/chats/%21message-pages%3Abeeper/messages",
+                {},
+                _page(
+                    [_sync_message("newer", chat_id, sort_key="00000200")],
+                    newest="message-head",
+                    oldest="message-page-2",
+                    more=True,
+                ),
+            ),
+            (
+                "/v1/chats",
+                {"cursor": "chat-head", "direction": "after"},
+                _page([], newest="chat-head", oldest="chat-head"),
+            ),
+            (
+                "/v1/chats/%21message-pages%3Abeeper/messages",
+                {"cursor": "message-page-2", "direction": "before"},
+                _page(
+                    [_sync_message("older", chat_id, sort_key="00000100")],
+                    newest="message-page-2",
+                    oldest="message-tail",
+                ),
+            ),
+        ]
+    )
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    BeeperDesktopAdapter(
+        factory, access_token="fake", enabled=True, client=client  # type: ignore[arg-type]
+    ).poll_inbound(now=SYNC_NOW)
+    BeeperDesktopAdapter(
+        factory, access_token="fake", enabled=True, client=client  # type: ignore[arg-type]
+    ).poll_inbound(now=SYNC_NOW + timedelta(seconds=2))
+
+    with factory() as session:
+        assert set(session.scalars(select(Message.provider_message_id))) == {"newer", "older"}
+        checkpoint = session.scalar(
+            select(BeeperSyncCheckpoint).where(
+                BeeperSyncCheckpoint.scope == "CONVERSATION"
+            )
+        )
+        assert checkpoint is not None and checkpoint.bootstrap_complete
+        assert checkpoint.newest_cursor == "message-head"
+
+
+def test_failed_message_page_does_not_advance_chat_checkpoint(
+    db_session: Session,
+) -> None:
+    chat_id = "!failed-page:beeper"
+    client = ScriptedPollClient(
+        [
+            ("/v1/chats", {}, _page([_sync_chat(chat_id)], newest="chat-head", oldest="chat-tail")),
+            (
+                "/v1/chats/%21failed-page%3Abeeper/messages",
+                {},
+                RuntimeError("provider unavailable"),
+            ),
+        ]
+    )
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    adapter = BeeperDesktopAdapter(
+        factory, access_token="fake", enabled=True, client=client  # type: ignore[arg-type]
+    )
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        adapter.poll_inbound(now=SYNC_NOW)
+    with factory() as session:
+        assert session.get(BeeperSyncCheckpoint, "chat-feed") is None
+        assert session.scalar(select(func.count(Conversation.id))) == 0
+
+
+def test_ingestion_failure_rolls_back_messages_and_checkpoint_progress(
+    db_session: Session,
+) -> None:
+    chat_id = "!bad-message:beeper"
+    malformed = _sync_message("bad", chat_id)
+    malformed.pop("senderID")
+    client = ScriptedPollClient(
+        [
+            ("/v1/chats", {}, _page([_sync_chat(chat_id)], newest="chat-head", oldest="chat-tail")),
+            (
+                "/v1/chats/%21bad-message%3Abeeper/messages",
+                {},
+                _page([malformed], newest="message-head", oldest="message-tail"),
+            ),
+        ]
+    )
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    adapter = BeeperDesktopAdapter(
+        factory, access_token="fake", enabled=True, client=client  # type: ignore[arg-type]
+    )
+    with pytest.raises(DomainError, match="stable chat/message/sender identifiers"):
+        adapter.poll_inbound(now=SYNC_NOW)
+    with factory() as session:
+        assert session.scalar(select(func.count(BeeperSyncCheckpoint.checkpoint_key))) == 0
+        assert session.scalar(select(func.count(Conversation.id))) == 0
+        assert session.scalar(select(func.count(Message.id))) == 0
+
+
+def test_pagination_without_required_cursor_fails_closed(db_session: Session) -> None:
+    client = ScriptedPollClient(
+        [
+            (
+                "/v1/chats",
+                {},
+                {"items": [_sync_chat("!missing-cursor:beeper")], "hasMore": True},
+            )
+        ]
+    )
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    adapter = BeeperDesktopAdapter(
+        factory, access_token="fake", enabled=True, client=client  # type: ignore[arg-type]
+    )
+    with pytest.raises(RuntimeError, match="missing required cursors"):
+        adapter.poll_inbound(now=SYNC_NOW)
+    with factory() as session:
+        assert session.scalar(select(func.count(BeeperSyncCheckpoint.checkpoint_key))) == 0
+
+
+def test_malformed_incremental_page_retains_last_committed_checkpoint(
+    db_session: Session,
+) -> None:
+    chat_id = "!retain-checkpoint:beeper"
+    client = ScriptedPollClient(
+        [
+            ("/v1/chats", {}, _page([_sync_chat(chat_id)], newest="chat-head", oldest="chat-tail")),
+            (
+                "/v1/chats/%21retain-checkpoint%3Abeeper/messages",
+                {},
+                _page([_sync_message("known", chat_id)], newest="message-head", oldest="message-tail"),
+            ),
+            (
+                "/v1/chats",
+                {"cursor": "chat-head", "direction": "after"},
+                {"items": [], "hasMore": False},
+            ),
+        ]
+    )
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    adapter = BeeperDesktopAdapter(
+        factory, access_token="fake", enabled=True, client=client  # type: ignore[arg-type]
+    )
+    adapter.poll_inbound(now=SYNC_NOW)
+    with pytest.raises(RuntimeError, match="missing required cursors"):
+        adapter.poll_inbound(now=SYNC_NOW + timedelta(seconds=2))
+    with factory() as session:
+        checkpoint = session.get(BeeperSyncCheckpoint, "chat-feed")
+        assert checkpoint is not None
+        assert checkpoint.newest_cursor == "chat-head"
+        assert checkpoint.updated_at == SYNC_NOW.replace(tzinfo=None)
+
+
+def test_initial_sync_stops_at_thirty_day_cutoff(db_session: Session) -> None:
+    chat_id = "!cutoff:beeper"
+    client = ScriptedPollClient(
+        [
+            ("/v1/chats", {}, _page([_sync_chat(chat_id)], newest="chat-head", oldest="chat-tail")),
+            (
+                "/v1/chats/%21cutoff%3Abeeper/messages",
+                {},
+                _page(
+                    [
+                        _sync_message("recent", chat_id),
+                        _sync_message(
+                            "too-old",
+                            chat_id,
+                            timestamp="2026-07-01T12:00:00Z",
+                            sort_key="00000001",
+                        ),
+                    ],
+                    newest="message-head",
+                    oldest="message-old",
+                    more=True,
+                ),
+            ),
+        ]
+    )
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    BeeperDesktopAdapter(
+        factory, access_token="fake", enabled=True, client=client  # type: ignore[arg-type]
+    ).poll_inbound(now=SYNC_NOW)
+    with factory() as session:
+        assert list(session.scalars(select(Message.provider_message_id))) == ["recent"]
+        checkpoint = session.scalar(
+            select(BeeperSyncCheckpoint).where(
+                BeeperSyncCheckpoint.scope == "CONVERSATION"
+            )
+        )
+        assert checkpoint is not None and checkpoint.bootstrap_complete
+        assert checkpoint.backfill_cursor is None
+
+
+def test_reactivated_chat_uses_forward_message_cursor(db_session: Session) -> None:
+    chat_id = "!reactivated:beeper"
+    client = ScriptedPollClient(
+        [
+            ("/v1/chats", {}, _page([_sync_chat(chat_id)], newest="chat-head", oldest="chat-tail")),
+            (
+                "/v1/chats/%21reactivated%3Abeeper/messages",
+                {},
+                _page([_sync_message("first", chat_id)], newest="message-head", oldest="message-tail"),
+            ),
+            (
+                "/v1/chats",
+                {"cursor": "chat-head", "direction": "after"},
+                _page([_sync_chat(chat_id)], newest="chat-next", oldest="chat-next"),
+            ),
+            (
+                "/v1/chats/%21reactivated%3Abeeper/messages",
+                {"cursor": "message-head", "direction": "after"},
+                _page(
+                    [_sync_message("second", chat_id, sort_key="00000200")],
+                    newest="message-next",
+                    oldest="message-next",
+                ),
+            ),
+        ]
+    )
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    adapter = BeeperDesktopAdapter(
+        factory, access_token="fake", enabled=True, client=client  # type: ignore[arg-type]
+    )
+    adapter.poll_inbound(now=SYNC_NOW)
+    adapter.poll_inbound(now=SYNC_NOW + timedelta(seconds=2))
+    with factory() as session:
+        assert set(session.scalars(select(Message.provider_message_id))) == {"first", "second"}
+
+
+def test_reconciliation_ingests_explicit_edit_and_deletion_but_not_absence(
+    db_session: Session,
+) -> None:
+    chat_id = "!reconcile:beeper"
+    original = [
+        _sync_message("edited", chat_id, text="before", sort_key="00000100"),
+        _sync_message("deleted", chat_id, text="present", sort_key="00000200"),
+        _sync_message("absent", chat_id, text="unchanged", sort_key="00000300"),
+    ]
+    changed = [
+        _sync_message(
+            "edited",
+            chat_id,
+            text="after",
+            sort_key="00000400",
+            edited_timestamp="2026-09-14T15:30:00Z",
+        ),
+        _sync_message(
+            "deleted",
+            chat_id,
+            text="ignored",
+            sort_key="00000500",
+            edited_timestamp="2026-09-14T15:31:00Z",
+            deleted=True,
+        ),
+    ]
+    client = ScriptedPollClient(
+        [
+            ("/v1/chats", {}, _page([_sync_chat(chat_id)], newest="chat-head", oldest="chat-tail")),
+            (
+                "/v1/chats/%21reconcile%3Abeeper/messages",
+                {},
+                _page(original, newest="message-head", oldest="message-tail"),
+            ),
+            (
+                "/v1/chats",
+                {"cursor": "chat-head", "direction": "after"},
+                _page([], newest="chat-head", oldest="chat-head"),
+            ),
+            (
+                "/v1/chats/%21reconcile%3Abeeper/messages",
+                {},
+                _page(changed, newest="message-reconciled", oldest="message-tail"),
+            ),
+        ]
+    )
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    adapter = BeeperDesktopAdapter(
+        factory, access_token="fake", enabled=True, client=client  # type: ignore[arg-type]
+    )
+    adapter.poll_inbound(now=SYNC_NOW)
+    adapter.poll_inbound(now=SYNC_NOW + timedelta(seconds=2))
+
+    with factory() as session:
+        rows = {
+            message.provider_message_id: session.get(MessageRevision, message.current_revision_id)
+            for message in session.scalars(select(Message))
+        }
+        assert rows["edited"].text == "after"
+        assert rows["deleted"].is_deleted and rows["deleted"].text is None
+        assert rows["absent"].text == "unchanged" and not rows["absent"].is_deleted
+        assert session.scalar(select(func.count(MessageRevision.id))) == 5
+
+
+def test_reconciliation_page_progress_resumes_after_restart(db_session: Session) -> None:
+    chat_id = "!reconcile-pages:beeper"
+    client = ScriptedPollClient(
+        [
+            ("/v1/chats", {}, _page([_sync_chat(chat_id)], newest="chat-head", oldest="chat-tail")),
+            (
+                "/v1/chats/%21reconcile-pages%3Abeeper/messages",
+                {},
+                _page([_sync_message("first", chat_id)], newest="message-head", oldest="message-tail"),
+            ),
+            (
+                "/v1/chats",
+                {"cursor": "chat-head", "direction": "after"},
+                _page([], newest="chat-head", oldest="chat-head"),
+            ),
+            (
+                "/v1/chats/%21reconcile-pages%3Abeeper/messages",
+                {},
+                _page(
+                    [_sync_message("first", chat_id)],
+                    newest="audit-head",
+                    oldest="audit-page-2",
+                    more=True,
+                ),
+            ),
+            (
+                "/v1/chats",
+                {"cursor": "chat-head", "direction": "after"},
+                _page([], newest="chat-head", oldest="chat-head"),
+            ),
+            (
+                "/v1/chats/%21reconcile-pages%3Abeeper/messages",
+                {"cursor": "audit-page-2", "direction": "before"},
+                _page([], newest="audit-page-2", oldest="audit-tail"),
+            ),
+        ]
+    )
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    for offset in (0, 2, 4):
+        BeeperDesktopAdapter(
+            factory, access_token="fake", enabled=True, client=client  # type: ignore[arg-type]
+        ).poll_inbound(now=SYNC_NOW + timedelta(seconds=offset))
+    with factory() as session:
+        checkpoint = session.scalar(
+            select(BeeperSyncCheckpoint).where(
+                BeeperSyncCheckpoint.scope == "CONVERSATION"
+            )
+        )
+        assert checkpoint is not None
+        assert checkpoint.reconciliation_cursor is None
+        assert checkpoint.reconciliation_cutoff_at is None
+        assert checkpoint.last_reconciled_at == (SYNC_NOW + timedelta(seconds=4)).replace(
+            tzinfo=None
+        )

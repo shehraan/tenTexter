@@ -89,6 +89,11 @@ Join between Conversation and Identity.
 
 `UNIQUE(conversation_id, identity_id)`.
 
+### BeeperSyncCheckpoint
+Durable provider synchronization progress. One singleton row owns the global chat-feed cursor; one row per Conversation owns its message-feed cursor, bounded bootstrap progress, and recent reconciliation progress. Provider cursors are opaque and never become message identity or ordering state.
+
+v1 uses REST polling only. Initial backfill and best-effort edit/deletion reconciliation cover the most recent 30 days. New-message discovery resumes from durable cursors. Because Beeper does not provide a documented replay guarantee for changes made while the app is offline, absence from a page is never treated as deletion; only an explicit provider deletion tombstone creates a deleted MessageRevision.
+
 ### TaskDefinition
 Reusable/recurring coordination template.
 

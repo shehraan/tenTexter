@@ -108,7 +108,7 @@ def test_full_schema_round_trip(db_session: Session) -> None:
     assert {
         "task_definition", "task_instance", "message_revision", "decision_request",
         "contact_rule", "disclosure_grant", "trigger_execution", "outbox_message",
-        "telegram_update",
+        "telegram_update", "beeper_sync_checkpoint",
     } <= names
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import quote
@@ -13,6 +14,7 @@ from ten_texter.domain import DomainError, utc_now
 from ten_texter.enums import ContentSupport, ConversationKind, Transport
 from ten_texter.inbound import InboundEvent, IngestResult, MessageIngestor
 from ten_texter.models import (
+    BeeperSyncCheckpoint,
     Conversation,
     ConversationParticipant,
     Identity,
@@ -26,6 +28,31 @@ def _parse_time(value: str | None) -> datetime:
     if not value:
         return utc_now()
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _aware(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+@dataclass(frozen=True, slots=True)
+class BeeperPage:
+    items: tuple[dict[str, Any], ...]
+    has_more: bool
+    newest_cursor: str | None
+    oldest_cursor: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _CheckpointSnapshot:
+    checkpoint_key: str
+    newest_cursor: str | None
+    backfill_cursor: str | None
+    bootstrap_cutoff_at: datetime
+    bootstrap_complete: bool
+    reconciliation_cursor: str | None
+    reconciliation_cutoff_at: datetime | None
+    last_reconciled_at: datetime | None
+    updated_at: datetime
 
 
 class BeeperSyncService:
@@ -201,8 +228,8 @@ class BeeperSyncService:
 class BeeperDesktopAdapter:
     """Beeper Desktop REST v1 adapter; disabled unless explicitly configured."""
 
-    POLL_CHAT_PAGES = 1
-    POLL_MESSAGE_PAGES = 1
+    SYNC_WINDOW = timedelta(days=30)
+    CHAT_FEED_KEY = "chat-feed"
 
     def __init__(
         self,
@@ -271,63 +298,475 @@ class BeeperDesktopAdapter:
         allow_truncated: bool = False,
     ) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
-        params: dict[str, str] = {}
+        cursor: str | None = None
         for page in range(max_pages):
-            response = self.client.get(url, headers=self.headers, params=params)
-            response.raise_for_status()
-            payload = response.json()
-            items.extend(item for item in payload.get("items") or [] if isinstance(item, dict))
-            if payload.get("hasMore") is not True:
+            result = self._get_page(url, cursor=cursor, direction="before" if cursor else None)
+            items.extend(result.items)
+            if not result.has_more:
                 break
             if allow_truncated and page + 1 == max_pages:
                 break
-            cursor = payload.get("oldestCursor")
-            if not isinstance(cursor, str) or not cursor:
-                raise RuntimeError("Beeper pagination indicated more data without a cursor")
-            params = {"cursor": cursor, "direction": "before"}
+            cursor = result.oldest_cursor
         else:
             raise RuntimeError("Beeper pagination exceeded the bounded poll limit")
         return items
 
-    def poll_inbound(self) -> list[int]:
-        """Fetch bounded recent chat/message windows and ingest non-owner messages."""
-        chats = self.list_chats(
-            max_pages=self.POLL_CHAT_PAGES,
-            allow_truncated=True,
+    def _get_page(
+        self,
+        url: str,
+        *,
+        cursor: str | None,
+        direction: str | None,
+        require_cursors: bool = False,
+    ) -> BeeperPage:
+        params: dict[str, str] = {}
+        if cursor is not None:
+            params["cursor"] = cursor
+            params["direction"] = direction or "before"
+        response = self.client.get(url, headers=self.headers, params=params)
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError("Beeper page response must be an object")
+        raw_items = payload.get("items") or []
+        if not isinstance(raw_items, list):
+            raise RuntimeError("Beeper page items must be an array")
+        if any(not isinstance(item, dict) for item in raw_items):
+            raise RuntimeError("Beeper page contains a malformed item")
+        newest = payload.get("newestCursor")
+        oldest = payload.get("oldestCursor")
+        if newest is not None and (not isinstance(newest, str) or not newest):
+            raise RuntimeError("Beeper newest cursor is malformed")
+        if oldest is not None and (not isinstance(oldest, str) or not oldest):
+            raise RuntimeError("Beeper oldest cursor is malformed")
+        if require_cursors and (newest is None or oldest is None):
+            raise RuntimeError("Beeper synchronized page is missing required cursors")
+        has_more = payload.get("hasMore") is True
+        continuation = newest if direction == "after" else oldest
+        if has_more and continuation is None:
+            raise RuntimeError("Beeper pagination indicated more data without a cursor")
+        return BeeperPage(
+            tuple(raw_items),
+            has_more,
+            newest,
+            oldest,
         )
-        fetched: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
-        for chat in chats:
-            chat_id = chat.get("id")
-            if not isinstance(chat_id, str) or not chat_id:
-                continue
-            fetched.append(
-                (
-                    chat,
-                    self.list_messages(
-                        chat_id,
-                        max_pages=self.POLL_MESSAGE_PAGES,
-                        allow_truncated=True,
+
+    def poll_inbound(self, *, now: datetime | None = None) -> list[int]:
+        """Advance durable REST synchronization by bounded provider pages."""
+        if not self.enabled:
+            return []
+        timestamp = _aware(now or utc_now())
+        revision_ids, touched = self._poll_chat_feed(timestamp)
+        revision_ids.extend(
+            self._advance_conversation_scan(timestamp, excluded_keys=touched)
+        )
+        return revision_ids
+
+    def _poll_chat_feed(
+        self, timestamp: datetime
+    ) -> tuple[list[int], frozenset[str]]:
+        cutoff = timestamp - self.SYNC_WINDOW
+        with self.sessions() as session:
+            checkpoint = session.get(BeeperSyncCheckpoint, self.CHAT_FEED_KEY)
+            snapshot = self._snapshot(checkpoint)
+        if checkpoint is None:
+            cursor = None
+            direction = None
+            bootstrap = True
+        elif not checkpoint.bootstrap_complete:
+            cursor = checkpoint.backfill_cursor
+            direction = "before"
+            bootstrap = True
+        else:
+            cursor = checkpoint.newest_cursor
+            direction = "after" if cursor is not None else None
+            bootstrap = False
+        chat_page = self._get_page(
+            f"{self.base_url}/v1/chats",
+            cursor=cursor,
+            direction=direction,
+            require_cursors=True,
+        )
+        eligible_chats = tuple(
+            chat
+            for chat in chat_page.items
+            if not bootstrap or self._at_or_after(chat.get("lastActivity"), cutoff)
+        )
+        message_requests: list[
+            tuple[dict[str, Any], str, str | None, _CheckpointSnapshot | None, bool]
+        ] = []
+        seen_provider_ids: set[str] = set()
+        with self.sessions() as session:
+            for chat in eligible_chats:
+                provider_id = chat.get("id")
+                if not isinstance(provider_id, str) or not provider_id:
+                    raise RuntimeError("Beeper chat page contains a chat without a stable id")
+                if provider_id in seen_provider_ids:
+                    continue
+                seen_provider_ids.add(provider_id)
+                conversation = session.scalar(
+                    select(Conversation).where(
+                        Conversation.beeper_conversation_id == provider_id
+                    )
+                )
+                message_checkpoint = (
+                    session.get(
+                        BeeperSyncCheckpoint,
+                        self._conversation_checkpoint_key(conversation.id),
+                    )
+                    if conversation is not None
+                    else None
+                )
+                message_snapshot = self._snapshot(message_checkpoint)
+                message_cursor = (
+                    message_checkpoint.newest_cursor
+                    if message_checkpoint is not None
+                    else None
+                )
+                message_requests.append(
+                    (
+                        chat,
+                        provider_id,
+                        message_cursor,
+                        message_snapshot,
+                        message_checkpoint is None,
+                    )
+                )
+        fetched_messages: list[
+            tuple[dict[str, Any], BeeperPage, _CheckpointSnapshot | None, bool]
+        ] = []
+        for chat, provider_id, message_cursor, message_snapshot, is_new in message_requests:
+            message_page = self._get_page(
+                f"{self.base_url}/v1/chats/{quote(provider_id, safe='')}/messages",
+                cursor=message_cursor,
+                direction="after" if message_cursor is not None else None,
+                require_cursors=True,
+            )
+            fetched_messages.append((chat, message_page, message_snapshot, is_new))
+
+        revision_ids: list[int] = []
+        touched_keys: set[str] = set()
+        with self.sessions.begin() as session:
+            current_feed = session.get(BeeperSyncCheckpoint, self.CHAT_FEED_KEY)
+            self._require_snapshot(current_feed, snapshot)
+            sync = BeeperSyncService(session, owner_chat_id=self.owner_chat_id)
+            for chat, message_page, message_snapshot, new_checkpoint in fetched_messages:
+                conversation = sync.sync_chat(chat)
+                key = self._conversation_checkpoint_key(conversation.id)
+                touched_keys.add(key)
+                current_message_checkpoint = session.get(BeeperSyncCheckpoint, key)
+                self._require_snapshot(current_message_checkpoint, message_snapshot)
+                message_cutoff = cutoff
+                messages = (
+                    item
+                    for item in message_page.items
+                    if not new_checkpoint
+                    or self._at_or_after(
+                        item.get("editedTimestamp") or item.get("timestamp"),
+                        message_cutoff,
+                    )
+                )
+                revision_ids.extend(
+                    self._ingest_messages(sync, conversation, messages)
+                )
+                self._advance_message_checkpoint(
+                    session,
+                    current_message_checkpoint,
+                    conversation=conversation,
+                    page=message_page,
+                    cutoff=message_cutoff,
+                    timestamp=timestamp,
+                    bootstrap=new_checkpoint,
+                    provider_activity_at=self._optional_time(chat.get("lastActivity")),
+                )
+            self._advance_feed_checkpoint(
+                session,
+                current_feed,
+                page=chat_page,
+                cutoff=cutoff,
+                timestamp=timestamp,
+                bootstrap=bootstrap,
+            )
+        return revision_ids, frozenset(touched_keys)
+
+    def _advance_conversation_scan(
+        self,
+        timestamp: datetime,
+        *,
+        excluded_keys: frozenset[str],
+    ) -> list[int]:
+        not_touched = (
+            BeeperSyncCheckpoint.checkpoint_key.not_in(excluded_keys)
+            if excluded_keys
+            else True
+        )
+        with self.sessions() as session:
+            checkpoint = session.scalar(
+                select(BeeperSyncCheckpoint)
+                .where(
+                    BeeperSyncCheckpoint.scope == "CONVERSATION",
+                    BeeperSyncCheckpoint.bootstrap_complete.is_(False),
+                    not_touched,
+                )
+                .order_by(BeeperSyncCheckpoint.created_at, BeeperSyncCheckpoint.checkpoint_key)
+                .limit(1)
+            )
+            scan_kind = "bootstrap"
+            if checkpoint is None:
+                checkpoint = session.scalar(
+                    select(BeeperSyncCheckpoint)
+                    .where(
+                        BeeperSyncCheckpoint.scope == "CONVERSATION",
+                        BeeperSyncCheckpoint.reconciliation_cursor.is_not(None),
+                        not_touched,
+                    )
+                    .order_by(BeeperSyncCheckpoint.updated_at, BeeperSyncCheckpoint.checkpoint_key)
+                    .limit(1)
+                )
+                scan_kind = "reconcile"
+            if checkpoint is None:
+                checkpoint = session.scalar(
+                    select(BeeperSyncCheckpoint)
+                    .where(
+                        BeeperSyncCheckpoint.scope == "CONVERSATION",
+                        not_touched,
+                    )
+                    .order_by(
+                        BeeperSyncCheckpoint.last_reconciled_at.asc().nulls_first(),
+                        BeeperSyncCheckpoint.checkpoint_key,
+                    )
+                    .limit(1)
+                )
+                scan_kind = "reconcile"
+            if checkpoint is None:
+                return []
+            snapshot = self._snapshot(checkpoint)
+            conversation = session.get(Conversation, checkpoint.conversation_id)
+            if conversation is None:
+                raise RuntimeError("Beeper checkpoint conversation is unavailable")
+            provider_id = conversation.beeper_conversation_id
+            if scan_kind == "bootstrap":
+                cursor = checkpoint.backfill_cursor
+                cutoff = _aware(checkpoint.bootstrap_cutoff_at)
+            else:
+                cursor = checkpoint.reconciliation_cursor
+                cutoff = _aware(
+                    checkpoint.reconciliation_cutoff_at or timestamp - self.SYNC_WINDOW
+                )
+        page = self._get_page(
+            f"{self.base_url}/v1/chats/{quote(provider_id, safe='')}/messages",
+            cursor=cursor,
+            direction="before" if cursor is not None else None,
+            require_cursors=True,
+        )
+        revision_ids: list[int] = []
+        with self.sessions.begin() as session:
+            current = session.get(BeeperSyncCheckpoint, snapshot.checkpoint_key)
+            self._require_snapshot(current, snapshot)
+            assert current is not None
+            conversation = session.get(Conversation, current.conversation_id)
+            if conversation is None:
+                raise RuntimeError("Beeper checkpoint conversation is unavailable")
+            sync = BeeperSyncService(session, owner_chat_id=self.owner_chat_id)
+            revision_ids.extend(
+                self._ingest_messages(
+                    sync,
+                    conversation,
+                    (
+                        item
+                        for item in page.items
+                        if self._at_or_after(
+                            item.get("editedTimestamp") or item.get("timestamp"),
+                            cutoff,
+                        )
                     ),
                 )
             )
-
-        revision_ids: list[int] = []
-        with self.sessions.begin() as session:
-            sync = BeeperSyncService(session, owner_chat_id=self.owner_chat_id)
-            for chat, messages in fetched:
-                conversation = sync.sync_chat(chat)
-                ordered = sorted(
-                    (item for item in messages if isinstance(item, dict)),
-                    key=lambda item: str(item.get("sortKey") or item.get("timestamp") or ""),
-                )
-                for item in ordered:
-                    if item.get("isSender") is True:
-                        continue
-                    payload = dict(item)
-                    payload.setdefault("chatID", conversation.beeper_conversation_id)
-                    result = sync.ingest_message(payload)
-                    revision_ids.append(result.revision_id)
+            reached_cutoff = self._page_reaches_cutoff(
+                page.items,
+                cutoff,
+                fields=("editedTimestamp", "timestamp"),
+            )
+            if cursor is None:
+                current.newest_cursor = page.newest_cursor or current.newest_cursor
+            if scan_kind == "bootstrap":
+                complete = not page.has_more or reached_cutoff
+                current.bootstrap_complete = complete
+                current.backfill_cursor = None if complete else page.oldest_cursor
+            else:
+                complete = not page.has_more or reached_cutoff
+                if complete:
+                    current.reconciliation_cursor = None
+                    current.reconciliation_cutoff_at = None
+                    current.last_reconciled_at = timestamp
+                else:
+                    current.reconciliation_cursor = page.oldest_cursor
+                    current.reconciliation_cutoff_at = cutoff
+            current.updated_at = timestamp
         return revision_ids
+
+    @staticmethod
+    def _conversation_checkpoint_key(conversation_id: int) -> str:
+        return f"conversation:{conversation_id}"
+
+    @staticmethod
+    def _snapshot(
+        checkpoint: BeeperSyncCheckpoint | None,
+    ) -> _CheckpointSnapshot | None:
+        if checkpoint is None:
+            return None
+        return _CheckpointSnapshot(
+            checkpoint.checkpoint_key,
+            checkpoint.newest_cursor,
+            checkpoint.backfill_cursor,
+            checkpoint.bootstrap_cutoff_at,
+            checkpoint.bootstrap_complete,
+            checkpoint.reconciliation_cursor,
+            checkpoint.reconciliation_cutoff_at,
+            checkpoint.last_reconciled_at,
+            checkpoint.updated_at,
+        )
+
+    @classmethod
+    def _require_snapshot(
+        cls,
+        checkpoint: BeeperSyncCheckpoint | None,
+        expected: _CheckpointSnapshot | None,
+    ) -> None:
+        if cls._snapshot(checkpoint) != expected:
+            raise RuntimeError("Beeper synchronization checkpoint changed concurrently")
+
+    @staticmethod
+    def _optional_time(value: object) -> datetime | None:
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value:
+            raise RuntimeError("Beeper timestamp is malformed")
+        return _aware(_parse_time(value))
+
+    @classmethod
+    def _at_or_after(cls, value: object, cutoff: datetime) -> bool:
+        parsed = cls._optional_time(value)
+        return parsed is None or parsed >= cutoff
+
+    @classmethod
+    def _page_reaches_cutoff(
+        cls,
+        items: tuple[dict[str, Any], ...],
+        cutoff: datetime,
+        *,
+        fields: tuple[str, ...],
+    ) -> bool:
+        for item in items:
+            value = next((item.get(field) for field in fields if item.get(field)), None)
+            parsed = cls._optional_time(value)
+            if parsed is not None and parsed < cutoff:
+                return True
+        return False
+
+    @staticmethod
+    def _ingest_messages(
+        sync: BeeperSyncService,
+        conversation: Conversation,
+        messages: Any,
+    ) -> list[int]:
+        revision_ids: list[int] = []
+        ordered = sorted(
+            messages,
+            key=lambda item: str(item.get("sortKey") or item.get("timestamp") or ""),
+        )
+        for item in ordered:
+            if item.get("isSender") is True:
+                continue
+            payload = dict(item)
+            payload.setdefault("chatID", conversation.beeper_conversation_id)
+            result = sync.ingest_message(payload)
+            revision_ids.append(result.revision_id)
+        return revision_ids
+
+    @classmethod
+    def _advance_message_checkpoint(
+        cls,
+        session: Session,
+        checkpoint: BeeperSyncCheckpoint | None,
+        *,
+        conversation: Conversation,
+        page: BeeperPage,
+        cutoff: datetime,
+        timestamp: datetime,
+        bootstrap: bool,
+        provider_activity_at: datetime | None,
+    ) -> BeeperSyncCheckpoint:
+        reached_cutoff = cls._page_reaches_cutoff(
+            page.items,
+            cutoff,
+            fields=("editedTimestamp", "timestamp"),
+        )
+        if checkpoint is None:
+            complete = not page.has_more or reached_cutoff
+            checkpoint = BeeperSyncCheckpoint(
+                checkpoint_key=cls._conversation_checkpoint_key(conversation.id),
+                scope="CONVERSATION",
+                conversation_id=conversation.id,
+                newest_cursor=page.newest_cursor,
+                backfill_cursor=None if complete else page.oldest_cursor,
+                bootstrap_cutoff_at=cutoff,
+                bootstrap_complete=complete,
+                provider_activity_at=provider_activity_at,
+                created_at=timestamp,
+                updated_at=timestamp,
+            )
+            session.add(checkpoint)
+            return checkpoint
+        if not bootstrap:
+            checkpoint.newest_cursor = page.newest_cursor or checkpoint.newest_cursor
+        if bootstrap:
+            complete = not page.has_more or reached_cutoff
+            checkpoint.bootstrap_complete = complete
+            checkpoint.backfill_cursor = None if complete else page.oldest_cursor
+        checkpoint.provider_activity_at = provider_activity_at or checkpoint.provider_activity_at
+        checkpoint.updated_at = timestamp
+        return checkpoint
+
+    @classmethod
+    def _advance_feed_checkpoint(
+        cls,
+        session: Session,
+        checkpoint: BeeperSyncCheckpoint | None,
+        *,
+        page: BeeperPage,
+        cutoff: datetime,
+        timestamp: datetime,
+        bootstrap: bool,
+    ) -> BeeperSyncCheckpoint:
+        reached_cutoff = cls._page_reaches_cutoff(
+            page.items,
+            cutoff,
+            fields=("lastActivity",),
+        )
+        if checkpoint is None:
+            complete = not page.has_more or reached_cutoff
+            checkpoint = BeeperSyncCheckpoint(
+                checkpoint_key=cls.CHAT_FEED_KEY,
+                scope="CHAT_FEED",
+                newest_cursor=page.newest_cursor,
+                backfill_cursor=None if complete else page.oldest_cursor,
+                bootstrap_cutoff_at=cutoff,
+                bootstrap_complete=complete,
+                created_at=timestamp,
+                updated_at=timestamp,
+            )
+            session.add(checkpoint)
+            return checkpoint
+        if not bootstrap:
+            checkpoint.newest_cursor = page.newest_cursor or checkpoint.newest_cursor
+        if bootstrap:
+            complete = not page.has_more or reached_cutoff
+            checkpoint.bootstrap_complete = complete
+            checkpoint.backfill_cursor = None if complete else page.oldest_cursor
+        checkpoint.updated_at = timestamp
+        return checkpoint
 
     def send(self, request: DeliveryRequest) -> DeliveryResult:
         if request.transport is not Transport.BEEPER:

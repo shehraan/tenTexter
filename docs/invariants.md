@@ -17,6 +17,10 @@ Examples:
 
 Audit rows may describe state but must not become competing authorities.
 
+`BeeperSyncCheckpoint` is the sole owner of Beeper polling progress. Checkpoint advancement and ingestion of the corresponding provider page commit atomically. Provider cursors are opaque, and checkpoint state never owns message content, revision ordering, or conversation membership.
+
+Beeper synchronization fails closed on malformed/missing cursor data and retains the last committed checkpoint. New-message replay is durable; edit/deletion recovery is a bounded 30-day best effort, and deletion requires an explicit provider tombstone.
+
 ## 2. LLM boundary
 
 LLMs may:
