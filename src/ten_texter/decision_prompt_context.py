@@ -20,6 +20,8 @@ from ten_texter.decision_prompts import (
     owner_command_review_prompt,
     uncertain_delivery_prompt,
     validator_block_prompt,
+    contact_boundary_ambiguity_prompt,
+    contact_rule_exception_prompt,
 )
 from ten_texter.enums import (
     AwaitedResponseStatus,
@@ -181,6 +183,85 @@ def _authorization_for_subject(
     decision: DecisionRequest,
     prompt: OutboxMessage,
 ) -> DecisionPromptAuthorization | None:
+    if decision.type == "CONTACT_BOUNDARY_AMBIGUITY" and decision.message_revision_id is not None:
+        from ten_texter.contact_boundaries import boundary_context
+        revision = session.get(MessageRevision, decision.message_revision_id)
+        inbound = session.get(Message, revision.message_id) if revision is not None else None
+        if (revision is None or inbound is None or inbound.current_revision_id != revision.id
+                or prompt.idempotency_key != f"decision:{decision.id}:owner-prompt"):
+            return None
+        awaited = (
+            session.get(AwaitedResponse, revision.awaited_response_id)
+            if revision.awaited_response_id is not None
+            else None
+        )
+        participant = (
+            session.get(TaskParticipant, awaited.task_participant_id)
+            if awaited is not None
+            else None
+        )
+        context = boundary_context(
+            session,
+            revision,
+            attributable_task_id=(
+                participant.task_instance_id if participant is not None else None
+            ),
+        )
+        expected_scope = context.attributable_task_id
+        if expected_scope is None and context.complete and len(context.candidates) == 1:
+            expected_scope = context.candidates[0].task_instance_id
+        if decision.task_instance_id != expected_scope:
+            return None
+        text = contact_boundary_ambiguity_prompt(decision.id, context.candidates)
+        claims = (
+            f"Participant contact boundary decision {decision.id} has ambiguous scope.",
+            *(f"Task {item.task_instance_id} has topic {item.topic_key}." for item in context.candidates),
+            "The owner may set a listed scope or dismiss by replying to this Telegram message.",
+        )
+        return DecisionPromptAuthorization(text, claims, (f"participant text={revision.text!r}",))
+
+    if (
+        decision.type == "CONTACT_RULE_EXCEPTION"
+        and decision.contact_rule_id is not None
+        and decision.task_instance_id is not None
+    ):
+        from ten_texter.contact_boundaries import contact_rule_exception_subject
+
+        subject = contact_rule_exception_subject(
+            session,
+            rule_id=decision.contact_rule_id,
+            task_id=decision.task_instance_id,
+        )
+        if (
+            subject is None
+            or prompt.idempotency_key != f"decision:{decision.id}:owner-prompt"
+        ):
+            return None
+        rule = subject.rule
+        task = subject.task
+        person = subject.person
+        if rule.scope.value == "GLOBAL":
+            scope_description = "global"
+        elif rule.scope.value == "TOPIC":
+            scope_description = f"topic {rule.topic_key}"
+        else:
+            scope_description = f"task definition {rule.task_definition_id}"
+        text = contact_rule_exception_prompt(
+            rule.id,
+            task.id,
+            person.display_name,
+            scope_description,
+            rule.value,
+        )
+        return DecisionPromptAuthorization(
+            text,
+            (
+                f"{person.display_name} has contact rule {rule.id} scoped to {scope_description}.",
+                f"Contact rule {rule.id} blocks task {task.id}.",
+                "The owner may allow only this task or respect the participant boundary.",
+            ),
+            (f"contact rule {rule.id} participant boundary text={rule.value!r}",),
+        )
     if decision.type == "UNCERTAIN_DELIVERY" and decision.outbox_message_id is not None:
         subject = session.get(OutboxMessage, decision.outbox_message_id)
         if (

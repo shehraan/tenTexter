@@ -11,7 +11,7 @@ from ten_texter.decision_prompt_context import (
     authorize_decision_prompt,
     decision_for_prompt,
 )
-from ten_texter.domain import normalize_topic_key, utc_now
+from ten_texter.domain import DecisionService, normalize_topic_key, utc_now
 from ten_texter.enums import (
     ContactRuleScope,
     ContactRuleSource,
@@ -26,6 +26,8 @@ from ten_texter.models import (
     BeeperOutboxDestination,
     ConversationParticipant,
     ContactRule,
+    DecisionRequest,
+    DecisionRequestPrompt,
     DisclosureGrant,
     DisclosureGrantScope,
     Identity,
@@ -38,6 +40,13 @@ from ten_texter.models import (
     TaskInstance,
     TaskParticipant,
 )
+from ten_texter.contact_boundaries import (
+    contact_rule_exception_subject,
+    pending_boundary_hold,
+)
+from ten_texter.decision_prompts import contact_rule_exception_prompt
+from ten_texter.enums import DecisionStatus, MessageKind, ParentTerminalPolicy
+from ten_texter.outbox import OutboxService
 from ten_texter.nobody_available import (
     authorize_nobody_available_notification,
     is_nobody_available_notification,
@@ -67,6 +76,11 @@ def _aware(value: datetime) -> datetime:
 
 
 class ContactRuleResolver:
+    @dataclass(frozen=True, slots=True)
+    class Assessment:
+        outcome: PolicyOutcome
+        blocking_rule_ids: tuple[int, ...] = ()
+
     def resolve(
         self,
         session: Session,
@@ -77,6 +91,14 @@ class ContactRuleResolver:
         task_definition_id: int | None = None,
         at: datetime | None = None,
     ) -> PolicyOutcome:
+        return self.assess(session, person_id=person_id, task=task, topic_key=topic_key,
+                           task_definition_id=task_definition_id, at=at).outcome
+
+    def assess(
+        self, session: Session, *, person_id: int, task: TaskInstance | None,
+        topic_key: str | None, task_definition_id: int | None = None,
+        at: datetime | None = None,
+    ) -> Assessment:
         timestamp = _aware(at or utc_now())
         rules = list(
             session.scalars(
@@ -90,7 +112,7 @@ class ContactRuleResolver:
             rule.scope is ContactRuleScope.TOPIC and self._live(session, rule, timestamp)
             for rule in rules
         ):
-            return PolicyOutcome.ASK_ME
+            return self.Assessment(PolicyOutcome.ASK_ME)
         normalized_topic = normalize_topic_key(topic_key) if topic_key is not None else None
         applicable = [
             rule
@@ -121,15 +143,20 @@ class ContactRuleResolver:
             and _TYPE_OUTCOME.get(rule.type, PolicyOutcome.ASK_ME) is not PolicyOutcome.AUTO
         ]
         if strong_boundaries:
-            return PolicyOutcome.ASK_ME
+            task_boundaries = [rule for rule in strong_boundaries if rule.scope is ContactRuleScope.TASK_INSTANCE]
+            if task_boundaries:
+                return self.Assessment(PolicyOutcome.DO_NOT_ACT, tuple(sorted(rule.id for rule in task_boundaries)))
+            return self.Assessment(PolicyOutcome.ASK_ME, tuple(sorted(rule.id for rule in strong_boundaries)))
         if not effective:
-            return PolicyOutcome.AUTO
+            return self.Assessment(PolicyOutcome.AUTO)
         specificity = max(_SPECIFICITY[rule.scope] for rule in effective)
         scoped = [rule for rule in effective if _SPECIFICITY[rule.scope] == specificity]
         strength = max(_STRENGTH[rule.strength] for rule in scoped)
         strongest = [rule for rule in scoped if _STRENGTH[rule.strength] == strength]
         outcomes = {_TYPE_OUTCOME.get(rule.type, PolicyOutcome.ASK_ME) for rule in strongest}
-        return outcomes.pop() if len(outcomes) == 1 else PolicyOutcome.ASK_ME
+        outcome = outcomes.pop() if len(outcomes) == 1 else PolicyOutcome.ASK_ME
+        blocking = tuple(sorted(rule.id for rule in strongest)) if outcome is not PolicyOutcome.AUTO else ()
+        return self.Assessment(outcome, blocking)
 
     @staticmethod
     def _live(session: Session, rule: ContactRule, at: datetime) -> bool:
@@ -360,6 +387,8 @@ class PolicyRevalidator(PreSendRevalidator):
         participants = [session.get(TaskParticipant, value) for value in participant_ids]
         if any(participant is None for participant in participants):
             return PreSendDecision.STALE
+        boundary_hold = False
+        exception_requests: list[int] = []
         for participant in participants:
             assert participant is not None
             if participant.task_instance_id != task.id or participant.conversation_id != destination.conversation_id:
@@ -370,13 +399,31 @@ class PolicyRevalidator(PreSendRevalidator):
                 conversation_id=destination.conversation_id,
             ):
                 return PreSendDecision.STALE
-            if self.rules.resolve(
+            boundary_hold = boundary_hold or pending_boundary_hold(
+                session,
+                person_id=participant.person_id,
+                task_id=task.id,
+            )
+            assessment = self.rules.assess(
                 session,
                 person_id=participant.person_id,
                 task=task,
                 topic_key=task.topic_key,
-            ) is not PolicyOutcome.AUTO:
-                return PreSendDecision.POLICY_BLOCKED
+            )
+            if assessment.outcome is PolicyOutcome.ASK_ME and assessment.blocking_rule_ids:
+                respected = session.scalar(select(DecisionRequest.id).where(
+                    DecisionRequest.contact_rule_id == assessment.blocking_rule_ids[0],
+                    DecisionRequest.task_instance_id == task.id,
+                    DecisionRequest.type == "CONTACT_RULE_EXCEPTION",
+                    DecisionRequest.status == DecisionStatus.CLOSED,
+                    DecisionRequest.resolution_json == {"action": "respect_boundary"},
+                ).limit(1))
+                if respected is not None:
+                    return PreSendDecision.POLICY_BLOCKED
+                exception_requests.append(assessment.blocking_rule_ids[0])
+            if assessment.outcome is not PolicyOutcome.AUTO:
+                if assessment.outcome is not PolicyOutcome.ASK_ME:
+                    return PreSendDecision.POLICY_BLOCKED
         for fact in self.facts.facts_for(session, message):
             if not self.disclosure.allows(
                 session,
@@ -387,7 +434,69 @@ class PolicyRevalidator(PreSendRevalidator):
                 scope=fact.scope,
             ):
                 return PreSendDecision.POLICY_BLOCKED
+        if boundary_hold:
+            return PreSendDecision.AWAITING_OWNER
+        if exception_requests:
+            if self.owner_chat_id is None:
+                return PreSendDecision.POLICY_BLOCKED
+            self._ensure_contact_rule_decision(
+                session,
+                min(exception_requests),
+                task.id,
+            )
+            return PreSendDecision.AWAITING_OWNER
         return PreSendDecision.READY
+
+    def _ensure_contact_rule_decision(self, session: Session, rule_id: int, task_id: int) -> None:
+        subject = contact_rule_exception_subject(
+            session,
+            rule_id=rule_id,
+            task_id=task_id,
+        )
+        if subject is None:
+            return
+        rule = subject.rule
+        person = subject.person
+        existing = session.scalar(select(DecisionRequest).where(
+            DecisionRequest.contact_rule_id == rule_id,
+            DecisionRequest.task_instance_id == task_id,
+            DecisionRequest.type == "CONTACT_RULE_EXCEPTION",
+            DecisionRequest.status == DecisionStatus.PENDING,
+        ))
+        if existing is None:
+            existing = DecisionService(session).create(
+                decision_type="CONTACT_RULE_EXCEPTION", subject_kind="contact_rule",
+                subject_id=rule_id, context={}, task_instance_id=task_id,
+                parent_terminal_policy=ParentTerminalPolicy.TERMINATE,
+            )
+        if self.owner_chat_id is not None:
+            prompt = OutboxService(session).create_owner(
+                telegram_chat_id=self.owner_chat_id,
+                final_text=contact_rule_exception_prompt(
+                    rule_id,
+                    task_id,
+                    person.display_name,
+                    self._rule_scope_description(rule),
+                    rule.value,
+                ),
+                message_kind=MessageKind.NOTIFICATION,
+                idempotency_key=f"decision:{existing.id}:owner-prompt",
+                task_instance_id=task_id,
+                parent_terminal_policy=ParentTerminalPolicy.TERMINATE,
+            )
+            if session.get(DecisionRequestPrompt, {"decision_request_id": existing.id, "outbox_message_id": prompt.id}) is None:
+                session.add(DecisionRequestPrompt(decision_request_id=existing.id, outbox_message_id=prompt.id))
+                session.flush()
+
+    @staticmethod
+    def _rule_scope_description(rule: ContactRule) -> str:
+        if rule.scope is ContactRuleScope.GLOBAL:
+            return "global"
+        if rule.scope is ContactRuleScope.TOPIC:
+            return f"topic {rule.topic_key}"
+        if rule.scope is ContactRuleScope.TASK_DEFINITION:
+            return f"task definition {rule.task_definition_id}"
+        return f"task {rule.task_instance_id}"
 
     def context_token(self, session: Session, message: OutboxMessage) -> tuple[object, ...]:
         """Stable pre-send snapshot used to detect policy/context changes during validation."""
@@ -424,7 +533,7 @@ class PolicyRevalidator(PreSendRevalidator):
                 .order_by(OutboxMessageParticipant.task_participant_id)
             )
         )
-        rule_outcomes: list[tuple[int, str]] = []
+        rule_outcomes: list[tuple[object, ...]] = []
         membership_tokens: list[tuple[int, tuple[int, ...]]] = []
         for participant_id in participant_ids:
             participant = session.get(TaskParticipant, participant_id)
@@ -446,13 +555,23 @@ class PolicyRevalidator(PreSendRevalidator):
                     ),
                 )
             )
-            outcome = self.rules.resolve(
+            assessment = self.rules.assess(
                 session,
                 person_id=participant.person_id,
                 task=task,
                 topic_key=task.topic_key if task is not None else None,
             )
-            rule_outcomes.append((participant_id, outcome.value))
+            hold = pending_boundary_hold(session, person_id=participant.person_id, task_id=task.id) if task else False
+            decision_states = tuple(session.execute(select(
+                DecisionRequest.id, DecisionRequest.status
+            ).where(
+                DecisionRequest.contact_rule_id.in_(assessment.blocking_rule_ids),
+                DecisionRequest.task_instance_id == (task.id if task else None),
+                DecisionRequest.type == "CONTACT_RULE_EXCEPTION",
+            ).order_by(DecisionRequest.id))) if assessment.blocking_rule_ids else ()
+            rule_outcomes.append((participant_id, assessment.outcome.value,
+                                  assessment.blocking_rule_ids, hold,
+                                  tuple((row[0], row[1].value) for row in decision_states)))
         facts = tuple(
             sorted(
                 (

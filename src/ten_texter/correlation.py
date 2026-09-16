@@ -48,6 +48,13 @@ from ten_texter.models import (
     DecisionRequestPrompt,
 )
 from ten_texter.outbox import OutboxService
+from ten_texter.contact_boundaries import (
+    ContactBoundary,
+    ContactBoundaryClassifier,
+    NoContactBoundaryClassifier,
+    apply_contact_boundary,
+    boundary_context,
+)
 
 
 class SemanticCorrelator(Protocol):
@@ -180,6 +187,12 @@ class PreparedCorrelation:
     classification: Classification | None = None
     candidate_ids: tuple[int, ...] = ()
     decision_type: str | None = None
+    contact_boundary: ContactBoundary = field(default_factory=lambda: ContactBoundary("NONE"))
+    boundary_person_id: int | None = None
+    boundary_task_ids: tuple[int, ...] = ()
+    boundary_topics: tuple[str, ...] = ()
+    boundary_candidates_complete: bool = True
+    boundary_attributable_task_id: int | None = None
 
 
 class CorrelationOrchestrator:
@@ -189,11 +202,13 @@ class CorrelationOrchestrator:
         *,
         semantic: SemanticCorrelator,
         classifier: Classifier,
+        boundary_classifier: ContactBoundaryClassifier | None = None,
         owner_chat_id: int | None = None,
     ):
         self.session = session
         self.semantic = semantic
         self.classifier = classifier
+        self.boundary_classifier = boundary_classifier or NoContactBoundaryClassifier()
         self.owner_chat_id = owner_chat_id
 
     def prepare(self, revision_id: int) -> PreparedCorrelation:
@@ -204,8 +219,34 @@ class CorrelationOrchestrator:
         message = self.session.get(Message, revision.message_id)
         if message is None or message.current_revision_id != revision.id:
             raise StaleWork("revision is not current")
+        def prepared(plan: PreparedCorrelation) -> PreparedCorrelation:
+            attributable_task_id = None
+            if plan.awaited_response_id is not None:
+                awaited = self.session.get(AwaitedResponse, plan.awaited_response_id)
+                participant = self.session.get(TaskParticipant, awaited.task_participant_id) if awaited else None
+                attributable_task_id = participant.task_instance_id if participant else None
+            boundary_values = boundary_context(
+                self.session,
+                revision,
+                attributable_task_id=attributable_task_id,
+            )
+            boundary = self.boundary_classifier.classify(revision, boundary_values)
+            return PreparedCorrelation(
+                outcome=plan.outcome,
+                awaited_response_id=plan.awaited_response_id,
+                source=plan.source,
+                classification=plan.classification,
+                candidate_ids=plan.candidate_ids,
+                decision_type=plan.decision_type,
+                contact_boundary=boundary,
+                boundary_person_id=boundary_values.person_id,
+                boundary_task_ids=tuple(item.task_instance_id for item in boundary_values.candidates),
+                boundary_topics=tuple(item.topic_key for item in boundary_values.candidates),
+                boundary_candidates_complete=boundary_values.complete,
+                boundary_attributable_task_id=attributable_task_id,
+            )
         if revision.awaited_response_id is not None:
-            return PreparedCorrelation("ALREADY_CORRELATED", revision.awaited_response_id)
+            return prepared(PreparedCorrelation("ALREADY_CORRELATED", revision.awaited_response_id))
 
         lineage = list(
             self.session.scalars(
@@ -220,35 +261,35 @@ class CorrelationOrchestrator:
             )
         )
         if len(lineage) == 1:
-            return self._prepare_known(revision, lineage[0], "REVISION_LINEAGE")
+            return prepared(self._prepare_known(revision, lineage[0], "REVISION_LINEAGE"))
         if len(lineage) > 1:
-            return self._prepare_ambiguous(lineage, "REVISION_LINEAGE_CONFLICT")
+            return prepared(self._prepare_ambiguous(lineage, "REVISION_LINEAGE_CONFLICT"))
 
         reply = self._reply_candidates(message)
         if reply:
             narrowed = self._narrow_to_sender(reply, message.sender_identity_id) or reply
             if len(narrowed) == 1:
-                return self._prepare_known(revision, narrowed[0], "PROVIDER_REPLY")
-            return self._prepare_ambiguous(narrowed, "CORRELATION_AMBIGUITY")
+                return prepared(self._prepare_known(revision, narrowed[0], "PROVIDER_REPLY"))
+            return prepared(self._prepare_ambiguous(narrowed, "CORRELATION_AMBIGUITY"))
 
         exact = self._exact_conversation_candidates(message)
         if len(exact) == 1:
-            return self._prepare_known(revision, exact[0], "EXACT_CONVERSATION")
+            return prepared(self._prepare_known(revision, exact[0], "EXACT_CONVERSATION"))
         if len(exact) > 1:
             relevant = self._temporally_relevant(exact, message)
             if len(relevant) == 1:
-                return self._prepare_known(revision, relevant[0], "RECENCY")
+                return prepared(self._prepare_known(revision, relevant[0], "RECENCY"))
             candidates = relevant or exact
             chosen = self.semantic.choose(revision, candidates)
             if chosen is not None and sum(item.id == chosen for item in candidates) == 1:
                 awaited = next(item for item in candidates if item.id == chosen)
-                return self._prepare_known(revision, awaited, "SEMANTIC")
-            return self._prepare_ambiguous(candidates, "CORRELATION_AMBIGUITY")
+                return prepared(self._prepare_known(revision, awaited, "SEMANTIC"))
+            return prepared(self._prepare_ambiguous(candidates, "CORRELATION_AMBIGUITY"))
 
         cross = self._same_person_other_conversation(message)
         if cross:
-            return self._prepare_ambiguous(cross, "CROSS_CONVERSATION_RESPONSE")
-        return PreparedCorrelation("UNMATCHED")
+            return prepared(self._prepare_ambiguous(cross, "CROSS_CONVERSATION_RESPONSE"))
+        return prepared(PreparedCorrelation("UNMATCHED"))
 
     def apply_prepared(self, revision_id: int, plan: PreparedCorrelation) -> CorrelationResult:
         revision = self.session.get(MessageRevision, revision_id)
@@ -257,6 +298,27 @@ class CorrelationOrchestrator:
         message = self.session.get(Message, revision.message_id)
         if message is None or message.current_revision_id != revision.id:
             raise StaleWork("revision is not current")
+        if plan.boundary_person_id is not None:
+            current_context = boundary_context(
+                self.session,
+                revision,
+                attributable_task_id=plan.boundary_attributable_task_id,
+            )
+            if (
+                current_context.person_id != plan.boundary_person_id
+                or tuple(item.task_instance_id for item in current_context.candidates) != plan.boundary_task_ids
+                or tuple(item.topic_key for item in current_context.candidates) != plan.boundary_topics
+                or current_context.complete != plan.boundary_candidates_complete
+                or current_context.attributable_task_id != plan.boundary_attributable_task_id
+            ):
+                raise StaleWork("contact-boundary candidates changed")
+            apply_contact_boundary(
+                self.session,
+                revision,
+                plan.contact_boundary,
+                current_context,
+                owner_chat_id=self.owner_chat_id,
+            )
         if plan.outcome == "ALREADY_CORRELATED":
             return CorrelationResult(plan.outcome, plan.awaited_response_id)
         if plan.outcome == "UNMATCHED":

@@ -3,6 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import Protocol
+
+
+class BoundaryPromptCandidate(Protocol):
+    task_instance_id: int
+    topic_key: str
 
 
 OrderingPromptCandidate = tuple[
@@ -155,3 +161,31 @@ def ordering_conflict_untrusted_data(
 def bounded_revision_preview(text: str | None) -> str:
     value = "<deleted>" if text is None else text
     return value[:ORDERING_TEXT_PREVIEW_MAX_LENGTH]
+
+
+def contact_boundary_ambiguity_prompt(
+    decision_id: int, candidates: Iterable[BoundaryPromptCandidate]
+) -> str:
+    options = tuple(candidates)
+    lines = [f"Participant contact boundary decision {decision_id} has ambiguous scope."]
+    lines.extend(f"- task {item.task_instance_id}: topic {item.topic_key}" for item in options)
+    lines.append(
+        "Reply to this Telegram message with `set global`, `set topic <topic-key>`, "
+        "`set task <task-id>`, or `dismiss`."
+    )
+    return "\n".join(lines)
+
+
+def contact_rule_exception_prompt(
+    rule_id: int,
+    task_id: int,
+    person_name: str,
+    scope_description: str,
+    participant_text: str,
+) -> str:
+    return (
+        f"{person_name}'s contact rule {rule_id} ({scope_description}) blocks task {task_id}.\n"
+        f"Untrusted participant boundary text (quoted exactly): {participant_text!r}\n"
+        "Reply to this Telegram message with `allow this task` for one narrow exception "
+        "or `respect boundary`."
+    )

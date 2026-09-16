@@ -40,6 +40,7 @@ class PreSendDecision(str, Enum):
     STALE = "STALE"
     POLICY_BLOCKED = "POLICY_BLOCKED"
     UNAVAILABLE = "UNAVAILABLE"
+    AWAITING_OWNER = "AWAITING_OWNER"
 
 
 class PreSendRevalidator(Protocol):
@@ -289,7 +290,7 @@ class OutboxWorker:
             if message is None or message.status is not OutboxStatus.PENDING:
                 return message.status if message is not None else OutboxStatus.CANCELLED
             initial_decision = self.revalidator.check(session, message)
-            if initial_decision is PreSendDecision.UNAVAILABLE:
+            if initial_decision in {PreSendDecision.UNAVAILABLE, PreSendDecision.AWAITING_OWNER}:
                 return OutboxStatus.PENDING
             if initial_decision in {
                 PreSendDecision.STALE,
@@ -327,7 +328,7 @@ class OutboxWorker:
                 and token_builder(session, message) != policy_token
             ):
                 decision = PreSendDecision.POLICY_BLOCKED
-            if decision is PreSendDecision.UNAVAILABLE:
+            if decision in {PreSendDecision.UNAVAILABLE, PreSendDecision.AWAITING_OWNER}:
                 return OutboxStatus.PENDING
             if decision in {PreSendDecision.STALE, PreSendDecision.POLICY_BLOCKED}:
                 message.status = OutboxStatus.CANCELLED

@@ -17,7 +17,7 @@ from ten_texter.correlation import (
 )
 from ten_texter.decision_prompts import owner_command_review_prompt
 from ten_texter.decision_prompt_context import late_terminal_subject
-from ten_texter.domain import DecisionService, DomainError, ProposalService
+from ten_texter.domain import ContactRuleService, DecisionService, DomainError, ProposalService, normalize_topic_key
 from ten_texter.inbound import (
     ordering_conflict_candidates,
     ordering_conflict_still_requires_decision,
@@ -31,6 +31,9 @@ from ten_texter.enums import (
     ParentTerminalPolicy,
     OutboxStatus,
     ProposalStatus,
+    ContactRuleScope,
+    ContactRuleSource,
+    RuleStrength,
 )
 from ten_texter.model_clients import EntityResolverAssistant, TaskParseReview, TaskPlan
 from ten_texter.models import (
@@ -49,8 +52,12 @@ from ten_texter.models import (
     TelegramUpdate,
     TaskDefinition,
     TaskDefinitionParticipant,
+    TaskInstance,
+    TaskParticipant,
+    OutboxMessageParticipant,
 )
 from ten_texter.outbox import OutboxService
+from ten_texter.contact_boundaries import boundary_context, contact_rule_exception_subject
 from ten_texter.validator import (
     GenerationOutcome,
     ValidatedGenerationPipeline,
@@ -148,6 +155,26 @@ class ProductionOwnerCommandHandler:
                 if late_terminal_subject(session, decision) is None:
                     return PreparedOwnerDecision("stale")
                 return PreparedOwnerDecision("dismiss")
+            if decision.type == "CONTACT_BOUNDARY_AMBIGUITY":
+                revision = session.get(MessageRevision, decision.message_revision_id)
+                message = session.get(Message, revision.message_id) if revision is not None else None
+                if revision is None or message is None or message.current_revision_id != revision.id:
+                    return PreparedOwnerDecision("stale")
+                text = str((payload.get("message") or {}).get("text") or "").strip()
+                lowered = text.casefold()
+                if lowered == "set global":
+                    return PreparedOwnerDecision("set_global")
+                if lowered.startswith("set topic ") and text[10:].strip():
+                    return PreparedOwnerDecision(f"set_topic:{normalize_topic_key(text[10:])}")
+                if lowered.startswith("set task ") and text[9:].strip().isdigit():
+                    return PreparedOwnerDecision("set_task", message_revision_id=int(text[9:].strip()))
+                if lowered == "dismiss":
+                    return PreparedOwnerDecision("dismiss")
+                raise DomainError("contact boundary decision requires set global/topic/task or dismiss")
+            if decision.type == "CONTACT_RULE_EXCEPTION" and decision.contact_rule_id is not None:
+                if action not in {"allow_this", "respect_boundary"}:
+                    raise DomainError("contact rule decision requires `allow this task` or `respect boundary`")
+                return PreparedOwnerDecision(action)
             if decision.message_revision_id is not None:
                 if action != "select" or selected_id is None:
                     raise DomainError("correlation decisions require `select <awaited-response-id>`")
@@ -407,6 +434,142 @@ class ProductionOwnerCommandHandler:
             )
             DecisionService(session).close(decision.id, reason)
             return
+        if decision.type == "CONTACT_BOUNDARY_AMBIGUITY":
+            revision = session.get(MessageRevision, decision.message_revision_id)
+            message = session.get(Message, revision.message_id) if revision is not None else None
+            identity = session.get(Identity, message.sender_identity_id) if message is not None else None
+            correlated = (
+                session.get(AwaitedResponse, revision.awaited_response_id)
+                if revision is not None and revision.awaited_response_id is not None
+                else None
+            )
+            correlated_participant = (
+                session.get(TaskParticipant, correlated.task_participant_id)
+                if correlated is not None
+                else None
+            )
+            scope_context = (
+                boundary_context(
+                    session,
+                    revision,
+                    attributable_task_id=(
+                        correlated_participant.task_instance_id
+                        if correlated_participant is not None
+                        else None
+                    ),
+                )
+                if revision is not None and identity is not None
+                else None
+            )
+            def still_requires_boundary(_decision: DecisionRequest) -> bool:
+                expected_task_id = (
+                    scope_context.attributable_task_id
+                    if scope_context is not None
+                    else None
+                )
+                if (
+                    expected_task_id is None
+                    and scope_context is not None
+                    and scope_context.complete
+                    and len(scope_context.candidates) == 1
+                ):
+                    expected_task_id = scope_context.candidates[0].task_instance_id
+                return bool(
+                    revision
+                    and message
+                    and identity
+                    and message.current_revision_id == revision.id
+                    and decision.task_instance_id == expected_task_id
+                )
+            def apply_boundary(_decision: DecisionRequest, _resolution: dict[str, object]) -> bool:
+                assert identity is not None and revision is not None
+                if payload.action == "dismiss":
+                    return True
+                values: dict[str, object] = {}
+                if payload.action == "set_global":
+                    scope = ContactRuleScope.GLOBAL
+                elif payload.action.startswith("set_topic:"):
+                    scope = ContactRuleScope.TOPIC
+                    topic = payload.action.split(":", 1)[1]
+                    values["topic_key"] = topic
+                elif (
+                    payload.action == "set_task"
+                    and scope_context is not None
+                    and payload.message_revision_id in scope_context.task_ids
+                ):
+                    scope = ContactRuleScope.TASK_INSTANCE
+                    values["task_instance_id"] = payload.message_revision_id
+                else:
+                    return False
+                ContactRuleService(session).create(
+                    person_id=identity.person_id, scope=scope, type="DO_NOT_CONTACT",
+                    value=revision.text or "<deleted>", source=ContactRuleSource.PARTICIPANT_REQUESTED,
+                    strength=RuleStrength.STRONG, **values,
+                )
+                pending = list(session.scalars(select(OutboxMessage).join(
+                    OutboxMessageParticipant, OutboxMessageParticipant.outbox_message_id == OutboxMessage.id
+                ).join(TaskParticipant, TaskParticipant.id == OutboxMessageParticipant.task_participant_id)
+                .join(TaskInstance, TaskInstance.id == OutboxMessage.task_instance_id).where(
+                    OutboxMessage.status == OutboxStatus.PENDING,
+                    TaskParticipant.person_id == identity.person_id,
+                    *( [TaskInstance.topic_key == values["topic_key"]] if scope is ContactRuleScope.TOPIC else [] ),
+                    *( [TaskInstance.id == values["task_instance_id"]] if scope is ContactRuleScope.TASK_INSTANCE else [] ),
+                )))
+                for target in pending:
+                    target.status = OutboxStatus.CANCELLED
+                    target.cancel_reason = OutboxCancelReason.POLICY_BLOCKED
+                return True
+            if payload.action == "dismiss":
+                DecisionService(session).close(
+                    decision.id,
+                    DecisionCloseReason.DISMISSED if still_requires_boundary(decision)
+                    else DecisionCloseReason.SUBJECT_RESOLVED,
+                )
+            else:
+                DecisionService(session).answer(decision.id, {"action": payload.action},
+                    subject_still_requires_decision=still_requires_boundary, apply=apply_boundary)
+            return
+        if decision.type == "CONTACT_RULE_EXCEPTION" and decision.contact_rule_id is not None:
+            if decision.task_instance_id is None:
+                DecisionService(session).close(
+                    decision.id,
+                    DecisionCloseReason.SUBJECT_RESOLVED,
+                )
+                return
+            if payload.action not in {"allow_this", "respect_boundary"}:
+                raise DomainError(
+                    "contact rule decision requires `allow this task` or `respect boundary`"
+                )
+            def still_requires_rule(_decision: DecisionRequest) -> bool:
+                return contact_rule_exception_subject(
+                    session,
+                    rule_id=decision.contact_rule_id,
+                    task_id=decision.task_instance_id,
+                ) is not None
+            def apply_rule(_decision: DecisionRequest, _resolution: dict[str, object]) -> bool:
+                subject = contact_rule_exception_subject(
+                    session,
+                    rule_id=decision.contact_rule_id,
+                    task_id=decision.task_instance_id,
+                )
+                if subject is None:
+                    return False
+                if payload.action == "allow_this":
+                    ContactRuleService(session).create(person_id=subject.rule.person_id,
+                        scope=ContactRuleScope.TASK_INSTANCE, task_instance_id=subject.task.id,
+                        type="ALLOW", value="Owner approved this task only",
+                        source=ContactRuleSource.USER_CONFIGURED, strength=RuleStrength.STRONG,
+                        overrides_contact_rule_id=subject.rule.id)
+                else:
+                    for outbox_id in subject.pending_outbox_ids:
+                        target = session.get(OutboxMessage, outbox_id)
+                        assert target is not None
+                        target.status = OutboxStatus.CANCELLED
+                        target.cancel_reason = OutboxCancelReason.POLICY_BLOCKED
+                return True
+            DecisionService(session).answer(decision.id, {"action": payload.action},
+                subject_still_requires_decision=still_requires_rule, apply=apply_rule)
+            return
         if decision.message_revision_id is not None:
             revision = session.get(MessageRevision, decision.message_revision_id)
             message = session.get(Message, revision.message_id) if revision is not None else None
@@ -523,8 +686,9 @@ class ProductionOwnerCommandHandler:
                 selected = int(parts[2]) if parts[2].isdigit() else None
             else:
                 value = (
+                    "allow_this" if parts == ["allow", "this", "task"] else
                     "_".join(parts[:2])
-                    if parts[:2] in [["keep", "reconciling"], ["keep", "blocked"]]
+                    if parts[:2] in [["keep", "reconciling"], ["keep", "blocked"], ["respect", "boundary"]]
                     else (parts[0] if parts else "")
                 )
                 selected = (

@@ -405,6 +405,8 @@ Examples:
 
 Explicit owner-approved narrow exception points to exactly one original blocking ContactRule; one original may have multiple exceptions over time.
 
+Participant boundary requests are classified independently of availability and proposals. Explicit GLOBAL, TOPIC, and TASK_INSTANCE requests become STRONG participant-requested `DO_NOT_CONTACT` rules. Ambiguous scope creates an owner DecisionRequest and a temporary send hold. TASK_INSTANCE boundaries are absolute; broader boundaries permit only an owner-approved TASK_INSTANCE `ALLOW` exception. The original Outbox remains PENDING while that exception decision is pending.
+
 ## Disclosure policy
 
 Implicit private-DM information flowing to another conversation requires ASK_ME unless a valid DisclosureGrant exists.

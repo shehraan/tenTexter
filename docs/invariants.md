@@ -145,6 +145,10 @@ Revocation uses `revoked_at`/`revoked_reason`; historical rows are preserved. Ap
 
 Approved exceptions use `overrides_contact_rule_id`, must not self-reference, must refer to the same Person, must be narrower/applicable to the approved context, and must not form cycles.
 
+An explicit participant-requested boundary is a STRONG `DO_NOT_CONTACT` rule. A TASK_INSTANCE participant boundary is absolute for that task. A broader participant boundary may be overridden only by an explicit owner-approved TASK_INSTANCE `ALLOW` rule referencing the blocking rule. While that decision is pending, the original immutable Outbox remains PENDING and is neither validated nor sent.
+
+Boundary classification is a bounded semantic effect separate from availability/proposal classification. Ambiguous scope creates a typed MessageRevision DecisionRequest and holds sends to that Person for the uniquely attributable task, or globally when no unique task is attributable. Editing a message never silently revokes an established boundary.
+
 ContactRules apply to logical targets, not every incidental member of a group conversation. Do not let one group member implicitly veto a whole group merely because they are present.
 
 ## 10. Disclosure

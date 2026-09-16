@@ -34,6 +34,7 @@ from ten_texter.model_clients import (
     EntityResolverAssistant,
     HTTPModelBackend,
     MessageClassifier,
+    ModelContactBoundaryClassifier,
     MessageGenerator,
     ModelBackend,
     ModelOutputError,
@@ -63,6 +64,7 @@ from ten_texter.policy import (
     DatabaseContextProvider,
     PolicyRevalidator,
 )
+from ten_texter.contact_boundaries import ContactBoundaryClassifier
 from ten_texter.scheduler import RecurrenceScheduler
 from ten_texter.telegram import TelegramBotAdapter, TelegramControlGateway
 from ten_texter.triggers import TriggerWorker
@@ -218,6 +220,7 @@ class AgentRuntime:
         revisions: RevisionProcessor,
         semantic: SemanticCorrelator,
         classifier: Classifier,
+        boundary_classifier: ContactBoundaryClassifier,
         recurrence: RecurrenceScheduler,
         triggers: TriggerWorker,
         outbox: OutboxWorker,
@@ -232,6 +235,7 @@ class AgentRuntime:
         self.revisions = revisions
         self.semantic = semantic
         self.classifier = classifier
+        self.boundary_classifier = boundary_classifier
         self.recurrence = recurrence
         self.triggers = triggers
         self.outbox = outbox
@@ -351,6 +355,7 @@ class AgentRuntime:
                         session,
                         semantic=self.semantic,
                         classifier=self.classifier,
+                        boundary_classifier=self.boundary_classifier,
                         owner_chat_id=self.owner_chat_id,
                     ).prepare(revision_id)
             except ModelUnavailable as exc:
@@ -388,6 +393,7 @@ class AgentRuntime:
                     session,
                     semantic=self.semantic,
                     classifier=self.classifier,
+                    boundary_classifier=self.boundary_classifier,
                     owner_chat_id=self.owner_chat_id,
                 ).apply_prepared(revision_id, plan)
 
@@ -577,6 +583,7 @@ def build_runtime(
         validator=independent_validator,
     )
     classifier = MessageClassifier(primary_backend)
+    boundary_classifier = ModelContactBoundaryClassifier(primary_backend)
     handler = ProductionOwnerCommandHandler(
         sessions,
         owner_chat_id=settings.owner_chat_id,
@@ -644,6 +651,7 @@ def build_runtime(
         revisions=RevisionProcessor(sessions),
         semantic=SemanticCorrelationFallback(primary_backend),
         classifier=classifier,
+        boundary_classifier=boundary_classifier,
         recurrence=recurrence,
         triggers=triggers,
         outbox=outbox,
