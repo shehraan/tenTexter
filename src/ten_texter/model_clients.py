@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Protocol
@@ -157,10 +158,20 @@ class TaskParseReview(StrictOutput):
 def task_plan_json_schema() -> dict[str, Any]:
     """llama.cpp-compatible TaskPlan schema with paired recurrence fields."""
     generated = TaskPlan.model_json_schema()
+    grounding_schema = generated.get("$defs", {}).get("TaskPlanGrounding")
+    if not isinstance(grounding_schema, dict):
+        raise ModelOutputError("TaskPlan schema is missing TaskPlanGrounding definition")
     common_properties = {
         name: schema
         for name, schema in generated["properties"].items()
         if name not in {"recurrence_rule", "timezone"}
+    }
+    # llama.cpp resolves neither Pydantic's local $defs nor the resulting $ref
+    # when the schema is nested inside response_format.schema. Inline this small
+    # definition so the production model request is accepted by the local server.
+    common_properties["grounding"] = {
+        "anyOf": [deepcopy(grounding_schema), {"type": "null"}],
+        "default": None,
     }
     required = [
         *generated["required"],

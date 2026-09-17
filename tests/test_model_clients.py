@@ -184,6 +184,16 @@ def test_task_parser_llama_schema_pairs_recurrence_and_timezone() -> None:
     }
 
 
+def test_task_parser_llama_schema_inlines_grounding_definition() -> None:
+    schema = task_plan_json_schema()
+
+    encoded = json.dumps(schema)
+    assert "$defs" not in schema
+    assert "$ref" not in encoded
+    grounding = schema["oneOf"][0]["properties"]["grounding"]
+    assert grounding["anyOf"][0]["properties"]["participant_sources"]["type"] == "array"
+
+
 def test_message_classifier_llama_schema_discriminates_semantic_shapes() -> None:
     schema = _operation_json_schema("message_classifier")
     generated = ClassificationOutput.model_json_schema()
