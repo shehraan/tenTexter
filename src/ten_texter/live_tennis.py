@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import select
@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from ten_texter.beeper import BeeperSyncService
 from ten_texter.control import PreparedOwnerCommand
+from ten_texter.domain import utc_now
 from ten_texter.enums import (
     ConversationKind,
     DestinationKind,
@@ -47,6 +48,10 @@ MAX_POLL_DELAY_SECONDS = 60.0
 
 class LiveTennisTestError(RuntimeError):
     """The guarded live tennis test could not safely complete."""
+
+    def __init__(self, message: str, *, task_instance_id: int | None = None):
+        super().__init__(message)
+        self.task_instance_id = task_instance_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,21 +359,28 @@ def run_live_tennis_test(
             "Refusing live send: initial participant outbox was not pending."
         )
     try:
-        initial_status = runtime.outbox.process(initial.id)
-    except Exception as exc:
-        raise LiveTennisTestError(
-            f"Initial participant send could not be processed: {type(exc).__name__}: {exc}"
-        ) from exc
-    if initial_status is OutboxStatus.RECONCILING:
-        initial_status = _reconcile_initial_send(
-            runtime,
-            initial.id,
-            poll_rounds=poll_rounds,
-            poll_delay_seconds=poll_delay_seconds,
-        )
+        try:
+            initial_status = runtime.outbox.process(initial.id)
+        except Exception as exc:
+            raise LiveTennisTestError(
+                f"Initial participant send could not be processed: {type(exc).__name__}: {exc}",
+                task_instance_id=task_id,
+            ) from exc
+        if initial_status is OutboxStatus.RECONCILING:
+            initial_status = _reconcile_initial_send(
+                runtime,
+                initial.id,
+                poll_rounds=poll_rounds,
+                poll_delay_seconds=poll_delay_seconds,
+            )
+    except LiveTennisTestError as exc:
+        if exc.task_instance_id is None:
+            exc.task_instance_id = task_id
+        raise
     if initial_status is not OutboxStatus.SENT:
         raise LiveTennisTestError(
-            f"Initial participant send did not reach SENT; status is {initial_status.value}."
+            f"Initial participant send did not reach SENT; status is {initial_status.value}.",
+            task_instance_id=task_id,
         )
 
     poll = _poll_live_tennis_task(
@@ -457,12 +469,17 @@ def poll_live_tennis_test(
         ]
         if (
             len(participant_outboxes) != 1
-            or participant_outboxes[0].status is not OutboxStatus.SENT
+            or participant_outboxes[0].status
+            not in {OutboxStatus.SENT, OutboxStatus.RECONCILING}
         ):
             raise LiveTennisTestError(
-                "Refusing live poll: the task does not have exactly one sent participant message."
+                "Refusing live poll: the task does not have exactly one sent or "
+                "reconciling participant message."
             )
-        _assert_no_active_revisions(session)
+        initial_outbox_needs_reconcile = (
+            participant_outboxes[0].status is OutboxStatus.RECONCILING
+        )
+        recovery_replies = _find_recoverable_target_revisions(session, target)
         known_provider_message_ids = set(
             session.scalars(
                 select(Message.provider_message_id).where(
@@ -472,6 +489,24 @@ def poll_live_tennis_test(
         )
 
     runtime = build_runtime(app)
+    if initial_outbox_needs_reconcile:
+        try:
+            initial_status = _reconcile_initial_send(
+                runtime,
+                participant_outboxes[0].id,
+                poll_rounds=poll_rounds,
+                poll_delay_seconds=poll_delay_seconds,
+            )
+        except LiveTennisTestError as exc:
+            if exc.task_instance_id is None:
+                exc.task_instance_id = task_instance_id
+            raise
+        if initial_status is not OutboxStatus.SENT:
+            raise LiveTennisTestError(
+                "Initial participant send is still RECONCILING; resume the same "
+                "task after the Beeper delivery can be resolved.",
+                task_instance_id=task_instance_id,
+            )
     poll = _poll_live_tennis_task(
         runtime,
         app.sessions,
@@ -480,6 +515,7 @@ def poll_live_tennis_test(
         owner_chat_id=settings.owner_chat_id,
         known_provider_message_ids=known_provider_message_ids,
         known_task_outbox_ids={message.id for message in task_outboxes},
+        recovery_replies=recovery_replies,
         poll_rounds=poll_rounds,
         poll_delay_seconds=poll_delay_seconds,
     )
@@ -562,6 +598,66 @@ def _assert_no_active_revisions(session: Session) -> None:
             "Refusing live test: existing inbound revisions must be drained before "
             "the targeted loop can run."
         )
+
+
+def _find_recoverable_target_revisions(
+    session: Session,
+    target: LiveTennisTarget,
+) -> tuple[tuple[str, int], ...]:
+    """Find the one persisted target reply that a resumed live poll may process."""
+    rows = list(
+        session.execute(
+            select(
+                MessageRevision.id.label("revision_id"),
+                Message.provider_message_id,
+                Message.conversation_id,
+                Message.sender_identity_id,
+                MessageRevision.processing_status,
+                MessageRevision.lease_expires_at,
+            ).join(Message, Message.id == MessageRevision.message_id)
+            .where(
+                MessageRevision.processing_status.in_(
+                    [ProcessingStatus.PENDING, ProcessingStatus.PROCESSING]
+                )
+            )
+        )
+    )
+    if not rows:
+        return ()
+
+    now = utc_now()
+    recoverable = []
+    blocked = False
+    for row in rows:
+        lease_expires_at = row.lease_expires_at
+        if lease_expires_at is not None and lease_expires_at.tzinfo is None:
+            lease_expires_at = lease_expires_at.replace(tzinfo=UTC)
+        is_recoverable = row.processing_status is ProcessingStatus.PENDING or (
+            row.processing_status is ProcessingStatus.PROCESSING
+            and lease_expires_at is not None
+            and lease_expires_at <= now
+        )
+        if is_recoverable:
+            recoverable.append(row)
+        else:
+            blocked = True
+
+    if blocked or len(recoverable) != 1:
+        raise LiveTennisTestError(
+            "Refusing live poll: existing inbound revisions are not exactly one "
+            "recoverable reply for the allowlisted target."
+        )
+
+    row = recoverable[0]
+    if (
+        row.conversation_id != target.conversation_id
+        or row.sender_identity_id != target.identity_id
+    ):
+        raise LiveTennisTestError(
+            "Refusing live poll: the recoverable inbound revision is outside the "
+            "allowlisted WhatsApp conversation."
+        )
+    return ((row.provider_message_id, row.revision_id),)
 
 
 def _next_synthetic_update_id(sessions: Any) -> int:
@@ -658,6 +754,7 @@ def _poll_live_tennis_task(
     owner_chat_id: int,
     known_provider_message_ids: set[str],
     known_task_outbox_ids: set[int],
+    recovery_replies: tuple[tuple[str, int], ...] = (),
     poll_rounds: int,
     poll_delay_seconds: float,
 ) -> LiveTennisPollReport:
@@ -671,23 +768,28 @@ def _poll_live_tennis_task(
         if round_index:
             time.sleep(poll_delay_seconds)
         rounds_checked += 1
-        try:
-            messages = runtime.beeper.list_messages(
-                target.beeper_conversation_id,
-                max_pages=1,
-                allow_truncated=True,
+        if recovery_replies:
+            new_provider_ids = [provider_id for provider_id, _ in recovery_replies]
+            new_revisions = [revision_id for _, revision_id in recovery_replies]
+            recovery_replies = ()
+        else:
+            try:
+                messages = runtime.beeper.list_messages(
+                    target.beeper_conversation_id,
+                    max_pages=1,
+                    allow_truncated=True,
+                )
+            except Exception as exc:
+                raise LiveTennisTestError(
+                    f"Target Beeper conversation could not be polled: {type(exc).__name__}: {exc}"
+                ) from exc
+            new_provider_ids, new_revisions = _ingest_new_target_messages(
+                sessions,
+                target,
+                messages,
+                known_provider_message_ids,
+                owner_chat_id=owner_chat_id,
             )
-        except Exception as exc:
-            raise LiveTennisTestError(
-                f"Target Beeper conversation could not be polled: {type(exc).__name__}: {exc}"
-            ) from exc
-        new_provider_ids, new_revisions = _ingest_new_target_messages(
-            sessions,
-            target,
-            messages,
-            known_provider_message_ids,
-            owner_chat_id=owner_chat_id,
-        )
         reply_provider_ids.extend(new_provider_ids)
         reply_revision_ids.extend(new_revisions)
         if new_revisions:

@@ -11,6 +11,7 @@ from ten_texter.control import PreparedOwnerCommand
 from ten_texter.enums import (
     ConversationKind,
     OutboxStatus,
+    ProcessingStatus,
     TaskStatus,
     Transport,
 )
@@ -28,6 +29,7 @@ from ten_texter.models import (
     Conversation,
     ConversationParticipant,
     Identity,
+    MessageRevision,
     OutboxMessage,
     Person,
     TaskInstance,
@@ -238,9 +240,18 @@ def test_live_runner_processes_only_the_allowlisted_beeper_outbox(
     class Outbox:
         def __init__(self) -> None:
             self.processed: list[int] = []
+            self.reconciled: list[int] = []
 
         def process(self, outbox_id: int) -> OutboxStatus:
             self.processed.append(outbox_id)
+            with factory.begin() as session:
+                message = session.get(OutboxMessage, outbox_id)
+                assert message is not None
+                message.status = OutboxStatus.SENT
+            return OutboxStatus.SENT
+
+        def reconcile(self, outbox_id: int) -> OutboxStatus:
+            self.reconciled.append(outbox_id)
             with factory.begin() as session:
                 message = session.get(OutboxMessage, outbox_id)
                 assert message is not None
@@ -277,6 +288,10 @@ def test_live_runner_processes_only_the_allowlisted_beeper_outbox(
             select(TaskInstance.status).where(TaskInstance.id == report.task_instance_id)
         ) is TaskStatus.ACTIVE
 
+    with factory.begin() as session:
+        initial = session.get(OutboxMessage, report.initial_outbox_id)
+        assert initial is not None
+        initial.status = OutboxStatus.RECONCILING
     resumed = poll_live_tennis_test(
         app,
         task_instance_id=report.task_instance_id,
@@ -285,6 +300,146 @@ def test_live_runner_processes_only_the_allowlisted_beeper_outbox(
     assert resumed.ok is True
     assert resumed.reply_provider_message_ids == ()
     assert outbox.processed == [report.initial_outbox_id]
+    assert outbox.reconciled == [report.initial_outbox_id]
+
+
+def test_live_poll_recovers_a_pending_allowlisted_reply(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seeded = add_allowlisted_target(db_session)
+    db_session.commit()
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    target_person = seeded["person"]
+    target_conversation = seeded["conversation"]
+
+    class Parser:
+        def parse(self, _text: str) -> object:
+            return object()
+
+    class Handler:
+        def prepare_command(self, _parsed: object, _update: object) -> PreparedOwnerCommand:
+            plan = SimpleNamespace(
+                recurrence_rule=None,
+                topic_key="tennis",
+                duration_minutes=60,
+                scheduled_at=NOW + timedelta(days=1),
+            )
+            return PreparedOwnerCommand(
+                plan=plan,
+                sends=(
+                    ParticipantSendPlan(
+                        person_id=target_person.id,  # type: ignore[union-attr]
+                        conversation_id=target_conversation.id,  # type: ignore[union-attr]
+                        final_text="Can you play tennis tomorrow at 5 PM for 60 minutes?",
+                    ),
+                ),
+            )
+
+        def apply_command(
+            self,
+            session: Session,
+            prepared: PreparedOwnerCommand,
+            _update: object,
+        ) -> None:
+            CoordinationWorkflow(session, owner_chat_id=99).start(
+                scheduled_at=prepared.plan.scheduled_at,  # type: ignore[union-attr]
+                duration_minutes=prepared.plan.duration_minutes,  # type: ignore[union-attr]
+                location=None,
+                topic_key=prepared.plan.topic_key,  # type: ignore[union-attr]
+                participant_sends=list(prepared.sends),
+            )
+
+        def prepare_decision(self, *_args: object) -> object:
+            return None
+
+        def apply_decision(self, *_args: object) -> None:
+            return None
+
+    class Beeper:
+        def list_messages(self, _chat_id: str, **_kwargs: object) -> list[dict[str, object]]:
+            return []
+
+    class Outbox:
+        def __init__(self) -> None:
+            self.processed: list[int] = []
+
+        def process(self, outbox_id: int) -> OutboxStatus:
+            self.processed.append(outbox_id)
+            with factory.begin() as session:
+                message = session.get(OutboxMessage, outbox_id)
+                assert message is not None
+                message.status = OutboxStatus.SENT
+            return OutboxStatus.SENT
+
+    outbox = Outbox()
+    runtime = SimpleNamespace(
+        control=SimpleNamespace(parser=Parser(), handler=Handler()),
+        beeper=Beeper(),
+        outbox=outbox,
+        sessions=factory,
+    )
+
+    def process_revisions() -> None:
+        with factory.begin() as session:
+            revisions = list(
+                session.scalars(
+                    select(MessageRevision).where(
+                        MessageRevision.processing_status == ProcessingStatus.PENDING
+                    )
+                )
+            )
+            assert len(revisions) == 1
+            revisions[0].processing_status = ProcessingStatus.PROCESSED
+
+    runtime._process_revisions = process_revisions
+    monkeypatch.setattr("ten_texter.live_tennis.build_runtime", lambda _app: runtime)
+    app = SimpleNamespace(
+        settings=SimpleNamespace(
+            real_transports_enabled=True,
+            owner_id=7,
+            owner_chat_id=99,
+        ),
+        sessions=factory,
+    )
+
+    report = run_live_tennis_test(app, confirm_real_send=True)
+    with factory() as session:
+        target = resolve_allowlisted_target(session)
+    provider_ids, revision_ids = _ingest_new_target_messages(
+        factory,
+        target,
+        [
+            {
+                "id": "reply-1",
+                "chatID": target.beeper_conversation_id,
+                "senderID": target.beeper_user_id,
+                "isSender": False,
+                "type": "TEXT",
+                "text": "Yes",
+                "timestamp": "2026-09-17T16:00:00Z",
+            }
+        ],
+        set(),
+        owner_chat_id=99,
+    )
+
+    assert provider_ids == ["reply-1"]
+    assert len(revision_ids) == 1
+    resumed = poll_live_tennis_test(
+        app,
+        task_instance_id=report.task_instance_id,
+        confirm_real_send=True,
+    )
+
+    assert resumed.ok is True
+    assert resumed.reply_provider_message_ids == ("reply-1",)
+    assert resumed.reply_revision_ids == tuple(revision_ids)
+    assert outbox.processed == [report.initial_outbox_id]
+    with factory() as session:
+        revision = session.get(MessageRevision, revision_ids[0])
+        assert revision is not None
+        assert revision.processing_status is ProcessingStatus.PROCESSED
 
 
 def test_live_runner_requires_explicit_real_send_confirmation() -> None:
@@ -314,3 +469,17 @@ def test_reconciling_send_is_reconciled_without_retrying() -> None:
 
     assert status is OutboxStatus.SENT
     assert calls == [41]
+
+
+def test_live_error_payload_includes_task_id_for_resume() -> None:
+    from ten_texter.cli import _live_tennis_error_payload
+
+    payload = _live_tennis_error_payload(
+        LiveTennisTestError("send is still reconciling", task_instance_id=73)
+    )
+
+    assert payload == {
+        "ok": False,
+        "error": "send is still reconciling",
+        "task_instance_id": 73,
+    }

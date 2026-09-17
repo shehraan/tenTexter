@@ -111,6 +111,14 @@ def _alembic_config(database_url: str) -> Config:
     return config
 
 
+def _live_tennis_error_payload(exc: Exception) -> dict[str, object]:
+    payload: dict[str, object] = {"ok": False, "error": str(exc)}
+    task_instance_id = getattr(exc, "task_instance_id", None)
+    if isinstance(task_instance_id, int):
+        payload["task_instance_id"] = task_instance_id
+    return payload
+
+
 def _run_agent(app: Application, *, once: bool) -> None:
     from ten_texter.runtime import build_runtime
 
@@ -195,7 +203,7 @@ def main(argv: list[str] | None = None) -> int:
                     poll_delay_seconds=args.poll_delay_seconds,
                 )
         except LiveTennisTestError as exc:
-            print(json.dumps({"ok": False, "error": str(exc)}, indent=2, sort_keys=True))
+            print(json.dumps(_live_tennis_error_payload(exc), indent=2, sort_keys=True))
             return 1
         print(json.dumps(asdict(report), indent=2, sort_keys=True))
         return 0 if report.ok else 1
