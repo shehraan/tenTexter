@@ -37,6 +37,9 @@ class ModelBackend(Protocol):
     def infer(self, *, operation: str, payload: dict[str, Any]) -> dict[str, Any]: ...
 
 
+MODEL_MAX_TOKENS = 512
+
+
 class HTTPModelBackend:
     """OpenAI-compatible adapter for a dedicated local llama.cpp server."""
 
@@ -79,6 +82,8 @@ class HTTPModelBackend:
             ],
             "temperature": 0,
             "stream": False,
+            "max_tokens": MODEL_MAX_TOKENS,
+            "chat_template_kwargs": {"enable_thinking": False},
             "response_format": {
                 "type": "json_object",
                 "schema": _operation_json_schema(operation),

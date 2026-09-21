@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -22,6 +23,9 @@ from ten_texter.models import (
     Person,
 )
 from ten_texter.outbox import DeliveryRequest, DeliveryResult
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _parse_time(value: object) -> datetime:
@@ -267,6 +271,7 @@ class BeeperDesktopAdapter:
         self.enabled = enabled
         self.client = client or httpx.Client(timeout=30)
         self.owner_chat_id = owner_chat_id
+        self._reported_blocked_scan_keys: set[str] = set()
 
     @property
     def headers(self) -> dict[str, str]:
@@ -357,11 +362,16 @@ class BeeperDesktopAdapter:
             raise RuntimeError("Beeper newest cursor is malformed")
         if oldest is not None and (not isinstance(oldest, str) or not oldest):
             raise RuntimeError("Beeper oldest cursor is malformed")
-        if require_cursors and (newest is None or oldest is None):
-            raise RuntimeError("Beeper synchronized page is missing required cursors")
         if "hasMore" not in payload or not isinstance(payload["hasMore"], bool):
             raise RuntimeError("Beeper page hasMore flag is missing or malformed")
         has_more = payload["hasMore"]
+        # Beeper omits cursors for an empty terminal page. There is no
+        # continuation to persist in that case, so retain the last committed
+        # checkpoint. Any page with data, or any page that claims to have a
+        # continuation, still requires both cursors so synchronization fails
+        # closed rather than guessing progress.
+        if require_cursors and (raw_items or has_more) and (newest is None or oldest is None):
+            raise RuntimeError("Beeper synchronized page is missing required cursors")
         continuation = newest if direction == "after" else oldest
         if has_more and continuation is None:
             raise RuntimeError("Beeper pagination indicated more data without a cursor")
@@ -574,12 +584,24 @@ class BeeperDesktopAdapter:
                 cutoff = _aware(
                     checkpoint.reconciliation_cutoff_at or timestamp - self.SYNC_WINDOW
                 )
-        page = self._get_page(
-            f"{self.base_url}/v1/chats/{quote(provider_id, safe='')}/messages",
-            cursor=cursor,
-            direction="before" if cursor is not None else None,
-            require_cursors=True,
-        )
+        try:
+            page = self._get_page(
+                f"{self.base_url}/v1/chats/{quote(provider_id, safe='')}/messages",
+                cursor=cursor,
+                direction="before" if cursor is not None else None,
+                require_cursors=True,
+            )
+        except RuntimeError as exc:
+            if str(exc) != "Beeper synchronized page is missing required cursors":
+                raise
+            if snapshot.checkpoint_key not in self._reported_blocked_scan_keys:
+                LOGGER.warning(
+                    "Beeper conversation scan is blocked by missing cursors; "
+                    "retaining checkpoint %s",
+                    snapshot.checkpoint_key,
+                )
+                self._reported_blocked_scan_keys.add(snapshot.checkpoint_key)
+            return []
         revision_ids: list[int] = []
         with self.sessions.begin() as session:
             current = session.get(BeeperSyncCheckpoint, snapshot.checkpoint_key)

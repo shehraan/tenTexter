@@ -1057,6 +1057,45 @@ def test_failed_message_page_does_not_advance_chat_checkpoint(
         assert session.scalar(select(func.count(Conversation.id))) == 0
 
 
+def test_malformed_conversation_scan_retains_checkpoint_without_blocking_poll(
+    db_session: Session,
+) -> None:
+    chat_id = "!blocked-conversation:beeper"
+    conversation = BeeperSyncService(db_session).sync_chat(chat_payload(chat_id=chat_id))
+    checkpoint = BeeperSyncCheckpoint(
+        checkpoint_key="conversation:1",
+        scope="CONVERSATION",
+        conversation_id=conversation.id,
+        backfill_cursor="message-tail",
+        bootstrap_cutoff_at=SYNC_NOW,
+        bootstrap_complete=False,
+        created_at=SYNC_NOW,
+        updated_at=SYNC_NOW,
+    )
+    db_session.add(checkpoint)
+    db_session.flush()
+    db_session.commit()
+    client = ScriptedPollClient(
+        [
+            (
+                "/v1/chats/%21blocked-conversation%3Abeeper/messages",
+                {"cursor": "message-tail", "direction": "before"},
+                {"items": [], "hasMore": True},
+            )
+        ]
+    )
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    adapter = BeeperDesktopAdapter(
+        factory, access_token="fake", enabled=True, client=client  # type: ignore[arg-type]
+    )
+
+    assert adapter._advance_conversation_scan(SYNC_NOW, excluded_keys=frozenset()) == []
+    assert client.calls == []
+    assert checkpoint.bootstrap_complete is False
+    assert checkpoint.backfill_cursor == "message-tail"
+    assert checkpoint.updated_at == SYNC_NOW
+
+
 def test_ingestion_failure_rolls_back_messages_and_checkpoint_progress(
     db_session: Session,
 ) -> None:
@@ -1169,7 +1208,7 @@ def test_missing_beeper_provider_timestamp_never_becomes_ordering_metadata(
     assert message.created_at.replace(tzinfo=UTC) == NOW
 
 
-def test_malformed_incremental_page_retains_last_committed_checkpoint(
+def test_empty_terminal_incremental_page_retains_last_committed_checkpoint(
     db_session: Session,
 ) -> None:
     chat_id = "!retain-checkpoint:beeper"
@@ -1186,6 +1225,11 @@ def test_malformed_incremental_page_retains_last_committed_checkpoint(
                 {"cursor": "chat-head", "direction": "after"},
                 {"items": [], "hasMore": False},
             ),
+            (
+                "/v1/chats/%21retain-checkpoint%3Abeeper/messages",
+                {},
+                {"items": [], "hasMore": False},
+            ),
         ]
     )
     factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
@@ -1193,13 +1237,12 @@ def test_malformed_incremental_page_retains_last_committed_checkpoint(
         factory, access_token="fake", enabled=True, client=client  # type: ignore[arg-type]
     )
     adapter.poll_inbound(now=SYNC_NOW)
-    with pytest.raises(RuntimeError, match="missing required cursors"):
-        adapter.poll_inbound(now=SYNC_NOW + timedelta(seconds=2))
+    adapter.poll_inbound(now=SYNC_NOW + timedelta(seconds=2))
     with factory() as session:
         checkpoint = session.get(BeeperSyncCheckpoint, "chat-feed")
         assert checkpoint is not None
         assert checkpoint.newest_cursor == "chat-head"
-        assert checkpoint.updated_at == SYNC_NOW.replace(tzinfo=None)
+        assert checkpoint.updated_at == (SYNC_NOW + timedelta(seconds=2)).replace(tzinfo=None)
 
 
 def test_initial_sync_stops_at_thirty_day_cutoff(db_session: Session) -> None:

@@ -70,6 +70,8 @@ def test_http_backend_uses_llama_chat_completions_with_schema() -> None:
     assert isinstance(body, dict)
     assert body["stream"] is False
     assert body["temperature"] == 0
+    assert body["max_tokens"] == 512
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}
     assert body["messages"][0]["role"] == "system"
     assert json.loads(body["messages"][1]["content"])["operation"] == "message_generator"
     assert body["response_format"]["type"] == "json_object"
