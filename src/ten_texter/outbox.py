@@ -70,6 +70,10 @@ class DeliveryResult:
     error: str | None = None
 
 
+def _aware(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
 class TransportAdapter(Protocol):
     def send(self, request: DeliveryRequest) -> DeliveryResult: ...
 
@@ -400,7 +404,7 @@ class OutboxWorker:
             )
             assert attempt is not None
             provider_message_id = attempt.provider_message_id
-            attempt_started_at = attempt.started_at.astimezone(UTC)
+            attempt_started_at = _aware(attempt.started_at)
             detail = read_session.get(BeeperDeliveryAttemptDetail, attempt.id)
             pending_id = detail.pending_provider_id if detail else None
         adapter = self.adapters.get(request.transport)

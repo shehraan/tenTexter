@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import (
@@ -29,7 +29,7 @@ def enum_type(enum_cls: type[StrEnum], name: str) -> SAEnum:
 
 
 def now() -> datetime:
-    return datetime.now().astimezone()
+    return datetime.now(UTC)
 
 
 class ArchivedMixin:

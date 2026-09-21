@@ -237,6 +237,32 @@ class EventuallySuccessfulClient(SlowPendingClient):
         return super().get(url)
 
 
+class TimestampSearchClient(SlowPendingClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.search_timestamp: str | None = None
+
+    def get(self, url: str, **_: object) -> Response:
+        if url.endswith("pending%3A1"):
+            self.gets.append(url)
+            return Response({"error": "pending message is no longer available"}, success=False, status_code=404)
+        assert self.search_timestamp is not None
+        self.gets.append(url)
+        return Response(
+            {
+                "items": [
+                    {
+                        "id": "search:1",
+                        "chatID": "conv:alex",
+                        "text": "Are you available?",
+                        "isSender": True,
+                        "timestamp": self.search_timestamp,
+                    }
+                ]
+            }
+        )
+
+
 class AuthorizationFailureClient(Client):
     def post(self, url: str, **_: object) -> Response:
         self.posts.append(url)
@@ -310,7 +336,7 @@ def attempt_started_at(factory: sessionmaker[Session], outbox_id: int):
         )
         assert attempt is not None
         value = attempt.started_at
-        return value.astimezone(UTC)
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 def create_beeper_send(db_session: Session, *, key: str) -> OutboxMessage:
@@ -450,6 +476,35 @@ def test_pending_send_reconciles_to_final_id_during_grace(db_session: Session) -
             )
         ) == 0
     assert len(client.posts) == 1
+
+
+def test_pending_send_reconciles_timestamp_match_from_utc_sqlite_value(
+    db_session: Session,
+) -> None:
+    message = create_beeper_send(db_session, key="beeper-pending-timestamp-match")
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    client = TimestampSearchClient()
+    worker = pending_worker(factory, client)
+
+    assert worker.process(message.id) is OutboxStatus.RECONCILING
+    with factory() as session:
+        attempt = session.scalar(
+            select(OutboxDeliveryAttempt)
+            .where(OutboxDeliveryAttempt.outbox_message_id == message.id)
+            .order_by(OutboxDeliveryAttempt.id.desc())
+        )
+        assert attempt is not None
+        client.search_timestamp = f"{attempt.started_at.isoformat()}Z"
+
+    assert worker.reconcile(message.id) is OutboxStatus.SENT
+    with factory() as session:
+        attempt = session.scalar(
+            select(OutboxDeliveryAttempt)
+            .where(OutboxDeliveryAttempt.outbox_message_id == message.id)
+            .order_by(OutboxDeliveryAttempt.id.desc())
+        )
+        assert attempt is not None
+        assert attempt.provider_message_id == "search:1"
 
 
 def test_pending_send_unresolved_after_grace_creates_exactly_one_decision(
@@ -1030,6 +1085,84 @@ def test_message_page_two_resumes_from_durable_checkpoint_after_restart(
         )
         assert checkpoint is not None and checkpoint.bootstrap_complete
         assert checkpoint.newest_cursor == "message-head"
+
+
+def test_incomplete_conversation_bootstrap_uses_backfill_cursor_when_chat_feed_touches_it(
+    db_session: Session,
+) -> None:
+    chat_id = "!incomplete-bootstrap:beeper"
+    client = ScriptedPollClient(
+        [
+            (
+                "/v1/chats",
+                {},
+                _page(
+                    [_sync_chat(chat_id)],
+                    newest="chat-head",
+                    oldest="chat-page-2",
+                    more=True,
+                ),
+            ),
+            (
+                "/v1/chats/%21incomplete-bootstrap%3Abeeper/messages",
+                {},
+                _page(
+                    [_sync_message("bootstrap-recent", chat_id)],
+                    newest="message-head-1",
+                    oldest="message-tail-1",
+                    more=True,
+                ),
+            ),
+            (
+                "/v1/chats",
+                {"cursor": "chat-page-2", "direction": "before"},
+                _page(
+                    [_sync_chat(chat_id)],
+                    newest="chat-page-2",
+                    oldest="chat-tail",
+                ),
+            ),
+            (
+                "/v1/chats/%21incomplete-bootstrap%3Abeeper/messages",
+                {"cursor": "message-tail-1", "direction": "before"},
+                _page(
+                    [
+                        _sync_message(
+                            "bootstrap-older",
+                            chat_id,
+                            timestamp="2026-09-13T15:00:00Z",
+                            sort_key="00000099",
+                        )
+                    ],
+                    newest="message-tail-1",
+                    oldest="message-tail-2",
+                ),
+            ),
+        ]
+    )
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    adapter = BeeperDesktopAdapter(
+        factory,
+        access_token="fake-token",
+        enabled=True,
+        client=client,  # type: ignore[arg-type]
+    )
+
+    first = adapter.poll_inbound(now=SYNC_NOW)
+    second = adapter.poll_inbound(now=SYNC_NOW + timedelta(seconds=2))
+
+    assert len(first) == 1
+    assert len(second) == 1
+    with factory() as session:
+        checkpoint = session.scalar(
+            select(BeeperSyncCheckpoint).where(
+                BeeperSyncCheckpoint.scope == "CONVERSATION"
+            )
+        )
+        assert checkpoint is not None
+        assert checkpoint.bootstrap_complete is True
+        assert checkpoint.backfill_cursor is None
+        assert session.scalar(select(func.count(Message.id))) == 2
 
 
 def test_failed_message_page_does_not_advance_chat_checkpoint(

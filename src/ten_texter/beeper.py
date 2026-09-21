@@ -271,7 +271,7 @@ class BeeperDesktopAdapter:
         self.enabled = enabled
         self.client = client or httpx.Client(timeout=30)
         self.owner_chat_id = owner_chat_id
-        self._reported_blocked_scan_keys: set[str] = set()
+        self._blocked_scan_keys: set[str] = set()
 
     @property
     def headers(self) -> dict[str, str]:
@@ -424,7 +424,14 @@ class BeeperDesktopAdapter:
             if not bootstrap or self._at_or_after(chat.get("lastActivity"), cutoff)
         )
         message_requests: list[
-            tuple[dict[str, Any], str, str | None, _CheckpointSnapshot | None, bool]
+            tuple[
+                dict[str, Any],
+                str,
+                str | None,
+                str | None,
+                _CheckpointSnapshot | None,
+                bool,
+            ]
         ] = []
         seen_provider_ids: set[str] = set()
         with self.sessions() as session:
@@ -449,31 +456,48 @@ class BeeperDesktopAdapter:
                     else None
                 )
                 message_snapshot = self._snapshot(message_checkpoint)
-                message_cursor = (
-                    message_checkpoint.newest_cursor
-                    if message_checkpoint is not None
-                    else None
-                )
+                if message_checkpoint is None:
+                    message_cursor = None
+                    message_direction = None
+                    message_bootstrap = True
+                elif not message_checkpoint.bootstrap_complete:
+                    message_cursor = message_checkpoint.backfill_cursor
+                    message_direction = "before" if message_cursor is not None else None
+                    message_bootstrap = True
+                else:
+                    message_cursor = message_checkpoint.newest_cursor
+                    message_direction = "after" if message_cursor is not None else None
+                    message_bootstrap = False
                 message_requests.append(
                     (
                         chat,
                         provider_id,
                         message_cursor,
+                        message_direction,
                         message_snapshot,
-                        message_checkpoint is None,
+                        message_bootstrap,
                     )
                 )
         fetched_messages: list[
             tuple[dict[str, Any], BeeperPage, _CheckpointSnapshot | None, bool]
         ] = []
-        for chat, provider_id, message_cursor, message_snapshot, is_new in message_requests:
+        for (
+            chat,
+            provider_id,
+            message_cursor,
+            message_direction,
+            message_snapshot,
+            message_bootstrap,
+        ) in message_requests:
             message_page = self._get_page(
                 f"{self.base_url}/v1/chats/{quote(provider_id, safe='')}/messages",
                 cursor=message_cursor,
-                direction="after" if message_cursor is not None else None,
+                direction=message_direction,
                 require_cursors=True,
             )
-            fetched_messages.append((chat, message_page, message_snapshot, is_new))
+            fetched_messages.append(
+                (chat, message_page, message_snapshot, message_bootstrap)
+            )
 
         revision_ids: list[int] = []
         touched_keys: set[str] = set()
@@ -481,7 +505,7 @@ class BeeperDesktopAdapter:
             current_feed = session.get(BeeperSyncCheckpoint, self.CHAT_FEED_KEY)
             self._require_snapshot(current_feed, snapshot)
             sync = BeeperSyncService(session, owner_chat_id=self.owner_chat_id)
-            for chat, message_page, message_snapshot, new_checkpoint in fetched_messages:
+            for chat, message_page, message_snapshot, message_bootstrap in fetched_messages:
                 conversation = sync.sync_chat(chat)
                 key = self._conversation_checkpoint_key(conversation.id)
                 touched_keys.add(key)
@@ -491,7 +515,7 @@ class BeeperDesktopAdapter:
                 messages = (
                     item
                     for item in message_page.items
-                    if not new_checkpoint
+                    if not message_bootstrap
                     or self._at_or_after(
                         item.get("editedTimestamp") or item.get("timestamp"),
                         message_cutoff,
@@ -507,7 +531,7 @@ class BeeperDesktopAdapter:
                     page=message_page,
                     cutoff=message_cutoff,
                     timestamp=timestamp,
-                    bootstrap=new_checkpoint,
+                    bootstrap=message_bootstrap,
                     provider_activity_at=self._optional_time(chat.get("lastActivity")),
                 )
             self._advance_feed_checkpoint(
@@ -526,9 +550,10 @@ class BeeperDesktopAdapter:
         *,
         excluded_keys: frozenset[str],
     ) -> list[int]:
+        excluded_scan_keys = excluded_keys | self._blocked_scan_keys
         not_touched = (
-            BeeperSyncCheckpoint.checkpoint_key.not_in(excluded_keys)
-            if excluded_keys
+            BeeperSyncCheckpoint.checkpoint_key.not_in(excluded_scan_keys)
+            if excluded_scan_keys
             else True
         )
         with self.sessions() as session:
@@ -594,13 +619,13 @@ class BeeperDesktopAdapter:
         except RuntimeError as exc:
             if str(exc) != "Beeper synchronized page is missing required cursors":
                 raise
-            if snapshot.checkpoint_key not in self._reported_blocked_scan_keys:
+            if snapshot.checkpoint_key not in self._blocked_scan_keys:
                 LOGGER.warning(
                     "Beeper conversation scan is blocked by missing cursors; "
                     "retaining checkpoint %s",
                     snapshot.checkpoint_key,
                 )
-                self._reported_blocked_scan_keys.add(snapshot.checkpoint_key)
+                self._blocked_scan_keys.add(snapshot.checkpoint_key)
             return []
         revision_ids: list[int] = []
         with self.sessions.begin() as session:
@@ -923,5 +948,4 @@ class BeeperDesktopAdapter:
             )
             if attempt is None:
                 return utc_now()
-            value = attempt.started_at
-            return value.astimezone(UTC)
+            return _aware(attempt.started_at)
