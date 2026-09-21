@@ -191,7 +191,15 @@ class TelegramControlGateway:
         prepared: object | None = None
         if decision_id is None:
             if not isinstance(text, str) or not text.strip():
-                raise DomainError("owner update has no supported instruction")
+                with self.sessions.begin() as session:
+                    update = session.get(TelegramUpdate, row_id)
+                    if update is None:
+                        raise DomainError("Telegram update not found")
+                    if update.status is not TelegramUpdateStatus.PENDING:
+                        return update.status
+                    update.status = TelegramUpdateStatus.FAILED
+                    update.error_details = "owner update has no supported instruction"
+                    return update.status
             parsed = self.parser.parse(text)
             prepare = getattr(self.handler, "prepare_command", None)
             prepared = prepare(parsed, update) if prepare is not None else parsed

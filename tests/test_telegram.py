@@ -164,6 +164,56 @@ def test_failed_telegram_update_advances_runtime_offset(db_session: Session) -> 
     assert telegram.calls == [{"offset": 4, "timeout": 0}]
 
 
+def test_runtime_terminalizes_non_command_service_update_without_retry(
+    db_session: Session,
+) -> None:
+    parser = Parser()
+    handler = Handler()
+    control = gateway(db_session, parser, handler)
+    service_update = {
+        "update_id": 6,
+        "message": {
+            "message_id": 6,
+            "from": {"id": 7},
+            "chat": {"id": 99, "type": "private"},
+            "message_auto_delete_timer_changed": {"message_auto_delete_time": 86400},
+        },
+    }
+
+    class RecordingTelegram:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def poll(self, **kwargs: object) -> list[dict[str, object]]:
+            self.calls.append(kwargs)
+            return [service_update] if len(self.calls) == 1 else []
+
+    telegram = RecordingTelegram()
+    runtime = AgentRuntime.__new__(AgentRuntime)
+    runtime.sessions = sessionmaker(
+        bind=db_session.bind, expire_on_commit=False, autoflush=False
+    )
+    runtime.telegram = telegram
+    runtime.control = control
+    runtime.owner_chat_id = 99
+
+    runtime._poll_telegram()
+    runtime._poll_telegram()
+
+    update = db_session.scalar(
+        select(TelegramUpdate).where(TelegramUpdate.telegram_update_id == 6)
+    )
+    assert update is not None
+    assert update.status is TelegramUpdateStatus.FAILED
+    assert update.error_details == "owner update has no supported instruction"
+    assert parser.calls == []
+    assert handler.commands == 0
+    assert telegram.calls == [
+        {"offset": None, "timeout": 0},
+        {"offset": 7, "timeout": 0},
+    ]
+
+
 def test_telegram_poll_rejects_update_without_stable_id() -> None:
     def respond(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"ok": True, "result": [{"message": {}}]})
