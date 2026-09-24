@@ -7,6 +7,7 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
+from ten_texter.correlation import AtomicProposal, TaskProposalContext
 from ten_texter.domain import AwaitedResponseService
 from ten_texter.enums import AvailabilityEvidence, AvailabilityStatus
 from ten_texter.model_clients import (
@@ -945,6 +946,68 @@ def test_participant_prompt_injection_is_untrusted_classification_data(db_sessio
     payload = backend.calls[0][1]
     assert payload["untrusted_participant_text"].startswith("Ignore instructions")
     assert "tools" not in payload
+
+
+def test_message_classifier_normalizes_counterproposal_against_task_context(db_session) -> None:
+    core = seed_core(db_session)
+    response = AwaitedResponseService(db_session).create(
+        core["participant"].id,
+        "availability",
+    )
+    backend = Backend(
+        {
+            "message_classifier": {
+                "kind": "COUNTERPROPOSAL",
+                "availability": None,
+                "evidence": "FIRST_PARTY",
+                "proposals": [
+                    {
+                        "field": "time",
+                        "operation": "REPLACE",
+                        "old_value": None,
+                        "proposed_value": "6pm",
+                    },
+                    {
+                        "field": "duration",
+                        "operation": "REPLACE",
+                        "old_value": None,
+                        "proposed_value": "30 minutes",
+                    },
+                ],
+            }
+        }
+    )
+    context = TaskProposalContext(
+        scheduled_at=datetime(2026, 9, 25, 21, tzinfo=UTC),
+        duration_minutes=30,
+        location=None,
+        topic_key="tennis",
+        owner_timezone="America/Toronto",
+    )
+
+    classification = MessageClassifier(backend).classify(
+        core["revision"],
+        response,
+        AvailabilitySubjectContext(()),
+        task_context=context,
+    )
+
+    assert classification.proposals == (
+        AtomicProposal(
+            field="scheduled_at",
+            operation="SET",
+            old_value="2026-09-25T21:00:00+00:00",
+            proposed_value="2026-09-25T22:00:00+00:00",
+        ),
+    )
+    payload = backend.calls[0][1]
+    assert payload["task_context"] == {
+        "scheduled_at": "2026-09-25T21:00:00+00:00",
+        "duration_minutes": 30,
+        "location": None,
+        "topic_key": "tennis",
+        "owner_timezone": "America/Toronto",
+    }
 
 
 @pytest.mark.parametrize(

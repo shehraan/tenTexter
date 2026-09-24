@@ -13,6 +13,7 @@ from ten_texter.correlation import (
     Classifier,
     CorrelationOrchestrator,
     PreparedCorrelation,
+    TaskProposalContext,
     third_party_subject_context,
 )
 from ten_texter.decision_prompts import owner_command_review_prompt
@@ -122,12 +123,14 @@ class ProductionOwnerCommandHandler:
         resolver: EntityResolverAssistant,
         generation: ValidatedGenerationPipeline,
         classifier: Classifier | None = None,
+        owner_timezone: str = "UTC",
     ):
         self.sessions = sessions
         self.owner_chat_id = owner_chat_id
         self.resolver = resolver
         self.generation = generation
         self.classifier = classifier
+        self.owner_timezone = owner_timezone
 
     def prepare_decision(
         self, decision_id: int, payload: dict[str, Any], _update: TelegramUpdate
@@ -219,6 +222,14 @@ class ProductionOwnerCommandHandler:
                     return PreparedOwnerDecision("stale", selected_id)
                 if self.classifier is None:
                     raise DomainError("correlation decision classifier is unavailable")
+                participant = session.get(TaskParticipant, awaited.task_participant_id)
+                task = (
+                    session.get(TaskInstance, participant.task_instance_id)
+                    if participant is not None
+                    else None
+                )
+                if task is None:
+                    raise DomainError("correlation decision task is unavailable")
                 return PreparedOwnerDecision(
                     "select",
                     selected_id,
@@ -226,6 +237,13 @@ class ProductionOwnerCommandHandler:
                         revision,
                         awaited,
                         third_party_subject_context(session, revision, awaited),
+                        TaskProposalContext(
+                            scheduled_at=task.scheduled_at,
+                            duration_minutes=task.duration_minutes,
+                            location=task.location,
+                            topic_key=task.topic_key,
+                            owner_timezone=self.owner_timezone,
+                        ),
                     ),
                 )
         return PreparedOwnerDecision(action, selected_id)
@@ -659,6 +677,7 @@ class ProductionOwnerCommandHandler:
                     semantic=_UnusedSemantic(),
                     classifier=self.classifier,  # type: ignore[arg-type]
                     owner_chat_id=self.owner_chat_id,
+                    owner_timezone=self.owner_timezone,
                 ).apply_prepared(
                     revision.id,
                     PreparedCorrelation(
@@ -803,6 +822,8 @@ class ProductionOwnerCommandHandler:
                     "conversation_title": conversation.title,
                     "beeper_conversation_id": conversation.beeper_conversation_id,
                     "network": conversation.network,
+                    "conversation_kind": conversation.kind.value,
+                    "counterparty_person_id": conversation.counterparty_person_id,
                 }
             )
         return candidates
@@ -830,7 +851,38 @@ class ProductionOwnerCommandHandler:
                 for key in keys
             )
         ]
-        if len(exact) == 1:
+        person_keys = (
+            "person_name",
+            "identity_username",
+            "identity_display_name",
+            "beeper_user_id",
+        )
+        person_exact = [
+            candidate
+            for candidate in candidates
+            if any(
+                isinstance(candidate.get(key), str)
+                and str(candidate[key]).strip().casefold() == needle
+                for key in person_keys
+            )
+        ]
+        direct_person_exact = [
+            candidate
+            for candidate in person_exact
+            if str(candidate.get("conversation_kind") or "").casefold() == "direct"
+            and (
+                candidate.get("counterparty_person_id") is None
+                or candidate.get("counterparty_person_id") == candidate.get("person_id")
+            )
+        ]
+        if len(direct_person_exact) == 1:
+            chosen = direct_person_exact[0]
+        elif person_exact:
+            # A bare person reference must never fall back to a group route. If
+            # there is no unique direct chat, keep the command reviewable instead
+            # of guessing which conversation the owner meant.
+            return None
+        elif len(exact) == 1:
             chosen = exact[0]
         else:
             pool = exact or self._lexical_route_candidates(reference, candidates)

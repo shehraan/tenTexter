@@ -19,6 +19,8 @@ def candidate(
     username: str | None = None,
     conversation_title: str | None = None,
     network: str = "Discord",
+    conversation_kind: str = "DIRECT",
+    counterparty_person_id: int | None = None,
 ) -> dict[str, object]:
     return {
         "id": candidate_id,
@@ -32,6 +34,8 @@ def candidate(
         "conversation_title": conversation_title or f"Chat {candidate_id}",
         "beeper_conversation_id": f"!chat_{candidate_id}:beeper",
         "network": network,
+        "conversation_kind": conversation_kind,
+        "counterparty_person_id": counterparty_person_id,
     }
 
 
@@ -76,6 +80,58 @@ def test_exact_unique_route_bypasses_semantic_resolver() -> None:
     )
 
     assert route is not None and route.person_id == 1
+    assert resolver.calls == []
+
+
+def test_bare_person_name_prefers_unique_direct_route_over_group_membership() -> None:
+    resolver = RecordingResolver()
+    route = handler(resolver)._resolve_route(
+        "Shehraan Canada",
+        [
+            candidate(
+                1,
+                person_id=7,
+                person_name="Shehraan Canada",
+                conversation_title="Loving 4",
+                network="WhatsApp",
+                conversation_kind="GROUP",
+            ),
+            candidate(
+                2,
+                person_id=7,
+                person_name="Shehraan Canada",
+                conversation_title="Shehraan Canada",
+                network="WhatsApp",
+                conversation_kind="DIRECT",
+                counterparty_person_id=7,
+            ),
+        ],
+    )
+
+    assert route is not None
+    assert route.person_id == 7
+    assert route.conversation_id == 10_002
+    assert resolver.calls == []
+
+
+def test_bare_person_name_does_not_route_to_group_when_no_direct_chat_exists() -> None:
+    resolver = RecordingResolver()
+
+    route = handler(resolver)._resolve_route(
+        "Shehraan Canada",
+        [
+            candidate(
+                1,
+                person_id=7,
+                person_name="Shehraan Canada",
+                conversation_title="Loving 4",
+                network="WhatsApp",
+                conversation_kind="GROUP",
+            )
+        ],
+    )
+
+    assert route is None
     assert resolver.calls == []
 
 

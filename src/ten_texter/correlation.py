@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
-from datetime import UTC
+from datetime import UTC, datetime
 from typing import Protocol
 
 from sqlalchemy import select
@@ -16,6 +17,7 @@ from ten_texter.domain import (
     AvailabilityService,
     DecisionService,
     DomainError,
+    ProposalService,
     StaleWork,
     utc_now,
 )
@@ -67,6 +69,15 @@ class AtomicProposal:
     operation: str
     old_value: object
     proposed_value: object
+
+
+@dataclass(frozen=True, slots=True)
+class TaskProposalContext:
+    scheduled_at: datetime
+    duration_minutes: int
+    location: str | None
+    topic_key: str
+    owner_timezone: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +141,7 @@ class Classifier(Protocol):
         revision: MessageRevision,
         awaited_response: AwaitedResponse,
         third_party_subject_context: AvailabilitySubjectContext,
+        task_context: TaskProposalContext | None = None,
     ) -> Classification: ...
 
 
@@ -204,12 +216,14 @@ class CorrelationOrchestrator:
         classifier: Classifier,
         boundary_classifier: ContactBoundaryClassifier | None = None,
         owner_chat_id: int | None = None,
+        owner_timezone: str = "UTC",
     ):
         self.session = session
         self.semantic = semantic
         self.classifier = classifier
         self.boundary_classifier = boundary_classifier or NoContactBoundaryClassifier()
         self.owner_chat_id = owner_chat_id
+        self.owner_timezone = owner_timezone
 
     def prepare(self, revision_id: int) -> PreparedCorrelation:
         """Run correlation/classification reads and model calls without a write transaction."""
@@ -352,6 +366,12 @@ class CorrelationOrchestrator:
         awaited: AwaitedResponse,
         source: str,
     ) -> PreparedCorrelation:
+        participant = self.session.get(TaskParticipant, awaited.task_participant_id)
+        if participant is None:
+            raise DomainError("awaited response participant not found")
+        task = self.session.get(TaskInstance, participant.task_instance_id)
+        if task is None:
+            raise DomainError("awaited response task not found")
         return PreparedCorrelation(
             outcome="KNOWN",
             awaited_response_id=awaited.id,
@@ -360,6 +380,7 @@ class CorrelationOrchestrator:
                 revision,
                 awaited,
                 third_party_subject_context(self.session, revision, awaited),
+                self._task_proposal_context(task),
             ),
         )
 
@@ -372,6 +393,18 @@ class CorrelationOrchestrator:
             outcome=decision_type,
             candidate_ids=tuple(candidate.id for candidate in candidates),
             decision_type=decision_type,
+        )
+
+    def _task_proposal_context(self, task: TaskInstance) -> TaskProposalContext:
+        scheduled_at = task.scheduled_at
+        if scheduled_at.tzinfo is None:
+            scheduled_at = scheduled_at.replace(tzinfo=UTC)
+        return TaskProposalContext(
+            scheduled_at=scheduled_at,
+            duration_minutes=task.duration_minutes,
+            location=task.location,
+            topic_key=task.topic_key,
+            owner_timezone=self.owner_timezone,
         )
 
     def process(self, revision_id: int) -> CorrelationResult:
@@ -568,6 +601,7 @@ class CorrelationOrchestrator:
             revision,
             awaited,
             third_party_subject_context(self.session, revision, awaited),
+            self._task_proposal_context(task),
         )
         availability_target: TaskParticipant | None = None
         if classification.kind == "AVAILABILITY" and classification.availability is not None:
@@ -602,6 +636,11 @@ class CorrelationOrchestrator:
             classification,
             availability_target,
             prior_revision_ids,
+        )
+        proposals_to_create = tuple(
+            proposal
+            for proposal in proposals_to_create
+            if not self._is_noop_proposal(task, proposal)
         )
         if classification.kind == "AMBIGUOUS":
             if may_replace_awaited_status:
@@ -689,6 +728,49 @@ class CorrelationOrchestrator:
             return CorrelationResult("INTERPRETATION_AMBIGUOUS", awaited.id)
         self.session.flush()
         return CorrelationResult("CORRELATED", awaited.id)
+
+    @staticmethod
+    def _is_noop_proposal(task: TaskInstance, proposal: AtomicProposal) -> bool:
+        """Do not create an owner decision for a value that is already current."""
+        if proposal.operation not in {"SET", "REPLACE"}:
+            return False
+
+        if proposal.field in {"duration", "duration_minutes"}:
+            def duration_value(value: object) -> int | None:
+                if type(value) is int:
+                    return value
+                if not isinstance(value, str):
+                    return None
+                match = re.fullmatch(
+                    r"\s*(\d+)\s*(?:minutes?|mins?|m)?\s*",
+                    value,
+                    flags=re.IGNORECASE,
+                )
+                return int(match.group(1)) if match is not None else None
+
+            proposed_value = duration_value(proposal.proposed_value)
+            old_value = duration_value(proposal.old_value)
+            return (
+                proposed_value == task.duration_minutes
+                and (old_value is None or old_value == task.duration_minutes)
+            )
+        if proposal.field == "location":
+            return proposal.old_value == task.location and proposal.proposed_value == task.location
+        if proposal.field == "scheduled_at":
+            if not isinstance(proposal.old_value, str) or not isinstance(
+                proposal.proposed_value, str
+            ):
+                return False
+            current = task.scheduled_at
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=UTC)
+            try:
+                old_value = ProposalService._parse_scheduled_at(proposal.old_value)
+                proposed_value = ProposalService._parse_scheduled_at(proposal.proposed_value)
+            except (DomainError, TypeError, ValueError):
+                return False
+            return old_value == current and proposed_value == current
+        return False
 
     def _awaited_response_effect_ownership(
         self,

@@ -722,6 +722,45 @@ def test_counterproposal_edit_to_third_party_reopens_sender_response(
     assert kyran.availability_status is AvailabilityStatus.AVAILABLE
 
 
+def test_counterproposal_drops_a_noop_change_before_creating_owner_decision(
+    db_session: Session,
+) -> None:
+    core = seed_core(db_session)
+    task = core["task"]
+    task.duration_minutes = 30
+    db_session.flush()
+    awaited(db_session, core)
+    current_start = NOW + timedelta(days=1)
+    proposed_start = current_start + timedelta(hours=1)
+
+    result = orchestrator(
+        db_session,
+        Classification(
+            kind="COUNTERPROPOSAL",
+            proposals=(
+                AtomicProposal(
+                    field="duration",
+                    operation="REPLACE",
+                    old_value=None,
+                    proposed_value="30 minutes",
+                ),
+                AtomicProposal(
+                    field="scheduled_at",
+                    operation="SET",
+                    old_value=current_start.isoformat(),
+                    proposed_value=proposed_start.isoformat(),
+                ),
+            ),
+        ),
+    ).process(core["revision"].id)
+
+    assert result.outcome == "CORRELATED"
+    proposals = list(db_session.scalars(select(Proposal).order_by(Proposal.id)))
+    assert [(proposal.field, proposal.proposed_value) for proposal in proposals] == [
+        ("scheduled_at", proposed_start.isoformat())
+    ]
+
+
 @pytest.mark.parametrize("edited_kind", ["AMBIGUOUS", "OTHER"])
 def test_older_message_edit_does_not_override_independent_satisfied_response(
     db_session: Session,
@@ -1004,6 +1043,57 @@ def test_ambiguous_message_owner_selection_continues_semantic_processing(db_sess
         assert session.get(type(core["participant"]), core["participant"].id).availability_status is AvailabilityStatus.AVAILABLE
         decision = session.get(DecisionRequest, result.decision_request_id)
         assert decision.status.value == "CLOSED"
+
+
+def test_owner_correlation_selection_classifies_with_task_proposal_context(
+    db_session: Session,
+) -> None:
+    core = seed_core(db_session)
+    first = awaited(db_session, core, created_at=NOW - timedelta(minutes=10))
+    second = awaited(db_session, core, created_at=NOW - timedelta(minutes=5))
+    result = CorrelationOrchestrator(
+        db_session,
+        semantic=Semantic(),
+        classifier=Classifier(Classification(kind="AMBIGUOUS")),
+        owner_chat_id=99,
+    ).process(core["revision"].id)
+    db_session.commit()
+
+    class RecordingClassifier:
+        def __init__(self) -> None:
+            self.context = None
+
+        def classify(self, *args: object, **kwargs: object) -> Classification:
+            self.context = args[3] if len(args) > 3 else kwargs.get("task_context")
+            return Classification(kind="OTHER")
+
+    classifier = RecordingClassifier()
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+    handler = ProductionOwnerCommandHandler(
+        factory,
+        owner_chat_id=99,
+        owner_timezone="America/Toronto",
+        resolver=object(),  # type: ignore[arg-type]
+        generation=object(),  # type: ignore[arg-type]
+        classifier=classifier,
+    )
+
+    prepared = handler.prepare_decision(
+        result.decision_request_id,
+        {
+            "callback_query": {
+                "data": f"decision:{result.decision_request_id}:awaited_response:{second.id}"
+            }
+        },
+        object(),  # type: ignore[arg-type]
+    )
+
+    assert prepared.action == "select"
+    assert classifier.context is not None
+    assert classifier.context.duration_minutes == core["task"].duration_minutes
+    assert classifier.context.topic_key == core["task"].topic_key
+    assert classifier.context.owner_timezone == "America/Toronto"
+    assert first.status is AwaitedResponseStatus.OPEN
 
 
 def test_stale_and_repeated_owner_correlation_answers_have_no_second_effect(db_session: Session) -> None:

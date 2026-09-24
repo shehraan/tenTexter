@@ -226,6 +226,7 @@ class AgentRuntime:
         outbox: OutboxWorker,
         health: HealthMonitor,
         owner_chat_id: int,
+        owner_timezone: str,
         recurring_generation: ValidatedGenerationPipeline,
     ):
         self.sessions = sessions
@@ -241,6 +242,7 @@ class AgentRuntime:
         self.outbox = outbox
         self.health = health
         self.owner_chat_id = owner_chat_id
+        self.owner_timezone = owner_timezone
         self.recurring_generation = recurring_generation
         self._recovery_pass = True
 
@@ -357,6 +359,7 @@ class AgentRuntime:
                         classifier=self.classifier,
                         boundary_classifier=self.boundary_classifier,
                         owner_chat_id=self.owner_chat_id,
+                        owner_timezone=self.owner_timezone,
                     ).prepare(revision_id)
             except ModelUnavailable as exc:
                 self.revisions.fail(
@@ -395,6 +398,7 @@ class AgentRuntime:
                     classifier=self.classifier,
                     boundary_classifier=self.boundary_classifier,
                     owner_chat_id=self.owner_chat_id,
+                    owner_timezone=self.owner_timezone,
                 ).apply_prepared(revision_id, plan)
 
             self.revisions.commit(claim, apply)
@@ -590,6 +594,7 @@ def build_runtime(
         resolver=EntityResolverAssistant(primary_backend),
         generation=generation,
         classifier=classifier,
+        owner_timezone=getattr(settings, "owner_timezone", "UTC"),
     )
     telegram = telegram or TelegramBotAdapter(
         token=settings.telegram_bot_token,
@@ -657,5 +662,6 @@ def build_runtime(
         outbox=outbox,
         health=HealthMonitor(owner_chat_id=settings.owner_chat_id),
         owner_chat_id=settings.owner_chat_id,
+        owner_timezone=getattr(settings, "owner_timezone", "UTC"),
         recurring_generation=generation,
     )
