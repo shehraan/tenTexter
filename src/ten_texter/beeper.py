@@ -13,12 +13,19 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from ten_texter.domain import DomainError, utc_now
 from ten_texter.enums import ContentSupport, ConversationKind, Transport
-from ten_texter.inbound import InboundEvent, IngestResult, MessageIngestor
+from ten_texter.inbound import (
+    InboundEvent,
+    IngestResult,
+    MessageIngestor,
+    immutable_content_hash,
+)
 from ten_texter.models import (
     BeeperSyncCheckpoint,
     Conversation,
     ConversationParticipant,
     Identity,
+    Message,
+    MessageRevision,
     OutboxDeliveryAttempt,
     Person,
 )
@@ -222,15 +229,46 @@ class BeeperSyncService:
         if is_deleted:
             text_value = None
             supported = True
-        body_hash = hashlib.sha256((text_value or "<deleted>").encode()).hexdigest()
         revision_marker = payload.get("editedTimestamp") or payload.get("timestamp") or "unknown"
+        legacy_body_hash = hashlib.sha256(
+            (text_value or "<deleted>").encode()
+        ).hexdigest()
+        provider_revision_key = f"{revision_marker}:{legacy_body_hash}"
+        existing_message = self.session.scalar(
+            select(Message).where(
+                Message.conversation_id == conversation.id,
+                Message.provider_message_id == message_id,
+            )
+        )
+        legacy_revision = (
+            self.session.scalar(
+                select(MessageRevision).where(
+                    MessageRevision.message_id == existing_message.id,
+                    MessageRevision.provider_revision_key == provider_revision_key,
+                )
+            )
+            if existing_message is not None
+            else None
+        )
+        immutable_hash = immutable_content_hash(
+            text=text_value if isinstance(text_value, str) else None,
+            is_deleted=is_deleted,
+        )
+        if legacy_revision is not None and (
+            legacy_revision.content_hash != immutable_hash
+            or legacy_revision.is_deleted != is_deleted
+        ):
+            # Older releases synthesized keys from timestamp plus display text,
+            # which collapses missing/empty content and deletion tombstones.
+            # Keep legacy keys stable unless that lossy key is already occupied.
+            provider_revision_key = f"{revision_marker}:{immutable_hash}"
         arrival = _aware(received_at or utc_now())
         provider_time = payload.get("editedTimestamp") or payload.get("timestamp")
         event = InboundEvent(
             conversation_id=conversation.id,
             provider_message_id=message_id,
             sender_identity_id=identity.id,
-            provider_revision_key=f"{revision_marker}:{body_hash}",
+            provider_revision_key=provider_revision_key,
             provider_sort_key=str(payload.get("sortKey")) if payload.get("sortKey") is not None else None,
             provider_event_at=(
                 _optional_provider_time(provider_time)

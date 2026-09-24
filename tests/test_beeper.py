@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -8,10 +9,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from ten_texter.beeper import BeeperDesktopAdapter, BeeperSyncService
-from ten_texter.enums import DecisionCloseReason, DecisionStatus, MessageKind, OutboxStatus, Transport
+from ten_texter.enums import ContentSupport, DecisionCloseReason, DecisionStatus, MessageKind, OutboxStatus, ParentTerminalPolicy, ProcessingStatus, Transport
 from ten_texter.models import BeeperOutboxDestination, BeeperSyncCheckpoint, Conversation, ConversationParticipant, DecisionRequest, DecisionRequestPrompt, Identity, Message, MessageRevision, OutboxDeliveryAttempt, OutboxMessage, Person, TaskInstance, TaskParticipant
 from ten_texter.enums import AvailabilityStatus, TaskStatus
-from ten_texter.domain import DomainError, utc_now
+from ten_texter.domain import DecisionService, DomainError, utc_now
 from ten_texter.control import ProductionOwnerCommandHandler
 from ten_texter.telegram import TelegramControlGateway
 from ten_texter.outbox import AllowingRevalidator, DeliveryRequest, OutboxService, OutboxWorker
@@ -141,6 +142,39 @@ def test_beeper_message_maps_sort_key_edits_and_reply_link(db_session: Session) 
     assert message.provider_reply_to_message_id == "prior-message"
     assert message.current_revision_id == second.revision_id
     assert db_session.get(MessageRevision, second.revision_id).provider_sort_key == "00000101"
+
+
+def test_beeper_same_sort_key_edit_uses_event_time_ordering(db_session: Session) -> None:
+    service = BeeperSyncService(db_session)
+    conversation = service.sync_chat(chat_payload())
+    original = {
+        "id": "same-position-edit",
+        "chatID": conversation.beeper_conversation_id,
+        "senderID": "@discord_123:beeper",
+        "sortKey": "00000100",
+        "timestamp": "2026-08-26T15:00:00Z",
+        "type": "TEXT",
+        "text": "before",
+    }
+    first = service.ingest_message(original, received_at=NOW)
+    edited = dict(original)
+    edited.update(
+        {
+            "editedTimestamp": "2026-08-26T15:01:00Z",
+            "text": "after",
+        }
+    )
+    second = service.ingest_message(edited, received_at=NOW + timedelta(seconds=1))
+
+    message = db_session.get(Message, first.message_id)
+    assert message is not None
+    assert not second.ordering_conflict
+    assert message.current_revision_id == second.revision_id
+    assert db_session.scalar(
+        select(func.count(DecisionRequest.id)).where(
+            DecisionRequest.type == "MESSAGE_ORDERING_CONFLICT"
+        )
+    ) == 0
 
 
 class Response:
@@ -1516,6 +1550,292 @@ def test_reconciliation_ingests_explicit_edit_and_deletion_but_not_absence(
         assert rows["deleted"].is_deleted and rows["deleted"].text is None
         assert rows["absent"].text == "unchanged" and not rows["absent"].is_deleted
         assert session.scalar(select(func.count(MessageRevision.id))) == 5
+
+
+def test_reconciliation_preserves_tombstone_when_legacy_unsupported_revision_has_same_timestamp(
+    db_session: Session,
+) -> None:
+    chat_id = "!unsupported-then-deleted:beeper"
+    timestamp = "2026-09-14T15:00:00Z"
+    unsupported = _sync_message(
+        "unsupported-then-deleted",
+        chat_id,
+        text=None,
+        timestamp=timestamp,
+        sort_key="00000100",
+    )
+    tombstone = _sync_message(
+        "unsupported-then-deleted",
+        chat_id,
+        text=None,
+        timestamp=timestamp,
+        sort_key="00000100",
+        deleted=True,
+    )
+    client = ScriptedPollClient(
+        [
+            (
+                "/v1/chats",
+                {},
+                _page(
+                    [_sync_chat(chat_id)],
+                    newest="chat-head",
+                    oldest="chat-tail",
+                ),
+            ),
+            (
+                "/v1/chats/%21unsupported-then-deleted%3Abeeper/messages",
+                {},
+                _page(
+                    [unsupported],
+                    newest="message-head",
+                    oldest="message-tail",
+                ),
+            ),
+            (
+                "/v1/chats",
+                {"cursor": "chat-head", "direction": "after"},
+                _page([], newest="chat-head", oldest="chat-head"),
+            ),
+            (
+                "/v1/chats/%21unsupported-then-deleted%3Abeeper/messages",
+                {},
+                _page(
+                    [tombstone],
+                    newest="message-tombstone",
+                    oldest="message-tail",
+                ),
+            ),
+        ]
+    )
+    factory = sessionmaker(
+        bind=db_session.bind, expire_on_commit=False, autoflush=False
+    )
+    adapter = BeeperDesktopAdapter(
+        factory,
+        access_token="fake",
+        enabled=True,
+        client=client,  # type: ignore[arg-type]
+    )
+
+    adapter.poll_inbound(now=SYNC_NOW)
+    adapter.poll_inbound(now=SYNC_NOW + timedelta(seconds=2))
+
+    with factory.begin() as session:
+        message = session.scalar(
+            select(Message).where(
+                Message.provider_message_id == "unsupported-then-deleted"
+            )
+        )
+        revisions = list(
+            session.scalars(
+                select(MessageRevision)
+                .where(MessageRevision.message_id == message.id)
+                .order_by(MessageRevision.id)
+            )
+        )
+        assert len(revisions) == 2
+        assert not revisions[0].is_deleted
+        assert revisions[0].content_support is ContentSupport.UNSUPPORTED
+        assert revisions[1].is_deleted
+        assert message.current_revision_id == revisions[1].id
+        assert revisions[1].processing_status is ProcessingStatus.PROCESSED
+        assert session.scalar(
+            select(func.count(DecisionRequest.id)).where(
+                DecisionRequest.message_revision_id == revisions[1].id,
+                DecisionRequest.type == "MESSAGE_ORDERING_CONFLICT",
+                DecisionRequest.status == DecisionStatus.PENDING,
+            )
+        ) == 0
+        repeated = BeeperSyncService(session).ingest_message(
+            tombstone,
+            received_at=SYNC_NOW + timedelta(seconds=3),
+        )
+        assert repeated.duplicate
+        assert (
+            session.scalar(
+                select(func.count(MessageRevision.id)).where(
+                    MessageRevision.message_id == message.id
+                )
+            )
+            == 2
+        )
+
+
+def test_replayed_tombstone_repairs_legacy_pending_ordering_conflict(
+    db_session: Session,
+) -> None:
+    chat_id = "!legacy-tombstone-conflict:beeper"
+    timestamp = "2026-09-14T15:00:00Z"
+    service = BeeperSyncService(db_session)
+    conversation = service.sync_chat(chat_payload(chat_id=chat_id))
+    original = service.ingest_message(
+        _sync_message(
+            "legacy-tombstone",
+            chat_id,
+            text=None,
+            timestamp=timestamp,
+            sort_key="00000100",
+        )
+    )
+    message = db_session.get(Message, original.message_id)
+    assert message is not None
+    deleted_hash = hashlib.sha256(b"deleted\0").hexdigest()
+    legacy_key = f"{timestamp}:{deleted_hash}"
+    legacy_tombstone = MessageRevision(
+        message_id=message.id,
+        provider_revision_key=legacy_key,
+        provider_sort_key="00000100",
+        provider_event_at=datetime.fromisoformat(timestamp.replace("Z", "+00:00")),
+        content_hash=deleted_hash,
+        is_deleted=True,
+        text=None,
+        received_at=NOW,
+        content_support=ContentSupport.SUPPORTED,
+        processing_status=ProcessingStatus.PENDING,
+    )
+    db_session.add(legacy_tombstone)
+    db_session.flush()
+    decision = DecisionService(db_session).create(
+        decision_type="MESSAGE_ORDERING_CONFLICT",
+        subject_kind="message_revision",
+        subject_id=legacy_tombstone.id,
+        context={"message_id": message.id},
+        parent_terminal_policy=ParentTerminalPolicy.SURVIVE,
+    )
+    db_session.flush()
+
+    result = service.ingest_message(
+        _sync_message(
+            "legacy-tombstone",
+            chat_id,
+            text=None,
+            timestamp=timestamp,
+            sort_key="00000100",
+            deleted=True,
+        ),
+        received_at=NOW + timedelta(seconds=1),
+    )
+
+    assert result.duplicate
+    assert message.current_revision_id == legacy_tombstone.id
+    assert legacy_tombstone.processing_status is ProcessingStatus.PROCESSED
+    assert legacy_tombstone.lease_expires_at is None
+    assert db_session.get(DecisionRequest, decision.id).status is DecisionStatus.CLOSED
+    assert db_session.get(DecisionRequest, decision.id).close_reason is DecisionCloseReason.SUBJECT_RESOLVED
+    assert conversation.id == message.conversation_id
+
+
+def test_explicit_tombstone_closes_conflict_attached_to_prior_revision(
+    db_session: Session,
+) -> None:
+    chat_id = "!stale-ordering-decision:beeper"
+    timestamp = "2026-09-14T15:00:00Z"
+    service = BeeperSyncService(db_session)
+    service.sync_chat(chat_payload(chat_id=chat_id))
+    original = service.ingest_message(
+        _sync_message(
+            "stale-ordering-message",
+            chat_id,
+            text=None,
+            timestamp=timestamp,
+            sort_key="00000100",
+        )
+    )
+    decision = DecisionService(db_session).create(
+        decision_type="MESSAGE_ORDERING_CONFLICT",
+        subject_kind="message_revision",
+        subject_id=original.revision_id,
+        context={"message_id": original.message_id},
+        parent_terminal_policy=ParentTerminalPolicy.SURVIVE,
+    )
+    db_session.flush()
+
+    deleted = service.ingest_message(
+        _sync_message(
+            "stale-ordering-message",
+            chat_id,
+            text=None,
+            timestamp=timestamp,
+            sort_key="00000100",
+            deleted=True,
+        ),
+        received_at=NOW + timedelta(seconds=1),
+    )
+
+    message = db_session.get(Message, original.message_id)
+    assert message is not None
+    assert message.current_revision_id == deleted.revision_id
+    stored_decision = db_session.get(DecisionRequest, decision.id)
+    assert stored_decision is not None
+    assert stored_decision.status is DecisionStatus.CLOSED
+    assert stored_decision.close_reason is DecisionCloseReason.SUBJECT_RESOLVED
+
+
+def test_replayed_same_sort_edit_repairs_legacy_pending_conflict(
+    db_session: Session,
+) -> None:
+    chat_id = "!legacy-same-sort-edit:beeper"
+    timestamp = "2026-09-14T15:00:00Z"
+    edited_timestamp = "2026-09-14T15:01:00Z"
+    service = BeeperSyncService(db_session)
+    conversation = service.sync_chat(chat_payload(chat_id=chat_id))
+    original = service.ingest_message(
+        _sync_message(
+            "legacy-same-sort-edit",
+            chat_id,
+            text="before",
+            timestamp=timestamp,
+            sort_key="00000100",
+        )
+    )
+    message = db_session.get(Message, original.message_id)
+    assert message is not None
+    edited_hash = hashlib.sha256(b"content\0after").hexdigest()
+    legacy_key = f"{edited_timestamp}:{hashlib.sha256(b'after').hexdigest()}"
+    legacy_edit = MessageRevision(
+        message_id=message.id,
+        provider_revision_key=legacy_key,
+        provider_sort_key="00000100",
+        provider_event_at=datetime.fromisoformat(edited_timestamp.replace("Z", "+00:00")),
+        content_hash=edited_hash,
+        is_deleted=False,
+        text="after",
+        received_at=NOW,
+        content_support=ContentSupport.SUPPORTED,
+        processing_status=ProcessingStatus.PENDING,
+    )
+    db_session.add(legacy_edit)
+    db_session.flush()
+    decision = DecisionService(db_session).create(
+        decision_type="MESSAGE_ORDERING_CONFLICT",
+        subject_kind="message_revision",
+        subject_id=legacy_edit.id,
+        context={"message_id": message.id},
+        parent_terminal_policy=ParentTerminalPolicy.SURVIVE,
+    )
+    db_session.flush()
+
+    result = service.ingest_message(
+        _sync_message(
+            "legacy-same-sort-edit",
+            chat_id,
+            text="after",
+            timestamp=timestamp,
+            sort_key="00000100",
+            edited_timestamp=edited_timestamp,
+        ),
+        received_at=NOW + timedelta(seconds=1),
+    )
+
+    assert result.duplicate
+    assert message.current_revision_id == legacy_edit.id
+    assert legacy_edit.processing_status is ProcessingStatus.PROCESSED
+    stored_decision = db_session.get(DecisionRequest, decision.id)
+    assert stored_decision is not None
+    assert stored_decision.status is DecisionStatus.CLOSED
+    assert stored_decision.close_reason is DecisionCloseReason.SUBJECT_RESOLVED
+    assert conversation.id == message.conversation_id
 
 
 def test_reconciliation_page_progress_resumes_after_restart(db_session: Session) -> None:
