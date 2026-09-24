@@ -3,12 +3,25 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Protocol
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 class BoundaryPromptCandidate(Protocol):
     task_instance_id: int
     topic_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class CounterproposalPromptContext:
+    participant_name: str
+    topic_key: str
+    scheduled_at: datetime
+    duration_minutes: int
+    location: str | None
+    owner_timezone: str
 
 
 OrderingPromptCandidate = tuple[
@@ -56,11 +69,117 @@ def mass_contact_confirmation_prompt(
     )
 
 
-def counterproposal_prompt(field: str, operation: str, proposed_value: object) -> str:
+def legacy_counterproposal_prompt(
+    field: str, operation: str, proposed_value: object
+) -> str:
     return (
         f"Participant proposed {field} {operation}: {proposed_value}. "
         "Reply to this Telegram message with `approve` or `reject`."
     )
+
+
+def counterproposal_prompt(
+    *,
+    context: CounterproposalPromptContext,
+    field: str,
+    operation: str,
+    proposed_value: object,
+) -> str:
+    if operation != "SET":
+        raise ValueError("counterproposal prompt requires the canonical SET operation")
+
+    if field == "scheduled_at":
+        current = _as_utc(context.scheduled_at)
+        proposed = _parse_scheduled_value(proposed_value)
+        zone = _owner_zone(context.owner_timezone)
+        current_local = current.astimezone(zone)
+        proposed_local = proposed.astimezone(zone)
+        current_date = _format_date(current_local)
+        if current_local.date() == proposed_local.date():
+            change = f"from {current_date} at {_format_time(current_local)} to {_format_time(proposed_local)}"
+        else:
+            change = (
+                f"from {current_date} at {_format_time(current_local)} to "
+                f"{_format_date(proposed_local)} at {_format_time(proposed_local)}"
+            )
+        detail = (
+            f"suggested moving {context.topic_key} {change} "
+            f"for {_format_duration(context.duration_minutes)}"
+        )
+    elif field == "duration_minutes":
+        proposed_duration = _parse_duration(proposed_value)
+        detail = (
+            f"suggested changing the duration for {context.topic_key} from "
+            f"{_format_duration(context.duration_minutes)} to "
+            f"{_format_duration(proposed_duration)}"
+        )
+    elif field == "location":
+        proposed_location = _parse_location(proposed_value)
+        detail = (
+            f"suggested changing the location for {context.topic_key} from "
+            f"{_format_location(context.location)} to {_format_location(proposed_location)}"
+        )
+    else:
+        raise ValueError(f"unsupported counterproposal field: {field}")
+
+    return (
+        f"{context.participant_name} {detail}. Should I accept this change? "
+        "Reply to this Telegram message with `approve` or `reject`."
+    )
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        # SQLite does not preserve timezone metadata for the normalized UTC task value.
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _owner_zone(name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(f"owner timezone is invalid: {name}") from exc
+
+
+def _parse_scheduled_value(value: object) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError("scheduled_at proposal must be an ISO timestamp")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("scheduled_at proposal must be an ISO timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("scheduled_at proposal must be timezone-aware")
+    return parsed.astimezone(UTC)
+
+
+def _parse_duration(value: object) -> int:
+    if type(value) is not int or value <= 0:
+        raise ValueError("duration proposal must be a positive integer")
+    return value
+
+
+def _parse_location(value: object) -> str | None:
+    if value is not None and not isinstance(value, str):
+        raise ValueError("location proposal must be a string or null")
+    return value
+
+
+def _format_date(value: datetime) -> str:
+    return f"{value.strftime('%A, %B')} {value.day}"
+
+
+def _format_time(value: datetime) -> str:
+    return value.strftime("%I:%M %p").lstrip("0")
+
+
+def _format_duration(value: int) -> str:
+    return f"{value} minute" if value == 1 else f"{value} minutes"
+
+
+def _format_location(value: str | None) -> str:
+    return "no location" if value is None else f"“{value}”"
 
 
 def late_terminal_message_prompt(

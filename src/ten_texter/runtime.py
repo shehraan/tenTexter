@@ -623,6 +623,7 @@ def build_runtime(
         revalidator=PolicyRevalidator(
             facts=facts,
             owner_chat_id=settings.owner_chat_id,
+            owner_timezone=getattr(settings, "owner_timezone", "UTC"),
         ),
         validator=OutboxValidatorGate(
             sessions,
@@ -631,6 +632,7 @@ def build_runtime(
                 sessions,
                 facts=facts,
                 owner_chat_id=settings.owner_chat_id,
+                owner_timezone=getattr(settings, "owner_timezone", "UTC"),
             ),
             owner_chat_id=settings.owner_chat_id,
         ),

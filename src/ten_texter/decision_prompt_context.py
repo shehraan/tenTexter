@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ten_texter.decision_prompts import (
+    CounterproposalPromptContext,
     OrderingPromptCandidate,
     bounded_revision_preview,
     correlation_ambiguity_prompt,
@@ -19,6 +20,7 @@ from ten_texter.decision_prompts import (
     ordering_conflict_untrusted_data,
     owner_command_review_prompt,
     mass_contact_confirmation_prompt,
+    legacy_counterproposal_prompt,
     uncertain_delivery_prompt,
     validator_block_prompt,
     contact_boundary_ambiguity_prompt,
@@ -152,6 +154,7 @@ def authorize_decision_prompt(
     message: OutboxMessage,
     *,
     owner_chat_id: int | None,
+    owner_timezone: str = "UTC",
 ) -> DecisionPromptAuthorization | None:
     if (
         owner_chat_id is None
@@ -173,16 +176,51 @@ def authorize_decision_prompt(
         or message.parent_terminal_policy is not decision.parent_terminal_policy
     ):
         return None
-    authorization = _authorization_for_subject(session, decision, message)
+    authorization = _authorization_for_subject(
+        session,
+        decision,
+        message,
+        owner_timezone=owner_timezone,
+    )
     if authorization is None or message.final_text != authorization.expected_text:
         return None
     return authorization
+
+
+def _counterproposal_prompt_context(
+    session: Session,
+    proposal: Proposal,
+    *,
+    owner_timezone: str,
+) -> CounterproposalPromptContext | None:
+    if proposal.proposed_by_participant_id is None:
+        return None
+    task = session.get(TaskInstance, proposal.task_instance_id)
+    participant = session.get(TaskParticipant, proposal.proposed_by_participant_id)
+    person = session.get(Person, participant.person_id) if participant is not None else None
+    if (
+        task is None
+        or participant is None
+        or participant.task_instance_id != task.id
+        or person is None
+    ):
+        return None
+    return CounterproposalPromptContext(
+        participant_name=person.display_name,
+        topic_key=task.topic_key,
+        scheduled_at=task.scheduled_at,
+        duration_minutes=task.duration_minutes,
+        location=task.location,
+        owner_timezone=owner_timezone,
+    )
 
 
 def _authorization_for_subject(
     session: Session,
     decision: DecisionRequest,
     prompt: OutboxMessage,
+    *,
+    owner_timezone: str,
 ) -> DecisionPromptAuthorization | None:
     if decision.type == "MASS_CONTACT_CONFIRMATION":
         from ten_texter.mass_contact import MASS_CONTACT_THRESHOLD, mass_contact_subject
@@ -331,12 +369,33 @@ def _authorization_for_subject(
             or prompt.idempotency_key != f"proposal:{proposal.id}:owner-prompt"
         ):
             return None
-        text = counterproposal_prompt(
+        legacy_text = legacy_counterproposal_prompt(
             proposal.field,
             proposal.operation,
             proposal.proposed_value,
         )
-        return DecisionPromptAuthorization(text, (text,))
+        context = _counterproposal_prompt_context(
+            session,
+            proposal,
+            owner_timezone=owner_timezone,
+        )
+        friendly_text: str | None = None
+        if context is not None:
+            try:
+                friendly_text = counterproposal_prompt(
+                    context=context,
+                    field=proposal.field,
+                    operation=proposal.operation,
+                    proposed_value=proposal.proposed_value,
+                )
+            except ValueError:
+                friendly_text = None
+        if prompt.final_text == friendly_text:
+            assert friendly_text is not None
+            return DecisionPromptAuthorization(friendly_text, (friendly_text,))
+        if prompt.final_text == legacy_text:
+            return DecisionPromptAuthorization(legacy_text, (legacy_text,))
+        return None
 
     if decision.type == "LATE_TERMINAL_MESSAGE":
         subject = late_terminal_subject(session, decision)

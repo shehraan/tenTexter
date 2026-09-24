@@ -42,6 +42,7 @@ def _run_outbox_worker(app: Application, *, once: bool) -> None:
             app.sessions,
             facts=facts,
             owner_chat_id=getattr(app.settings, "owner_chat_id", None),
+            owner_timezone=getattr(app.settings, "owner_timezone", "UTC"),
         ),
         owner_chat_id=getattr(app.settings, "owner_chat_id", None),
     )
@@ -50,6 +51,7 @@ def _run_outbox_worker(app: Application, *, once: bool) -> None:
         revalidator=PolicyRevalidator(
             facts=facts,
             owner_chat_id=getattr(app.settings, "owner_chat_id", None),
+            owner_timezone=getattr(app.settings, "owner_timezone", "UTC"),
         ),
         validator=gate,
         adapters={

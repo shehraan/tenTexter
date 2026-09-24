@@ -160,10 +160,12 @@ class DatabaseValidatorContextProvider:
         *,
         facts: DatabaseContextProvider,
         owner_chat_id: int | None = None,
+        owner_timezone: str = "UTC",
     ):
         self.sessions = sessions
         self.facts = facts
         self.owner_chat_id = owner_chat_id
+        self.owner_timezone = owner_timezone
 
     def context_for(self, outbox_id: int, message_kind: MessageKind) -> ValidatorContext:
         with self.sessions() as session:
@@ -218,6 +220,7 @@ class DatabaseValidatorContextProvider:
                     session,
                     message,
                     owner_chat_id=self.owner_chat_id,
+                    owner_timezone=self.owner_timezone,
                 )
                 if message_kind is message.message_kind
                 else None

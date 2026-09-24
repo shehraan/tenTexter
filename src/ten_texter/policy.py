@@ -349,11 +349,13 @@ class PolicyRevalidator(PreSendRevalidator):
         disclosure: DisclosurePolicy | None = None,
         facts: ContextFactProvider | None = None,
         owner_chat_id: int | None = None,
+        owner_timezone: str = "UTC",
     ):
         self.rules = rules or ContactRuleResolver()
         self.disclosure = disclosure or DisclosurePolicy()
         self.facts = facts or EmptyContextFactProvider()
         self.owner_chat_id = owner_chat_id
+        self.owner_timezone = owner_timezone
 
     def check(self, session: Session, message: OutboxMessage) -> PreSendDecision:
         task = session.get(TaskInstance, message.task_instance_id) if message.task_instance_id else None
@@ -377,6 +379,7 @@ class PolicyRevalidator(PreSendRevalidator):
                 session,
                 message,
                 owner_chat_id=self.owner_chat_id,
+                owner_timezone=self.owner_timezone,
             ) is None:
                 return PreSendDecision.STALE
             return PreSendDecision.READY
@@ -630,6 +633,7 @@ class PolicyRevalidator(PreSendRevalidator):
             session,
             message,
             owner_chat_id=self.owner_chat_id,
+            owner_timezone=self.owner_timezone,
         )
         if authorization is None:
             return (

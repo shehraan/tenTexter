@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ten_texter.decision_prompts import (
+    CounterproposalPromptContext,
     correlation_ambiguity_prompt,
     counterproposal_prompt,
     late_terminal_message_prompt,
@@ -676,17 +677,28 @@ class CorrelationOrchestrator:
                     parent_terminal_policy=ParentTerminalPolicy.SURVIVE,
                 )
         elif classification.kind == "COUNTERPROPOSAL" and classification.proposals:
+            person = self.session.get(Person, participant.person_id)
+            if person is None:
+                raise DomainError("counterproposal participant person not found")
+            prompt_context = CounterproposalPromptContext(
+                participant_name=person.display_name,
+                topic_key=task.topic_key,
+                scheduled_at=task.scheduled_at,
+                duration_minutes=task.duration_minutes,
+                location=task.location,
+                owner_timezone=self.owner_timezone,
+            )
             for atomic in proposals_to_create:
                 proposal = Proposal(
-                        task_instance_id=task.id,
-                        proposed_by_participant_id=participant.id,
-                        source_message_revision_id=revision.id,
-                        field=atomic.field,
-                        operation=atomic.operation,
-                        old_value=atomic.old_value,
-                        proposed_value=atomic.proposed_value,
-                        status=ProposalStatus.PENDING,
-                    )
+                    task_instance_id=task.id,
+                    proposed_by_participant_id=participant.id,
+                    source_message_revision_id=revision.id,
+                    field=atomic.field,
+                    operation=atomic.operation,
+                    old_value=atomic.old_value,
+                    proposed_value=atomic.proposed_value,
+                    status=ProposalStatus.PENDING,
+                )
                 self.session.add(proposal)
                 self.session.flush()
                 decision = DecisionService(self.session).create(
@@ -702,14 +714,19 @@ class CorrelationOrchestrator:
                     parent_terminal_policy=ParentTerminalPolicy.TERMINATE,
                 )
                 if self.owner_chat_id is not None:
+                    try:
+                        final_text = counterproposal_prompt(
+                            context=prompt_context,
+                            field=proposal.field,
+                            operation=proposal.operation,
+                            proposed_value=proposal.proposed_value,
+                        )
+                    except ValueError as exc:
+                        raise DomainError("counterproposal prompt data is invalid") from exc
                     prompt = OutboxService(self.session).create_owner(
                         telegram_chat_id=self.owner_chat_id,
                         task_instance_id=task.id,
-                        final_text=counterproposal_prompt(
-                            proposal.field,
-                            proposal.operation,
-                            proposal.proposed_value,
-                        ),
+                        final_text=final_text,
                         message_kind=MessageKind.NOTIFICATION,
                         idempotency_key=f"proposal:{proposal.id}:owner-prompt",
                         parent_terminal_policy=ParentTerminalPolicy.TERMINATE,
