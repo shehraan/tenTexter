@@ -38,12 +38,21 @@ def _run_outbox_worker(app: Application, *, once: bool) -> None:
     gate = OutboxValidatorGate(
         app.sessions,
         validator=validator,
-        contexts=DatabaseValidatorContextProvider(app.sessions, facts=facts),
+        contexts=DatabaseValidatorContextProvider(
+            app.sessions,
+            facts=facts,
+            owner_chat_id=getattr(app.settings, "owner_chat_id", None),
+            owner_timezone=getattr(app.settings, "owner_timezone", "UTC"),
+        ),
         owner_chat_id=getattr(app.settings, "owner_chat_id", None),
     )
     worker = OutboxWorker(
         app.sessions,
-        revalidator=PolicyRevalidator(facts=facts),
+        revalidator=PolicyRevalidator(
+            facts=facts,
+            owner_chat_id=getattr(app.settings, "owner_chat_id", None),
+            owner_timezone=getattr(app.settings, "owner_timezone", "UTC"),
+        ),
         validator=gate,
         adapters={
             Transport.BEEPER: BeeperDesktopAdapter(
@@ -104,6 +113,14 @@ def _alembic_config(database_url: str) -> Config:
     return config
 
 
+def _live_tennis_error_payload(exc: Exception) -> dict[str, object]:
+    payload: dict[str, object] = {"ok": False, "error": str(exc)}
+    task_instance_id = getattr(exc, "task_instance_id", None)
+    if isinstance(task_instance_id, int):
+        payload["task_instance_id"] = task_instance_id
+    return payload
+
+
 def _run_agent(app: Application, *, once: bool) -> None:
     from ten_texter.runtime import build_runtime
 
@@ -124,6 +141,22 @@ def main(argv: list[str] | None = None) -> int:
     runtime = subparsers.add_parser("run")
     runtime.add_argument("--once", action="store_true")
     subparsers.add_parser("identities")
+    live_tennis = subparsers.add_parser(
+        "live-tennis-test",
+        help="run one guarded real tennis flow against the alternate WhatsApp account",
+    )
+    live_tennis.add_argument(
+        "--confirm-real-send",
+        action="store_true",
+        help="confirm that the test may send a real message to the hard-coded test account",
+    )
+    live_tennis.add_argument(
+        "--resume-task-id",
+        type=int,
+        help="poll an existing allowlisted test task instead of creating a new send",
+    )
+    live_tennis.add_argument("--poll-rounds", type=int, default=1)
+    live_tennis.add_argument("--poll-delay-seconds", type=float, default=0.0)
     link_identity = subparsers.add_parser("link-identity")
     link_identity.add_argument("--identity-id", type=int, required=True)
     link_identity.add_argument("--person-id", type=int, required=True)
@@ -147,6 +180,35 @@ def main(argv: list[str] | None = None) -> int:
                     sort_keys=True,
                 )
             )
+    elif args.command == "live-tennis-test":
+        from ten_texter.live_tennis import (
+            LiveTennisTestError,
+            poll_live_tennis_test,
+            run_live_tennis_test,
+        )
+
+        try:
+            app = Application.bootstrap(settings)
+            if args.resume_task_id is None:
+                report = run_live_tennis_test(
+                    app,
+                    confirm_real_send=args.confirm_real_send,
+                    poll_rounds=args.poll_rounds,
+                    poll_delay_seconds=args.poll_delay_seconds,
+                )
+            else:
+                report = poll_live_tennis_test(
+                    app,
+                    task_instance_id=args.resume_task_id,
+                    confirm_real_send=args.confirm_real_send,
+                    poll_rounds=args.poll_rounds,
+                    poll_delay_seconds=args.poll_delay_seconds,
+                )
+        except LiveTennisTestError as exc:
+            print(json.dumps(_live_tennis_error_payload(exc), indent=2, sort_keys=True))
+            return 1
+        print(json.dumps(asdict(report), indent=2, sort_keys=True))
+        return 0 if report.ok else 1
     elif args.command == "link-identity":
         from ten_texter.identity import IdentityLinkingService
 

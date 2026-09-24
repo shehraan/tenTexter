@@ -97,7 +97,7 @@ def test_duplicate_logical_send_collapses(db_session: Session) -> None:
         idempotency_key="same",
     )
     assert one.id == two.id
-    with pytest.raises(DomainError):
+    with pytest.raises(DomainError, match="idempotency key reused for a different logical send"):
         service.create_beeper(
             task_instance_id=core["task"].id,
             conversation_id=core["conversation"].id,

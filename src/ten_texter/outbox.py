@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Protocol
 
@@ -9,9 +9,12 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from ten_texter.decision_prompts import uncertain_delivery_prompt
 from ten_texter.domain import DecisionService, DomainError, utc_now
 from ten_texter.enums import (
     AttemptResult,
+    DecisionCloseReason,
+    DecisionStatus,
     DestinationKind,
     MessageKind,
     OutboxCancelReason,
@@ -37,6 +40,7 @@ class PreSendDecision(str, Enum):
     STALE = "STALE"
     POLICY_BLOCKED = "POLICY_BLOCKED"
     UNAVAILABLE = "UNAVAILABLE"
+    AWAITING_OWNER = "AWAITING_OWNER"
 
 
 class PreSendRevalidator(Protocol):
@@ -64,6 +68,10 @@ class DeliveryResult:
     provider_message_id: str | None = None
     pending_provider_id: str | None = None
     error: str | None = None
+
+
+def _aware(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 class TransportAdapter(Protocol):
@@ -260,6 +268,7 @@ class OutboxWorker:
         validator: IndependentTextValidator,
         adapters: dict[Transport, TransportAdapter],
         lease_duration: timedelta = timedelta(seconds=30),
+        pending_reconciliation_grace: timedelta = timedelta(minutes=5),
         raise_validation_errors: bool = False,
         owner_chat_id: int | None = None,
     ):
@@ -268,6 +277,7 @@ class OutboxWorker:
         self.validator = validator
         self.adapters = adapters
         self.lease_duration = lease_duration
+        self.pending_reconciliation_grace = pending_reconciliation_grace
         self.raise_validation_errors = raise_validation_errors
         self.owner_chat_id = owner_chat_id
 
@@ -279,11 +289,25 @@ class OutboxWorker:
             return snapshot["status"]
         policy_token: object | None = None
         token_builder = getattr(self.revalidator, "context_token", None)
-        if token_builder is not None:
-            with self.sessions() as session:
-                message = session.get(OutboxMessage, outbox_id)
-                if message is None or message.status is not OutboxStatus.PENDING:
-                    return message.status if message is not None else OutboxStatus.CANCELLED
+        with self.sessions.begin() as session:
+            message = session.get(OutboxMessage, outbox_id)
+            if message is None or message.status is not OutboxStatus.PENDING:
+                return message.status if message is not None else OutboxStatus.CANCELLED
+            initial_decision = self.revalidator.check(session, message)
+            if initial_decision in {PreSendDecision.UNAVAILABLE, PreSendDecision.AWAITING_OWNER}:
+                return OutboxStatus.PENDING
+            if initial_decision in {
+                PreSendDecision.STALE,
+                PreSendDecision.POLICY_BLOCKED,
+            }:
+                message.status = OutboxStatus.CANCELLED
+                message.cancel_reason = (
+                    OutboxCancelReason.STALE
+                    if initial_decision is PreSendDecision.STALE
+                    else OutboxCancelReason.POLICY_BLOCKED
+                )
+                return message.status
+            if token_builder is not None:
                 policy_token = token_builder(session, message)
         try:
             valid = self.validator.validate(
@@ -308,7 +332,7 @@ class OutboxWorker:
                 and token_builder(session, message) != policy_token
             ):
                 decision = PreSendDecision.POLICY_BLOCKED
-            if decision is PreSendDecision.UNAVAILABLE:
+            if decision in {PreSendDecision.UNAVAILABLE, PreSendDecision.AWAITING_OWNER}:
                 return OutboxStatus.PENDING
             if decision in {PreSendDecision.STALE, PreSendDecision.POLICY_BLOCKED}:
                 message.status = OutboxStatus.CANCELLED
@@ -365,7 +389,7 @@ class OutboxWorker:
                 message.status = OutboxStatus.RECONCILING
             return message.status
 
-    def reconcile(self, outbox_id: int) -> OutboxStatus:
+    def reconcile(self, outbox_id: int, *, at: datetime | None = None) -> OutboxStatus:
         with self.sessions() as read_session:
             message = read_session.get(OutboxMessage, outbox_id)
             if message is None:
@@ -380,6 +404,7 @@ class OutboxWorker:
             )
             assert attempt is not None
             provider_message_id = attempt.provider_message_id
+            attempt_started_at = _aware(attempt.started_at)
             detail = read_session.get(BeeperDeliveryAttemptDetail, attempt.id)
             pending_id = detail.pending_provider_id if detail else None
         adapter = self.adapters.get(request.transport)
@@ -402,6 +427,28 @@ class OutboxWorker:
                 )
                 assert latest is not None
                 latest.provider_message_id = found
+                pending_decisions = list(
+                    session.scalars(
+                        select(DecisionRequestPlaceholder).where(
+                            DecisionRequestPlaceholder.outbox_message_id == outbox_id,
+                            DecisionRequestPlaceholder.type == "UNCERTAIN_DELIVERY",
+                            DecisionRequestPlaceholder.status == DecisionStatus.PENDING,
+                        )
+                    )
+                )
+                for decision in pending_decisions:
+                    DecisionService(session).close(
+                        decision.id,
+                        DecisionCloseReason.SUBJECT_RESOLVED,
+                    )
+                return message.status
+            timestamp = at or utc_now()
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=attempt_started_at.tzinfo)
+            if (
+                pending_id is not None
+                and timestamp < attempt_started_at + self.pending_reconciliation_grace
+            ):
                 return message.status
             existing = session.scalar(
                 select(DecisionRequestPlaceholder.id).where(DecisionRequestPlaceholder.outbox_message_id == outbox_id)
@@ -423,10 +470,7 @@ class OutboxWorker:
 
                     prompt = OutboxService(session).create_owner(
                         telegram_chat_id=self.owner_chat_id,
-                        final_text=(
-                            f"Delivery for outbox {outbox_id} is uncertain. It must not be retried. "
-                            f"Reply `keep reconciling` to acknowledge while leaving it blocked."
-                        ),
+                        final_text=uncertain_delivery_prompt(outbox_id),
                         message_kind=MessageKind.NOTIFICATION,
                         idempotency_key=f"decision:{decision.id}:owner-prompt",
                         task_instance_id=message.task_instance_id,

@@ -1,19 +1,10 @@
-# tenTexter
+# tenTexter (v1)
 
 Local-first messaging coordination agent for arranging activities across Beeper-connected conversations, with a dedicated Telegram owner control plane.
 
 ## Status
 
 The frozen v1 architecture is implemented as a Python modular monolith with SQLite persistence, Alembic migrations, deterministic domain services, durable workers, policy enforcement, model boundaries, and fake-driven end-to-end recovery tests.
-
-The authoritative implementation documents are:
-
-- `AGENTS.md` — instructions for Codex and other coding agents.
-- `docs/architecture.md` — canonical architecture ledger and data-flow design.
-- `docs/invariants.md` — non-negotiable ownership, lifecycle, integrity, privacy, and crash-recovery invariants.
-- `docs/implementation-plan.md` — phased build order and acceptance criteria.
-
-Do not infer architecture from commit history or old discussions. If implementation exposes a contradiction in the documents above, stop and surface the contradiction instead of silently redesigning the system.
 
 ## Local setup
 
@@ -47,7 +38,7 @@ Use `uv run ten-texter run --once` for one complete polling pass. The runtime po
 
 - Telegram uses Bot API long polling for owner updates and `sendMessage` only through Outbox. Create a bot with BotFather, set the owner’s numeric user/chat IDs, and provide the token.
 - Beeper uses the local Desktop REST v1 API at `http://127.0.0.1:23373` by default. Enable Desktop API access, provide its token, and keep Beeper Desktop running. Chats remain distinct; tenTexter never assumes merged conversations.
-- The primary and validator model servers are independently configured at `/v1/infer`. Each accepts `{operation, input}` and returns `{output}` conforming to the strict operation schema. Tests replace both with fakes.
+- The primary and validator model servers are independent llama.cpp servers. Configure each server's base URL (or its full `/v1/chat/completions` URL); tenTexter sends non-streaming OpenAI-compatible chat requests with schema-constrained JSON output and then strictly validates the returned `choices[0].message.content`. Tests replace both with fakes.
 
 The Beeper adapter follows the documented v1 chat/message endpoints. A successful send request returns a pending message ID and therefore enters reconciliation until a final successful provider message is observed. WebSocket delivery remains optional/experimental; provider event ingestion is exposed through the adapter’s deterministic sync/ingestion boundary.
 

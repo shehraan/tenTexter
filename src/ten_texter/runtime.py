@@ -20,6 +20,7 @@ from ten_texter.domain import DomainError, TaskService, utc_now
 from ten_texter.enums import (
     MessageKind,
     OutboxStatus,
+    ParentTerminalPolicy,
     PolicyOutcome,
     ProcessingFailureType,
     ProcessingStatus,
@@ -33,6 +34,7 @@ from ten_texter.model_clients import (
     EntityResolverAssistant,
     HTTPModelBackend,
     MessageClassifier,
+    ModelContactBoundaryClassifier,
     MessageGenerator,
     ModelBackend,
     ModelOutputError,
@@ -55,12 +57,14 @@ from ten_texter.models import (
     TaskTrigger,
     TelegramUpdate,
 )
+from ten_texter.nobody_available import NobodyAvailableNotifier
 from ten_texter.outbox import OutboxService, OutboxWorker
 from ten_texter.policy import (
     ContactRuleResolver,
     DatabaseContextProvider,
     PolicyRevalidator,
 )
+from ten_texter.contact_boundaries import ContactBoundaryClassifier
 from ten_texter.scheduler import RecurrenceScheduler
 from ten_texter.telegram import TelegramBotAdapter, TelegramControlGateway
 from ten_texter.triggers import TriggerWorker
@@ -216,11 +220,13 @@ class AgentRuntime:
         revisions: RevisionProcessor,
         semantic: SemanticCorrelator,
         classifier: Classifier,
+        boundary_classifier: ContactBoundaryClassifier,
         recurrence: RecurrenceScheduler,
         triggers: TriggerWorker,
         outbox: OutboxWorker,
         health: HealthMonitor,
         owner_chat_id: int,
+        owner_timezone: str,
         recurring_generation: ValidatedGenerationPipeline,
     ):
         self.sessions = sessions
@@ -230,11 +236,13 @@ class AgentRuntime:
         self.revisions = revisions
         self.semantic = semantic
         self.classifier = classifier
+        self.boundary_classifier = boundary_classifier
         self.recurrence = recurrence
         self.triggers = triggers
         self.outbox = outbox
         self.health = health
         self.owner_chat_id = owner_chat_id
+        self.owner_timezone = owner_timezone
         self.recurring_generation = recurring_generation
         self._recovery_pass = True
 
@@ -246,6 +254,10 @@ class AgentRuntime:
             ("beeper", self._poll_beeper),
             ("inbound-worker", self._process_revisions),
             ("task-lifecycle", lambda: self._sweep_tasks(timestamp)),
+            (
+                "owner-notifications",
+                lambda: self._notify_nobody_available(timestamp),
+            ),
             ("scheduler", lambda: self._poll_recurrence(timestamp)),
             ("recurring-coordination", self._initialize_recurring_tasks),
             ("trigger-worker", lambda: self._poll_triggers(timestamp)),
@@ -296,7 +308,23 @@ class AgentRuntime:
                 )
             )
         for update_id in pending:
-            self.control.process(update_id)
+            try:
+                self.control.process(update_id)
+            except Exception:
+                with self.sessions.begin() as session:
+                    update = session.get(TelegramUpdate, update_id)
+                    if update is not None and update.status.value == "PENDING":
+                        OutboxService(session).create_owner(
+                            telegram_chat_id=self.owner_chat_id,
+                            final_text=(
+                                f"Telegram command {update.telegram_update_id} could not be processed "
+                                "and remains pending for retry."
+                            ),
+                            message_kind=MessageKind.NOTIFICATION,
+                            idempotency_key=f"telegram-update:{update.id}:processing-failed",
+                            parent_terminal_policy=ParentTerminalPolicy.SURVIVE,
+                        )
+                raise
 
     def _poll_beeper(self) -> None:
         self.beeper.poll_inbound()
@@ -329,7 +357,9 @@ class AgentRuntime:
                         session,
                         semantic=self.semantic,
                         classifier=self.classifier,
+                        boundary_classifier=self.boundary_classifier,
                         owner_chat_id=self.owner_chat_id,
+                        owner_timezone=self.owner_timezone,
                     ).prepare(revision_id)
             except ModelUnavailable as exc:
                 self.revisions.fail(
@@ -366,7 +396,9 @@ class AgentRuntime:
                     session,
                     semantic=self.semantic,
                     classifier=self.classifier,
+                    boundary_classifier=self.boundary_classifier,
                     owner_chat_id=self.owner_chat_id,
+                    owner_timezone=self.owner_timezone,
                 ).apply_prepared(revision_id, plan)
 
             self.revisions.commit(claim, apply)
@@ -405,6 +437,12 @@ class AgentRuntime:
         for definition_id in definition_ids:
             with self.sessions.begin() as session:
                 self.recurrence.poll_definition(session, definition_id, now=now)
+
+    def _notify_nobody_available(self, now: datetime) -> None:
+        NobodyAvailableNotifier(
+            self.sessions,
+            owner_chat_id=self.owner_chat_id,
+        ).run(now=now)
 
     def _poll_triggers(self, now: datetime) -> None:
         with self.sessions() as session:
@@ -531,6 +569,7 @@ def build_runtime(
     validator_backend: ModelBackend | None = None,
     telegram: TelegramBotAdapter | None = None,
     beeper: BeeperDesktopAdapter | None = None,
+    task_parser_clock: Callable[[], datetime] | None = None,
 ) -> AgentRuntime:
     settings = app.settings
     sessions = app.sessions
@@ -548,12 +587,14 @@ def build_runtime(
         validator=independent_validator,
     )
     classifier = MessageClassifier(primary_backend)
+    boundary_classifier = ModelContactBoundaryClassifier(primary_backend)
     handler = ProductionOwnerCommandHandler(
         sessions,
         owner_chat_id=settings.owner_chat_id,
         resolver=EntityResolverAssistant(primary_backend),
         generation=generation,
         classifier=classifier,
+        owner_timezone=getattr(settings, "owner_timezone", "UTC"),
     )
     telegram = telegram or TelegramBotAdapter(
         token=settings.telegram_bot_token,
@@ -569,17 +610,30 @@ def build_runtime(
     control = TelegramControlGateway(
         sessions,
         owner_id=settings.owner_id,
-        parser=TaskParser(primary_backend),
+        parser=TaskParser(
+            primary_backend,
+            owner_timezone=getattr(settings, "owner_timezone", "UTC"),
+            clock=task_parser_clock,
+        ),
         handler=handler,
     )
     facts = DatabaseContextProvider()
     outbox = OutboxWorker(
         sessions,
-        revalidator=PolicyRevalidator(facts=facts),
+        revalidator=PolicyRevalidator(
+            facts=facts,
+            owner_chat_id=settings.owner_chat_id,
+            owner_timezone=getattr(settings, "owner_timezone", "UTC"),
+        ),
         validator=OutboxValidatorGate(
             sessions,
             validator=independent_validator,
-            contexts=DatabaseValidatorContextProvider(sessions, facts=facts),
+            contexts=DatabaseValidatorContextProvider(
+                sessions,
+                facts=facts,
+                owner_chat_id=settings.owner_chat_id,
+                owner_timezone=getattr(settings, "owner_timezone", "UTC"),
+            ),
             owner_chat_id=settings.owner_chat_id,
         ),
         adapters={Transport.BEEPER: beeper, Transport.TELEGRAM: telegram},
@@ -604,10 +658,12 @@ def build_runtime(
         revisions=RevisionProcessor(sessions),
         semantic=SemanticCorrelationFallback(primary_backend),
         classifier=classifier,
+        boundary_classifier=boundary_classifier,
         recurrence=recurrence,
         triggers=triggers,
         outbox=outbox,
         health=HealthMonitor(owner_chat_id=settings.owner_chat_id),
         owner_chat_id=settings.owner_chat_id,
+        owner_timezone=getattr(settings, "owner_timezone", "UTC"),
         recurring_generation=generation,
     )

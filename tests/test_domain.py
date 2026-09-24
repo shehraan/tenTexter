@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from ten_texter.domain import (
     AvailabilityService,
@@ -46,6 +46,7 @@ from ten_texter.models import (
     DisclosureGrant,
     OutboxMessage,
     Proposal,
+    TaskInstance,
     TaskTrigger,
     TriggerExecution,
 )
@@ -61,6 +62,50 @@ def test_task_creation_rejects_unpinned_person(db_session: Session) -> None:
             topic_key="Bad Route",
             participants=[(9999, core["conversation"].id)],  # type: ignore[union-attr]
         )
+
+
+def test_task_service_rejects_naive_authoritative_scheduled_at(
+    db_session: Session,
+) -> None:
+    with pytest.raises(DomainError, match="timezone-aware"):
+        TaskService(db_session).create(
+            scheduled_at=datetime(2026, 8, 30, 17),
+            duration_minutes=60,
+            topic_key="tennis",
+        )
+
+
+def test_task_service_normalizes_authoritative_scheduled_at_to_utc(
+    db_session: Session,
+) -> None:
+    task = TaskService(db_session).create(
+        scheduled_at=datetime.fromisoformat("2026-08-30T17:00:00-04:00"),
+        duration_minutes=60,
+        topic_key="tennis",
+    )
+
+    assert task.scheduled_at.tzinfo is UTC
+    assert task.scheduled_at.isoformat() == "2026-08-30T21:00:00+00:00"
+
+
+def test_task_service_reschedule_rejects_naive_and_normalizes_to_utc(
+    db_session: Session,
+) -> None:
+    task = seed_core(db_session)["task"]
+    original_scheduled_at = task.scheduled_at
+    service = TaskService(db_session)
+
+    with pytest.raises(DomainError, match="timezone-aware"):
+        service.reschedule(task.id, datetime(2026, 8, 31, 17))
+    assert task.scheduled_at == original_scheduled_at
+
+    service.reschedule(
+        task.id,
+        datetime.fromisoformat("2026-08-31T17:00:00-04:00"),
+    )
+
+    assert task.scheduled_at.tzinfo is UTC
+    assert task.scheduled_at.isoformat() == "2026-08-31T21:00:00+00:00"
 
 
 def test_terminalization_is_atomic_and_respects_survive(db_session: Session) -> None:
@@ -316,3 +361,133 @@ def test_proposal_revalidates_precondition(db_session: Session) -> None:
     ProposalService(db_session).resolve(proposal.id, accept=True)
     assert proposal.status is ProposalStatus.SUPERSEDED
     assert core["task"].location is None
+
+
+def test_accepted_schedule_proposal_reuses_task_reschedule_invariants(
+    db_session: Session,
+) -> None:
+    core = seed_core(db_session)
+    destination_id = _second_conversation(db_session, core)
+    grant = DisclosureGrant(
+        source_person_id=core["person"].id,
+        source_conversation_id=core["conversation"].id,
+        destination_conversation_id=destination_id,
+        task_instance_id=core["task"].id,
+        status=DisclosureGrantStatus.ACTIVE,
+        expires_at=core["task"].scheduled_at + timedelta(minutes=60),
+    )
+    proposal = Proposal(
+        task_instance_id=core["task"].id,
+        proposed_by_participant_id=core["participant"].id,
+        source_message_revision_id=core["revision"].id,
+        field="scheduled_at",
+        operation="SET",
+        old_value=core["task"].scheduled_at.isoformat(),
+        proposed_value="2026-08-31T21:00:00Z",
+        status=ProposalStatus.PENDING,
+    )
+    db_session.add_all([grant, proposal])
+    db_session.flush()
+
+    ProposalService(db_session).resolve(proposal.id, accept=True)
+
+    assert proposal.status is ProposalStatus.ACCEPTED
+    assert core["task"].scheduled_at.isoformat() == "2026-08-31T21:00:00+00:00"
+    assert grant.expires_at.isoformat() == "2026-08-31T22:00:00+00:00"
+
+
+@pytest.mark.parametrize(
+    ("field", "old_value", "proposed_value"),
+    [
+        ("scheduled_at", "2026-08-27T15:00:00+00:00", "2026-08-31T21:00:00"),
+        ("duration_minutes", 60, "not-a-number"),
+        ("location", None, {"invented": "location"}),
+    ],
+)
+def test_invalid_proposal_values_are_superseded_without_mutation(
+    db_session: Session,
+    field: str,
+    old_value: object,
+    proposed_value: object,
+) -> None:
+    core = seed_core(db_session)
+    original = (
+        core["task"].scheduled_at,
+        core["task"].duration_minutes,
+        core["task"].location,
+    )
+    proposal = Proposal(
+        task_instance_id=core["task"].id,
+        proposed_by_participant_id=core["participant"].id,
+        source_message_revision_id=core["revision"].id,
+        field=field,
+        operation="SET",
+        old_value=old_value,
+        proposed_value=proposed_value,
+        status=ProposalStatus.PENDING,
+    )
+    db_session.add(proposal)
+    db_session.flush()
+
+    ProposalService(db_session).resolve(proposal.id, accept=True)
+
+    assert proposal.status is ProposalStatus.SUPERSEDED
+    assert (
+        core["task"].scheduled_at,
+        core["task"].duration_minutes,
+        core["task"].location,
+    ) == original
+
+
+def test_null_location_precondition_does_not_match_existing_location(
+    db_session: Session,
+) -> None:
+    core = seed_core(db_session)
+    core["task"].location = "the courts"
+    db_session.flush()
+    proposal = Proposal(
+        task_instance_id=core["task"].id,
+        proposed_by_participant_id=core["participant"].id,
+        source_message_revision_id=core["revision"].id,
+        field="location",
+        operation="SET",
+        old_value=None,
+        proposed_value="the park",
+        status=ProposalStatus.PENDING,
+    )
+    db_session.add(proposal)
+    db_session.flush()
+
+    ProposalService(db_session).resolve(proposal.id, accept=True)
+
+    assert proposal.status is ProposalStatus.SUPERSEDED
+    assert core["task"].location == "the courts"
+
+
+def test_schedule_proposal_precondition_survives_sqlite_reload(
+    db_session: Session,
+) -> None:
+    core = seed_core(db_session)
+    db_session.commit()
+    factory = sessionmaker(bind=db_session.bind, expire_on_commit=False, autoflush=False)
+
+    with factory() as session:
+        task = session.get(TaskInstance, core["task"].id)
+        assert task is not None
+        proposal = Proposal(
+            task_instance_id=task.id,
+            proposed_by_participant_id=core["participant"].id,
+            source_message_revision_id=core["revision"].id,
+            field="scheduled_at",
+            operation="SET",
+            old_value="2026-08-27T15:00:00+00:00",
+            proposed_value="2026-08-31T21:00:00+00:00",
+            status=ProposalStatus.PENDING,
+        )
+        session.add(proposal)
+        session.flush()
+
+        ProposalService(session).resolve(proposal.id, accept=True)
+
+        assert proposal.status is ProposalStatus.ACCEPTED
+        assert task.scheduled_at.isoformat() == "2026-08-31T21:00:00+00:00"

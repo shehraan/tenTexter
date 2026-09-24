@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 def _optional_int(value: str | None) -> int | None:
@@ -27,6 +28,7 @@ class Settings:
     beeper_token: str | None = None
     primary_model_url: str = "http://127.0.0.1:8001"
     validator_model_url: str = "http://127.0.0.1:8002"
+    owner_timezone: str = "UTC"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -44,9 +46,14 @@ class Settings:
             beeper_token=env.get("TEN_TEXTER_BEEPER_TOKEN") or None,
             primary_model_url=env.get("TEN_TEXTER_PRIMARY_MODEL_URL", defaults.primary_model_url),
             validator_model_url=env.get("TEN_TEXTER_VALIDATOR_MODEL_URL", defaults.validator_model_url),
+            owner_timezone=env.get("TEN_TEXTER_OWNER_TIMEZONE", defaults.owner_timezone),
         )
 
     def validate_runtime(self) -> None:
+        try:
+            ZoneInfo(self.owner_timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("owner timezone must be a valid IANA timezone") from exc
         if self.real_transports_enabled:
             if not self.telegram_bot_token or not self.beeper_token:
                 raise ValueError("real transports require Telegram and Beeper credentials")

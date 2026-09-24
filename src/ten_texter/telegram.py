@@ -32,6 +32,50 @@ class OwnerCommandHandler(Protocol):
     def apply_decision(self, session: Session, decision_id: int, payload: dict[str, Any], update: TelegramUpdate) -> None: ...
 
 
+class TelegramTransportError(RuntimeError):
+    """Safe transport error whose text never contains the tokenized Bot API URL."""
+
+
+def _redact_token(value: str, token: str | None) -> str:
+    return value.replace(token, "<REDACTED>") if token else value
+
+
+def _telegram_failure(
+    operation: str,
+    *,
+    token: str | None,
+    response: httpx.Response | None = None,
+    exception: Exception | None = None,
+    fallback: str | None = None,
+) -> str:
+    parts = [f"Telegram {operation} failed"]
+    payload: dict[str, Any] = {}
+    if response is not None:
+        parts.append(f"HTTP {response.status_code}")
+        try:
+            candidate = response.json()
+        except Exception:
+            candidate = None
+        if isinstance(candidate, dict):
+            payload = candidate
+    error_code = payload.get("error_code")
+    if isinstance(error_code, (int, str)) and not isinstance(error_code, bool):
+        parts.append(f"code {error_code}")
+    description = payload.get("description")
+    if isinstance(description, str) and description.strip():
+        detail = description.strip()
+    elif fallback is not None:
+        detail = fallback
+    elif exception is not None:
+        detail = type(exception).__name__
+    else:
+        detail = None
+    message = " (" + ", ".join(parts[1:]) + ")" if len(parts) > 1 else ""
+    if detail is not None:
+        message += f": {detail}"
+    return _redact_token(parts[0] + message, token)
+
+
 @dataclass(frozen=True, slots=True)
 class ReceivedUpdate:
     outcome: str
@@ -41,15 +85,21 @@ class ReceivedUpdate:
 def _extract(raw: dict[str, Any]) -> tuple[int | None, int | None, str | None, str | None, int | None]:
     callback = raw.get("callback_query")
     if isinstance(callback, dict):
-        sender = callback.get("from", {}).get("id")
-        message = callback.get("message") or {}
-        chat = message.get("chat") or {}
+        sender_payload = callback.get("from")
+        sender = sender_payload.get("id") if isinstance(sender_payload, dict) else None
+        message = callback.get("message")
+        message = message if isinstance(message, dict) else {}
+        chat = message.get("chat")
+        chat = chat if isinstance(chat, dict) else {}
         return sender, chat.get("id"), chat.get("type"), callback.get("data"), None
     message = raw.get("message")
     if isinstance(message, dict):
-        sender = message.get("from", {}).get("id")
-        chat = message.get("chat") or {}
-        reply = message.get("reply_to_message") or {}
+        sender_payload = message.get("from")
+        sender = sender_payload.get("id") if isinstance(sender_payload, dict) else None
+        chat = message.get("chat")
+        chat = chat if isinstance(chat, dict) else {}
+        reply = message.get("reply_to_message")
+        reply = reply if isinstance(reply, dict) else {}
         return sender, chat.get("id"), chat.get("type"), message.get("text"), reply.get("message_id")
     return None, None, None, None, None
 
@@ -73,12 +123,43 @@ class TelegramControlGateway:
     def receive(self, raw: dict[str, Any]) -> ReceivedUpdate:
         update_id = raw.get("update_id")
         sender_id, chat_id, chat_type, _text, _reply = _extract(raw)
-        if not isinstance(update_id, int) or sender_id != self.owner_id:
-            return ReceivedUpdate("UNAUTHORIZED")
-        if self.require_private_chat and chat_type != "private":
-            return ReceivedUpdate("UNAUTHORIZED")
-        if not isinstance(chat_id, int):
+        if not isinstance(update_id, int) or isinstance(update_id, bool):
             return ReceivedUpdate("UNSUPPORTED")
+        rejection: str | None = None
+        if (
+            not isinstance(sender_id, int)
+            or isinstance(sender_id, bool)
+            or sender_id != self.owner_id
+        ):
+            rejection = "unauthorized sender"
+        elif self.require_private_chat and chat_type != "private":
+            rejection = "owner control requires a private chat"
+        elif not isinstance(chat_id, int) or isinstance(chat_id, bool):
+            rejection = "update has no supported chat"
+        if rejection is not None:
+            with self.sessions.begin() as session:
+                existing = session.scalar(
+                    select(TelegramUpdate).where(
+                        TelegramUpdate.telegram_update_id == update_id
+                    )
+                )
+                if existing is not None:
+                    return ReceivedUpdate("DUPLICATE", existing.id)
+                row = TelegramUpdate(
+                    telegram_update_id=update_id,
+                    sender_user_id=sender_id
+                    if isinstance(sender_id, int) and not isinstance(sender_id, bool)
+                    else None,
+                    chat_id=chat_id
+                    if isinstance(chat_id, int) and not isinstance(chat_id, bool)
+                    else None,
+                    payload_json=raw,
+                    status=TelegramUpdateStatus.FAILED,
+                    error_details=rejection,
+                )
+                session.add(row)
+                session.flush()
+                return ReceivedUpdate("FAILED", row.id)
         with self.sessions.begin() as session:
             existing = session.scalar(
                 select(TelegramUpdate).where(TelegramUpdate.telegram_update_id == update_id)
@@ -110,7 +191,15 @@ class TelegramControlGateway:
         prepared: object | None = None
         if decision_id is None:
             if not isinstance(text, str) or not text.strip():
-                raise DomainError("owner update has no supported instruction")
+                with self.sessions.begin() as session:
+                    update = session.get(TelegramUpdate, row_id)
+                    if update is None:
+                        raise DomainError("Telegram update not found")
+                    if update.status is not TelegramUpdateStatus.PENDING:
+                        return update.status
+                    update.status = TelegramUpdateStatus.FAILED
+                    update.error_details = "owner update has no supported instruction"
+                    return update.status
             parsed = self.parser.parse(text)
             prepare = getattr(self.handler, "prepare_command", None)
             prepared = prepare(parsed, update) if prepare is not None else parsed
@@ -189,11 +278,61 @@ class TelegramBotAdapter:
         params: dict[str, object] = {"timeout": timeout, "allowed_updates": ["message", "callback_query"]}
         if offset is not None:
             params["offset"] = offset
-        response = self.client.get(f"{self.base_url}/getUpdates", params=params)
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("ok") is not True or not isinstance(payload.get("result"), list):
-            raise RuntimeError("invalid Telegram getUpdates response")
+        try:
+            response = self.client.get(f"{self.base_url}/getUpdates", params=params)
+        except Exception as exc:
+            raise TelegramTransportError(
+                _telegram_failure("getUpdates", token=self.token, exception=exc)
+            ) from None
+        try:
+            response.raise_for_status()
+        except Exception as exc:
+            raise TelegramTransportError(
+                _telegram_failure(
+                    "getUpdates",
+                    token=self.token,
+                    response=response,
+                    exception=exc,
+                )
+            ) from None
+        try:
+            payload = response.json()
+        except Exception:
+            raise TelegramTransportError(
+                _telegram_failure(
+                    "getUpdates",
+                    token=self.token,
+                    response=response,
+                    fallback="invalid JSON response",
+                )
+            ) from None
+        if (
+            not isinstance(payload, dict)
+            or payload.get("ok") is not True
+            or not isinstance(payload.get("result"), list)
+        ):
+            raise TelegramTransportError(
+                _telegram_failure(
+                    "getUpdates",
+                    token=self.token,
+                    response=response,
+                    fallback="invalid response payload",
+                )
+            )
+        if any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("update_id"), int)
+            or isinstance(item.get("update_id"), bool)
+            for item in payload["result"]
+        ):
+            raise TelegramTransportError(
+                _telegram_failure(
+                    "getUpdates",
+                    token=self.token,
+                    response=response,
+                    fallback="invalid update item",
+                )
+            )
         return payload["result"]
 
     def send(self, request: DeliveryRequest) -> DeliveryResult:
@@ -207,11 +346,41 @@ class TelegramBotAdapter:
                 json={"chat_id": int(request.destination), "text": request.text},
             )
         except Exception as exc:
-            return DeliveryResult(False, True, error=str(exc))
+            error_response = exc.response if isinstance(exc, httpx.HTTPStatusError) else None
+            return DeliveryResult(
+                False,
+                True,
+                error=_telegram_failure(
+                    "sendMessage",
+                    token=self.token,
+                    response=error_response,
+                    exception=exc,
+                ),
+            )
         try:
             payload = response.json()
-        except Exception as exc:
-            return DeliveryResult(False, True, error=f"invalid Telegram response: {exc}")
+        except Exception:
+            return DeliveryResult(
+                False,
+                True,
+                error=_telegram_failure(
+                    "sendMessage",
+                    token=self.token,
+                    response=response,
+                    fallback="invalid JSON response",
+                ),
+            )
+        if not isinstance(payload, dict):
+            return DeliveryResult(
+                False,
+                True,
+                error=_telegram_failure(
+                    "sendMessage",
+                    token=self.token,
+                    response=response,
+                    fallback="invalid response payload",
+                ),
+            )
         if response.is_success and payload.get("ok") is True:
             result = payload.get("result") or {}
             message_id = result.get("message_id")
@@ -220,7 +389,12 @@ class TelegramBotAdapter:
             False,
             True,
             definitely_not_sent=payload.get("ok") is False,
-            error=str(payload.get("description") or response.status_code),
+            error=_telegram_failure(
+                "sendMessage",
+                token=self.token,
+                response=response,
+                fallback="invalid response payload",
+            ),
         )
 
     def reconcile(

@@ -89,6 +89,11 @@ Join between Conversation and Identity.
 
 `UNIQUE(conversation_id, identity_id)`.
 
+### BeeperSyncCheckpoint
+Durable provider synchronization progress. One singleton row owns the global chat-feed cursor; one row per Conversation owns its message-feed cursor, bounded bootstrap progress, and recent reconciliation progress. Provider cursors are opaque and never become message identity or ordering state.
+
+v1 uses REST polling only. Initial backfill and best-effort edit/deletion reconciliation cover the most recent 30 days. New-message discovery resumes from durable cursors. Because Beeper does not provide a documented replay guarantee for changes made while the app is offline, absence from a page is never treated as deletion; only an explicit provider deletion tombstone creates a deleted MessageRevision.
+
 ### TaskDefinition
 Reusable/recurring coordination template.
 
@@ -400,10 +405,12 @@ Examples:
 - ambiguous participant reply with two active requests => ASK_PARTICIPANT
 - counterproposal => ASK_ME
 - unauthorized new recipient => ASK_ME
-- mass contact => ASK_ME
+- more than 25 distinct logical TaskParticipants in one TaskInstance => ASK_ME before any participant send; approval is scoped to that TaskInstance only
 - participant asks not to be contacted about a topic => persistent ContactRule
 
 Explicit owner-approved narrow exception points to exactly one original blocking ContactRule; one original may have multiple exceptions over time.
+
+Participant boundary requests are classified independently of availability and proposals. Explicit GLOBAL, TOPIC, and TASK_INSTANCE requests become STRONG participant-requested `DO_NOT_CONTACT` rules. Ambiguous scope creates an owner DecisionRequest and a temporary send hold. TASK_INSTANCE boundaries are absolute; broader boundaries permit only an owner-approved TASK_INSTANCE `ALLOW` exception. The original Outbox remains PENDING while that exception decision is pending.
 
 ## Disclosure policy
 

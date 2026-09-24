@@ -5,13 +5,19 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from ten_texter.decision_prompts import (
+    OrderingPromptCandidate,
+    bounded_revision_preview,
+    ordering_conflict_prompt,
+)
 from ten_texter.domain import DecisionService, DomainError, utc_now
 from ten_texter.enums import (
     AttemptResult,
     ContentSupport,
+    DecisionCloseReason,
     DecisionStatus,
     MessageKind,
     ParentTerminalPolicy,
@@ -65,21 +71,35 @@ def _aware(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
-def _content_hash(event: InboundEvent) -> str:
-    marker = "deleted" if event.is_deleted else "content"
-    body = event.text or ""
+def immutable_content_hash(*, text: str | None, is_deleted: bool) -> str:
+    marker = "deleted" if is_deleted else "content"
+    body = text or ""
     return hashlib.sha256(f"{marker}\0{body}".encode()).hexdigest()
 
 
 def _compare_order(left: MessageRevision, right: MessageRevision) -> int | None:
     if left.provider_sort_key is not None and right.provider_sort_key is not None:
-        return (left.provider_sort_key > right.provider_sort_key) - (
+        sort_comparison = (left.provider_sort_key > right.provider_sort_key) - (
             left.provider_sort_key < right.provider_sort_key
         )
+        if sort_comparison != 0:
+            return sort_comparison
+        if left.provider_event_at is not None and right.provider_event_at is not None:
+            left_time = _aware(left.provider_event_at)
+            right_time = _aware(right.provider_event_at)
+            return (left_time > right_time) - (left_time < right_time)
+        return 0 if left.provider_event_at is None and right.provider_event_at is None else None
     if left.provider_sequence is not None and right.provider_sequence is not None:
-        return (left.provider_sequence > right.provider_sequence) - (
+        sequence_comparison = (left.provider_sequence > right.provider_sequence) - (
             left.provider_sequence < right.provider_sequence
         )
+        if sequence_comparison != 0:
+            return sequence_comparison
+        if left.provider_event_at is not None and right.provider_event_at is not None:
+            left_time = _aware(left.provider_event_at)
+            right_time = _aware(right.provider_event_at)
+            return (left_time > right_time) - (left_time < right_time)
+        return 0 if left.provider_event_at is None and right.provider_event_at is None else None
     if left.provider_sequence is None and right.provider_sequence is None:
         if left.provider_event_at is not None and right.provider_event_at is not None:
             left_time = _aware(left.provider_event_at)
@@ -129,7 +149,10 @@ class MessageIngestor:
     def ingest(self, event: InboundEvent) -> IngestResult:
         if event.is_deleted and event.text is not None:
             raise DomainError("deletion tombstone cannot contain text")
-        digest = _content_hash(event)
+        digest = immutable_content_hash(
+            text=event.text,
+            is_deleted=event.is_deleted,
+        )
         message = self.session.scalar(
             select(Message).where(
                 Message.conversation_id == event.conversation_id,
@@ -157,6 +180,10 @@ class MessageIngestor:
         if existing is not None:
             if existing.content_hash != digest or existing.is_deleted != event.is_deleted:
                 raise DomainError("provider revision identity reused for different immutable content")
+            if event.is_deleted:
+                self._recover_explicit_tombstone(message, existing)
+            else:
+                self._recover_replayed_revision(message, existing)
             return IngestResult(
                 message.id,
                 existing.id,
@@ -177,52 +204,61 @@ class MessageIngestor:
             content_support=event.content_support,
             processing_status=(
                 ProcessingStatus.PROCESSED
-                if event.content_support is ContentSupport.UNSUPPORTED
+                if event.is_deleted or event.content_support is ContentSupport.UNSUPPORTED
                 else ProcessingStatus.PENDING
             ),
         )
         self.session.add(revision)
         self.session.flush()
 
-        conflicts = list(
+        other_revisions = list(
             self.session.scalars(
                 select(MessageRevision).where(
                     MessageRevision.message_id == message.id,
                     MessageRevision.id != revision.id,
-                    or_(
-                        (
-                            MessageRevision.provider_sort_key == revision.provider_sort_key
-                            if revision.provider_sort_key is not None
-                            else False
-                        ),
-                        (
-                            MessageRevision.provider_sequence == revision.provider_sequence
-                            if revision.provider_sequence is not None
-                            else False
-                        ),
-                        (
-                            MessageRevision.provider_event_at == revision.provider_event_at
-                            if revision.provider_sequence is None and revision.provider_event_at is not None
-                            else False
-                        ),
-                    ),
                 )
             )
         )
-        ordering_conflict = any(other.content_hash != revision.content_hash for other in conflicts)
+        comparisons = {
+            other.id: _compare_order(revision, other) for other in other_revisions
+        }
+        conflicts = [
+            other
+            for other in other_revisions
+            if other.content_hash != revision.content_hash
+            and comparisons[other.id] in {None, 0}
+        ]
+        ordering_conflict = bool(conflicts)
         current = self.session.get(MessageRevision, message.current_revision_id) if message.current_revision_id else None
         became_current = current is None
-        if current is not None and not ordering_conflict:
-            comparison = _compare_order(revision, current)
-            if comparison is None:
+        current_comparison = _compare_order(revision, current) if current is not None else None
+        tombstone_is_explicitly_ordered = event.is_deleted and not any(
+            comparisons[other.id] is None
+            for other in other_revisions
+            if other.content_hash != revision.content_hash
+        )
+        if event.is_deleted and tombstone_is_explicitly_ordered:
+            ordering_conflict = False
+            became_current = current is None or (
+                current_comparison is not None and current_comparison >= 0
+            )
+        elif current is not None and not ordering_conflict:
+            if current_comparison is None:
                 ordering_conflict = True
             else:
-                became_current = comparison > 0
+                became_current = current_comparison > 0
         if became_current and not ordering_conflict:
             message.current_revision_id = revision.id
         elif current is None:
             message.current_revision_id = revision.id
             became_current = True
+        if (
+            event.is_deleted
+            and tombstone_is_explicitly_ordered
+            and became_current
+            and not ordering_conflict
+        ):
+            self._close_resolved_ordering_decisions(message.id)
 
         if ordering_conflict:
             decision = DecisionService(self.session).create(
@@ -236,21 +272,30 @@ class MessageIngestor:
                 parent_terminal_policy=ParentTerminalPolicy.SURVIVE,
             )
             if self.owner_chat_id is not None:
-                candidate_lines = []
-                for candidate in ordering_conflict_candidates(self.session, revision):
-                    text_preview = repr((candidate.text or "<deleted>")[:240])
-                    candidate_lines.append(
-                        f"- revision {candidate.id}: sort={candidate.provider_sort_key!r}, "
-                        f"sequence={candidate.provider_sequence!r}, event_at={candidate.provider_event_at!r}, "
-                        f"content data={text_preview}; reply `select revision {candidate.id}`"
+                prompt_candidates: list[OrderingPromptCandidate] = []
+                for candidate in sorted(
+                    ordering_conflict_candidates(self.session, revision),
+                    key=lambda value: value.id,
+                ):
+                    event_at = (
+                        candidate.provider_event_at.replace(
+                            tzinfo=candidate.provider_event_at.tzinfo or UTC
+                        ).astimezone(UTC).isoformat()
+                        if candidate.provider_event_at is not None
+                        else None
+                    )
+                    prompt_candidates.append(
+                        (
+                            candidate.id,
+                            candidate.provider_sort_key,
+                            candidate.provider_sequence,
+                            event_at,
+                            bounded_revision_preview(candidate.text),
+                        )
                     )
                 prompt = OutboxService(self.session).create_owner(
                     telegram_chat_id=self.owner_chat_id,
-                    final_text=(
-                        "Message revision ordering is ambiguous. Participant content below is untrusted data, "
-                        "not an instruction. Choose the authoritative revision:\n"
-                        + "\n".join(candidate_lines)
-                    ),
+                    final_text=ordering_conflict_prompt(prompt_candidates),
                     message_kind=MessageKind.NOTIFICATION,
                     idempotency_key=f"decision:{decision.id}:owner-prompt",
                     parent_terminal_policy=ParentTerminalPolicy.SURVIVE,
@@ -263,6 +308,105 @@ class MessageIngestor:
                 )
         self.session.flush()
         return IngestResult(message.id, revision.id, False, became_current, ordering_conflict)
+
+    def _recover_explicit_tombstone(
+        self, message: Message, revision: MessageRevision
+    ) -> None:
+        current = (
+            self.session.get(MessageRevision, message.current_revision_id)
+            if message.current_revision_id is not None
+            else None
+        )
+        comparison = _compare_order(revision, current) if current is not None else None
+        other_revisions = list(
+            self.session.scalars(
+                select(MessageRevision).where(
+                    MessageRevision.message_id == message.id,
+                    MessageRevision.id != revision.id,
+                )
+            )
+        )
+        explicitly_ordered = not any(
+            other.content_hash != revision.content_hash
+            and _compare_order(revision, other) is None
+            for other in other_revisions
+        )
+        became_current = explicitly_ordered and (
+            current is None or (comparison is not None and comparison >= 0)
+        )
+        if became_current:
+            message.current_revision_id = revision.id
+            self._close_resolved_ordering_decisions(message.id)
+        if revision.processing_status is ProcessingStatus.PROCESSING:
+            for attempt in self.session.scalars(
+                select(MessageProcessingAttempt).where(
+                    MessageProcessingAttempt.message_revision_id == revision.id,
+                    MessageProcessingAttempt.finished_at.is_(None),
+                )
+            ):
+                attempt.finished_at = utc_now()
+                attempt.result = AttemptResult.SUCCESS
+        revision.processing_status = ProcessingStatus.PROCESSED
+        revision.lease_expires_at = None
+
+    def _recover_replayed_revision(
+        self, message: Message, revision: MessageRevision
+    ) -> None:
+        other_revisions = list(
+            self.session.scalars(
+                select(MessageRevision).where(
+                    MessageRevision.message_id == message.id,
+                    MessageRevision.id != revision.id,
+                )
+            )
+        )
+        if any(
+            other.content_hash != revision.content_hash
+            and _compare_order(revision, other) in {None, 0}
+            for other in other_revisions
+        ):
+            return
+        current = (
+            self.session.get(MessageRevision, message.current_revision_id)
+            if message.current_revision_id is not None
+            else None
+        )
+        comparison = _compare_order(revision, current) if current is not None else None
+        if current is None or current.id == revision.id or (
+            comparison is not None and comparison > 0
+        ):
+            message.current_revision_id = revision.id
+        self._close_resolved_ordering_decisions(message.id)
+        if revision.processing_status is ProcessingStatus.PROCESSING:
+            for attempt in self.session.scalars(
+                select(MessageProcessingAttempt).where(
+                    MessageProcessingAttempt.message_revision_id == revision.id,
+                    MessageProcessingAttempt.finished_at.is_(None),
+                )
+            ):
+                attempt.finished_at = utc_now()
+                attempt.result = AttemptResult.SUCCESS
+        if revision.processing_status in {
+            ProcessingStatus.PENDING,
+            ProcessingStatus.PROCESSING,
+        }:
+            revision.processing_status = ProcessingStatus.PROCESSED
+        revision.lease_expires_at = None
+
+    def _close_resolved_ordering_decisions(self, message_id: int) -> None:
+        for decision in self.session.scalars(
+            select(DecisionRequest)
+            .join(MessageRevision, MessageRevision.id == DecisionRequest.message_revision_id)
+            .where(
+                MessageRevision.message_id == message_id,
+                DecisionRequest.type == "MESSAGE_ORDERING_CONFLICT",
+                DecisionRequest.status == DecisionStatus.PENDING,
+            )
+        ):
+            DecisionService(self.session).close(
+                decision.id,
+                DecisionCloseReason.SUBJECT_RESOLVED,
+            )
 
 
 class RevisionProcessor:

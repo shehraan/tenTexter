@@ -17,6 +17,10 @@ Examples:
 
 Audit rows may describe state but must not become competing authorities.
 
+`BeeperSyncCheckpoint` is the sole owner of Beeper polling progress. Checkpoint advancement and ingestion of the corresponding provider page commit atomically. Provider cursors are opaque, and checkpoint state never owns message content, revision ordering, or conversation membership.
+
+Beeper synchronization fails closed on malformed/missing cursor data and retains the last committed checkpoint. New-message replay is durable; edit/deletion recovery is a bounded 30-day best effort, and deletion requires an explicit provider tombstone.
+
 ## 2. LLM boundary
 
 LLMs may:
@@ -145,7 +149,21 @@ Revocation uses `revoked_at`/`revoked_reason`; historical rows are preserved. Ap
 
 Approved exceptions use `overrides_contact_rule_id`, must not self-reference, must refer to the same Person, must be narrower/applicable to the approved context, and must not form cycles.
 
+An explicit participant-requested boundary is a STRONG `DO_NOT_CONTACT` rule. A TASK_INSTANCE participant boundary is absolute for that task. A broader participant boundary may be overridden only by an explicit owner-approved TASK_INSTANCE `ALLOW` rule referencing the blocking rule. While that decision is pending, the original immutable Outbox remains PENDING and is neither validated nor sent.
+
+Boundary classification is a bounded semantic effect separate from availability/proposal classification. Ambiguous scope creates a typed MessageRevision DecisionRequest and holds sends to that Person for the uniquely attributable task, or globally when no unique task is attributable. Editing a message never silently revokes an established boundary.
+
 ContactRules apply to logical targets, not every incidental member of a group conversation. Do not let one group member implicitly veto a whole group merely because they are present.
+
+### Mass contact
+
+Mass contact is more than 25 distinct logical TaskParticipants in one TaskInstance. Every
+participant Outbox for that task remains PENDING until the owner approves that exact
+TaskInstance through its reply-correlated DecisionRequest. Approval never carries to a
+different TaskInstance, including another occurrence of the same TaskDefinition. Owner
+cancellation terminalizes the task through the normal TaskService transition.
+
+Incidental ConversationParticipants do not count toward the threshold.
 
 ## 10. Disclosure
 

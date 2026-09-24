@@ -1,15 +1,24 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Protocol
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from ten_texter.decision_prompts import (
+    CounterproposalPromptContext,
+    correlation_ambiguity_prompt,
+    counterproposal_prompt,
+    late_terminal_message_prompt,
+)
 from ten_texter.domain import (
     AvailabilityService,
     DecisionService,
     DomainError,
+    ProposalService,
     StaleWork,
     utc_now,
 )
@@ -34,6 +43,7 @@ from ten_texter.models import (
     MessageRevision,
     OutboxDeliveryAttempt,
     OutboxMessage,
+    Person,
     Proposal,
     TaskEvent,
     TaskInstance,
@@ -41,6 +51,13 @@ from ten_texter.models import (
     DecisionRequestPrompt,
 )
 from ten_texter.outbox import OutboxService
+from ten_texter.contact_boundaries import (
+    ContactBoundary,
+    ContactBoundaryClassifier,
+    NoContactBoundaryClassifier,
+    apply_contact_boundary,
+    boundary_context,
+)
 
 
 class SemanticCorrelator(Protocol):
@@ -56,15 +73,116 @@ class AtomicProposal:
 
 
 @dataclass(frozen=True, slots=True)
+class TaskProposalContext:
+    scheduled_at: datetime
+    duration_minutes: int
+    location: str | None
+    topic_key: str
+    owner_timezone: str
+
+
+@dataclass(frozen=True, slots=True)
+class AvailabilitySubjectCandidate:
+    task_participant_id: int
+    display_name: str
+
+
+# Matches TaskPlan's v1 maximum participant-reference contract. Exact-task state
+# created outside that path can exceed it, so completeness is reported explicitly.
+MAX_AVAILABILITY_SUBJECT_CANDIDATES = 100
+
+
+@dataclass(frozen=True, slots=True)
+class AvailabilitySubjectContext:
+    candidates: tuple[AvailabilitySubjectCandidate, ...]
+    complete: bool = True
+    ambiguous_display_names: tuple[str, ...] = field(init=False)
+
+    def __post_init__(self) -> None:
+        counts: dict[str, int] = {}
+        for candidate in self.candidates:
+            normalized = " ".join(candidate.display_name.casefold().split())
+            counts[normalized] = counts.get(normalized, 0) + 1
+        object.__setattr__(
+            self,
+            "ambiguous_display_names",
+            tuple(
+                sorted(
+                    name
+                    for name, count in counts.items()
+                    if not name or count > 1
+                )
+            ),
+        )
+
+    @property
+    def selectable_ids(self) -> frozenset[int]:
+        if not self.complete:
+            return frozenset()
+        ambiguous = set(self.ambiguous_display_names)
+        return frozenset(
+            candidate.task_participant_id
+            for candidate in self.candidates
+            if " ".join(candidate.display_name.casefold().split()) not in ambiguous
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class Classification:
     kind: str
     availability: AvailabilityStatus | None = None
     evidence: AvailabilityEvidence = AvailabilityEvidence.FIRST_PARTY
+    subject_task_participant_id: int | None = None
     proposals: tuple[AtomicProposal, ...] = field(default_factory=tuple)
 
 
 class Classifier(Protocol):
-    def classify(self, revision: MessageRevision, awaited_response: AwaitedResponse) -> Classification: ...
+    def classify(
+        self,
+        revision: MessageRevision,
+        awaited_response: AwaitedResponse,
+        third_party_subject_context: AvailabilitySubjectContext,
+        task_context: TaskProposalContext | None = None,
+    ) -> Classification: ...
+
+
+def third_party_subject_context(
+    session: Session,
+    revision: MessageRevision,
+    awaited_response: AwaitedResponse,
+) -> AvailabilitySubjectContext:
+    """Return other participants from the exact correlated task as a bounded model set."""
+    awaited_participant = session.get(
+        TaskParticipant,
+        awaited_response.task_participant_id,
+    )
+    message = session.get(Message, revision.message_id)
+    sender = session.get(Identity, message.sender_identity_id) if message is not None else None
+    if awaited_participant is None or sender is None:
+        raise DomainError("availability subject context is unavailable")
+    rows = list(
+        session.execute(
+            select(TaskParticipant.id, Person.display_name)
+            .join(Person, Person.id == TaskParticipant.person_id)
+            .where(
+                TaskParticipant.task_instance_id == awaited_participant.task_instance_id,
+                TaskParticipant.person_id != sender.person_id,
+            )
+            .order_by(TaskParticipant.id)
+            .limit(MAX_AVAILABILITY_SUBJECT_CANDIDATES + 1)
+        )
+    )
+    complete = len(rows) <= MAX_AVAILABILITY_SUBJECT_CANDIDATES
+    return AvailabilitySubjectContext(
+        candidates=tuple(
+            AvailabilitySubjectCandidate(
+                task_participant_id=participant_id,
+                display_name=display_name,
+            )
+            for participant_id, display_name in rows[:MAX_AVAILABILITY_SUBJECT_CANDIDATES]
+        ),
+        complete=complete,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +200,12 @@ class PreparedCorrelation:
     classification: Classification | None = None
     candidate_ids: tuple[int, ...] = ()
     decision_type: str | None = None
+    contact_boundary: ContactBoundary = field(default_factory=lambda: ContactBoundary("NONE"))
+    boundary_person_id: int | None = None
+    boundary_task_ids: tuple[int, ...] = ()
+    boundary_topics: tuple[str, ...] = ()
+    boundary_candidates_complete: bool = True
+    boundary_attributable_task_id: int | None = None
 
 
 class CorrelationOrchestrator:
@@ -91,12 +215,16 @@ class CorrelationOrchestrator:
         *,
         semantic: SemanticCorrelator,
         classifier: Classifier,
+        boundary_classifier: ContactBoundaryClassifier | None = None,
         owner_chat_id: int | None = None,
+        owner_timezone: str = "UTC",
     ):
         self.session = session
         self.semantic = semantic
         self.classifier = classifier
+        self.boundary_classifier = boundary_classifier or NoContactBoundaryClassifier()
         self.owner_chat_id = owner_chat_id
+        self.owner_timezone = owner_timezone
 
     def prepare(self, revision_id: int) -> PreparedCorrelation:
         """Run correlation/classification reads and model calls without a write transaction."""
@@ -106,8 +234,34 @@ class CorrelationOrchestrator:
         message = self.session.get(Message, revision.message_id)
         if message is None or message.current_revision_id != revision.id:
             raise StaleWork("revision is not current")
+        def prepared(plan: PreparedCorrelation) -> PreparedCorrelation:
+            attributable_task_id = None
+            if plan.awaited_response_id is not None:
+                awaited = self.session.get(AwaitedResponse, plan.awaited_response_id)
+                participant = self.session.get(TaskParticipant, awaited.task_participant_id) if awaited else None
+                attributable_task_id = participant.task_instance_id if participant else None
+            boundary_values = boundary_context(
+                self.session,
+                revision,
+                attributable_task_id=attributable_task_id,
+            )
+            boundary = self.boundary_classifier.classify(revision, boundary_values)
+            return PreparedCorrelation(
+                outcome=plan.outcome,
+                awaited_response_id=plan.awaited_response_id,
+                source=plan.source,
+                classification=plan.classification,
+                candidate_ids=plan.candidate_ids,
+                decision_type=plan.decision_type,
+                contact_boundary=boundary,
+                boundary_person_id=boundary_values.person_id,
+                boundary_task_ids=tuple(item.task_instance_id for item in boundary_values.candidates),
+                boundary_topics=tuple(item.topic_key for item in boundary_values.candidates),
+                boundary_candidates_complete=boundary_values.complete,
+                boundary_attributable_task_id=attributable_task_id,
+            )
         if revision.awaited_response_id is not None:
-            return PreparedCorrelation("ALREADY_CORRELATED", revision.awaited_response_id)
+            return prepared(PreparedCorrelation("ALREADY_CORRELATED", revision.awaited_response_id))
 
         lineage = list(
             self.session.scalars(
@@ -122,35 +276,35 @@ class CorrelationOrchestrator:
             )
         )
         if len(lineage) == 1:
-            return self._prepare_known(revision, lineage[0], "REVISION_LINEAGE")
+            return prepared(self._prepare_known(revision, lineage[0], "REVISION_LINEAGE"))
         if len(lineage) > 1:
-            return self._prepare_ambiguous(lineage, "REVISION_LINEAGE_CONFLICT")
+            return prepared(self._prepare_ambiguous(lineage, "REVISION_LINEAGE_CONFLICT"))
 
         reply = self._reply_candidates(message)
         if reply:
             narrowed = self._narrow_to_sender(reply, message.sender_identity_id) or reply
             if len(narrowed) == 1:
-                return self._prepare_known(revision, narrowed[0], "PROVIDER_REPLY")
-            return self._prepare_ambiguous(narrowed, "CORRELATION_AMBIGUITY")
+                return prepared(self._prepare_known(revision, narrowed[0], "PROVIDER_REPLY"))
+            return prepared(self._prepare_ambiguous(narrowed, "CORRELATION_AMBIGUITY"))
 
         exact = self._exact_conversation_candidates(message)
         if len(exact) == 1:
-            return self._prepare_known(revision, exact[0], "EXACT_CONVERSATION")
+            return prepared(self._prepare_known(revision, exact[0], "EXACT_CONVERSATION"))
         if len(exact) > 1:
             relevant = self._temporally_relevant(exact, message)
             if len(relevant) == 1:
-                return self._prepare_known(revision, relevant[0], "RECENCY")
+                return prepared(self._prepare_known(revision, relevant[0], "RECENCY"))
             candidates = relevant or exact
             chosen = self.semantic.choose(revision, candidates)
             if chosen is not None and sum(item.id == chosen for item in candidates) == 1:
                 awaited = next(item for item in candidates if item.id == chosen)
-                return self._prepare_known(revision, awaited, "SEMANTIC")
-            return self._prepare_ambiguous(candidates, "CORRELATION_AMBIGUITY")
+                return prepared(self._prepare_known(revision, awaited, "SEMANTIC"))
+            return prepared(self._prepare_ambiguous(candidates, "CORRELATION_AMBIGUITY"))
 
         cross = self._same_person_other_conversation(message)
         if cross:
-            return self._prepare_ambiguous(cross, "CROSS_CONVERSATION_RESPONSE")
-        return PreparedCorrelation("UNMATCHED")
+            return prepared(self._prepare_ambiguous(cross, "CROSS_CONVERSATION_RESPONSE"))
+        return prepared(PreparedCorrelation("UNMATCHED"))
 
     def apply_prepared(self, revision_id: int, plan: PreparedCorrelation) -> CorrelationResult:
         revision = self.session.get(MessageRevision, revision_id)
@@ -159,6 +313,27 @@ class CorrelationOrchestrator:
         message = self.session.get(Message, revision.message_id)
         if message is None or message.current_revision_id != revision.id:
             raise StaleWork("revision is not current")
+        if plan.boundary_person_id is not None:
+            current_context = boundary_context(
+                self.session,
+                revision,
+                attributable_task_id=plan.boundary_attributable_task_id,
+            )
+            if (
+                current_context.person_id != plan.boundary_person_id
+                or tuple(item.task_instance_id for item in current_context.candidates) != plan.boundary_task_ids
+                or tuple(item.topic_key for item in current_context.candidates) != plan.boundary_topics
+                or current_context.complete != plan.boundary_candidates_complete
+                or current_context.attributable_task_id != plan.boundary_attributable_task_id
+            ):
+                raise StaleWork("contact-boundary candidates changed")
+            apply_contact_boundary(
+                self.session,
+                revision,
+                plan.contact_boundary,
+                current_context,
+                owner_chat_id=self.owner_chat_id,
+            )
         if plan.outcome == "ALREADY_CORRELATED":
             return CorrelationResult(plan.outcome, plan.awaited_response_id)
         if plan.outcome == "UNMATCHED":
@@ -192,11 +367,22 @@ class CorrelationOrchestrator:
         awaited: AwaitedResponse,
         source: str,
     ) -> PreparedCorrelation:
+        participant = self.session.get(TaskParticipant, awaited.task_participant_id)
+        if participant is None:
+            raise DomainError("awaited response participant not found")
+        task = self.session.get(TaskInstance, participant.task_instance_id)
+        if task is None:
+            raise DomainError("awaited response task not found")
         return PreparedCorrelation(
             outcome="KNOWN",
             awaited_response_id=awaited.id,
             source=source,
-            classification=self.classifier.classify(revision, awaited),
+            classification=self.classifier.classify(
+                revision,
+                awaited,
+                third_party_subject_context(self.session, revision, awaited),
+                self._task_proposal_context(task),
+            ),
         )
 
     @staticmethod
@@ -208,6 +394,18 @@ class CorrelationOrchestrator:
             outcome=decision_type,
             candidate_ids=tuple(candidate.id for candidate in candidates),
             decision_type=decision_type,
+        )
+
+    def _task_proposal_context(self, task: TaskInstance) -> TaskProposalContext:
+        scheduled_at = task.scheduled_at
+        if scheduled_at.tzinfo is None:
+            scheduled_at = scheduled_at.replace(tzinfo=UTC)
+        return TaskProposalContext(
+            scheduled_at=scheduled_at,
+            duration_minutes=task.duration_minutes,
+            location=task.location,
+            topic_key=task.topic_key,
+            owner_timezone=self.owner_timezone,
         )
 
     def process(self, revision_id: int) -> CorrelationResult:
@@ -359,40 +557,148 @@ class CorrelationOrchestrator:
                 "LATE_TERMINAL_MESSAGE",
                 {"awaited_response_id": awaited.id, "correlation_source": source},
                 [],
+                task_instance_id=task.id,
             )
+            if self.owner_chat_id is not None:
+                message = self.session.get(Message, revision.message_id)
+                sender = (
+                    self.session.get(Identity, message.sender_identity_id)
+                    if message is not None
+                    else None
+                )
+                person = self.session.get(Person, sender.person_id) if sender is not None else None
+                if person is None:
+                    raise DomainError("late terminal message sender is unavailable")
+                prompt = OutboxService(self.session).create_owner(
+                    telegram_chat_id=self.owner_chat_id,
+                    final_text=late_terminal_message_prompt(
+                        task_id=task.id,
+                        topic_key=task.topic_key,
+                        task_status=task.status.value,
+                        sender_name=person.display_name,
+                        revision_id=revision.id,
+                        participant_text=revision.text,
+                    ),
+                    message_kind=MessageKind.NOTIFICATION,
+                    idempotency_key=f"decision:{decision.id}:owner-prompt",
+                    task_instance_id=task.id,
+                    parent_terminal_policy=ParentTerminalPolicy.SURVIVE,
+                )
+                if self.session.scalar(
+                    select(DecisionRequestPrompt).where(
+                        DecisionRequestPrompt.outbox_message_id == prompt.id
+                    )
+                ) is None:
+                    self.session.add(
+                        DecisionRequestPrompt(
+                            decision_request_id=decision.id,
+                            outbox_message_id=prompt.id,
+                        )
+                    )
             self.session.flush()
             return CorrelationResult("LATE_TERMINAL", awaited.id, decision.id)
 
-        classification = classification or self.classifier.classify(revision, awaited)
+        classification = classification or self.classifier.classify(
+            revision,
+            awaited,
+            third_party_subject_context(self.session, revision, awaited),
+            self._task_proposal_context(task),
+        )
+        availability_target: TaskParticipant | None = None
+        if classification.kind == "AVAILABILITY" and classification.availability is not None:
+            availability_target = self._availability_target(
+                revision,
+                task,
+                classification,
+            )
+        prior_revision_ids = list(
+            self.session.scalars(
+                select(MessageRevision.id).where(
+                    MessageRevision.message_id == revision.message_id,
+                    MessageRevision.id != revision.id,
+                )
+            )
+        )
+        lineage_owns_prior_effect, independent_effect_exists = (
+            self._awaited_response_effect_ownership(
+                revision,
+                awaited,
+                participant,
+                prior_revision_ids,
+            )
+        )
+        may_replace_awaited_status = (
+            awaited.status is not AwaitedResponseStatus.SATISFIED
+            or (lineage_owns_prior_effect and not independent_effect_exists)
+        )
         proposals_to_create = self._reconcile_previous_effects(
             revision,
             participant,
             classification,
+            availability_target,
+            prior_revision_ids,
+        )
+        proposals_to_create = tuple(
+            proposal
+            for proposal in proposals_to_create
+            if not self._is_noop_proposal(task, proposal)
         )
         if classification.kind == "AMBIGUOUS":
-            awaited.status = AwaitedResponseStatus.AMBIGUOUS
+            if may_replace_awaited_status:
+                awaited.status = AwaitedResponseStatus.AMBIGUOUS
             self.session.flush()
             return CorrelationResult("INTERPRETATION_AMBIGUOUS", awaited.id)
         if classification.kind == "AVAILABILITY" and classification.availability is not None:
-            AvailabilityService(self.session).apply(
-                participant.id,
+            assert availability_target is not None
+            applied = AvailabilityService(self.session).apply(
+                availability_target.id,
                 revision.id,
                 classification.availability,
                 classification.evidence,
             )
-            awaited.status = AwaitedResponseStatus.SATISFIED
+            if availability_target.id == participant.id:
+                awaited.status = AwaitedResponseStatus.SATISFIED
+            elif may_replace_awaited_status:
+                awaited.status = AwaitedResponseStatus.OPEN
+            if self.owner_chat_id is not None and applied:
+                person = self.session.get(Person, availability_target.person_id)
+                assert person is not None
+                status = availability_target.availability_status.value.lower()
+                OutboxService(self.session).create_owner(
+                    telegram_chat_id=self.owner_chat_id,
+                    task_instance_id=task.id,
+                    final_text=(
+                        f"{person.display_name} is {status} for {task.topic_key}."
+                    ),
+                    message_kind=MessageKind.NOTIFICATION,
+                    idempotency_key=(
+                        f"task:{task.id}:availability:{availability_target.id}:revision:{revision.id}"
+                    ),
+                    parent_terminal_policy=ParentTerminalPolicy.SURVIVE,
+                )
         elif classification.kind == "COUNTERPROPOSAL" and classification.proposals:
+            person = self.session.get(Person, participant.person_id)
+            if person is None:
+                raise DomainError("counterproposal participant person not found")
+            prompt_context = CounterproposalPromptContext(
+                participant_name=person.display_name,
+                topic_key=task.topic_key,
+                scheduled_at=task.scheduled_at,
+                duration_minutes=task.duration_minutes,
+                location=task.location,
+                owner_timezone=self.owner_timezone,
+            )
             for atomic in proposals_to_create:
                 proposal = Proposal(
-                        task_instance_id=task.id,
-                        proposed_by_participant_id=participant.id,
-                        source_message_revision_id=revision.id,
-                        field=atomic.field,
-                        operation=atomic.operation,
-                        old_value=atomic.old_value,
-                        proposed_value=atomic.proposed_value,
-                        status=ProposalStatus.PENDING,
-                    )
+                    task_instance_id=task.id,
+                    proposed_by_participant_id=participant.id,
+                    source_message_revision_id=revision.id,
+                    field=atomic.field,
+                    operation=atomic.operation,
+                    old_value=atomic.old_value,
+                    proposed_value=atomic.proposed_value,
+                    status=ProposalStatus.PENDING,
+                )
                 self.session.add(proposal)
                 self.session.flush()
                 decision = DecisionService(self.session).create(
@@ -408,13 +714,19 @@ class CorrelationOrchestrator:
                     parent_terminal_policy=ParentTerminalPolicy.TERMINATE,
                 )
                 if self.owner_chat_id is not None:
+                    try:
+                        final_text = counterproposal_prompt(
+                            context=prompt_context,
+                            field=proposal.field,
+                            operation=proposal.operation,
+                            proposed_value=proposal.proposed_value,
+                        )
+                    except ValueError as exc:
+                        raise DomainError("counterproposal prompt data is invalid") from exc
                     prompt = OutboxService(self.session).create_owner(
                         telegram_chat_id=self.owner_chat_id,
                         task_instance_id=task.id,
-                        final_text=(
-                            f"Participant proposed {proposal.field} {proposal.operation}: "
-                            f"{proposal.proposed_value}. Reply `approve` or `reject`."
-                        ),
+                        final_text=final_text,
                         message_kind=MessageKind.NOTIFICATION,
                         idempotency_key=f"proposal:{proposal.id}:owner-prompt",
                         parent_terminal_policy=ParentTerminalPolicy.TERMINATE,
@@ -427,42 +739,176 @@ class CorrelationOrchestrator:
                     )
             awaited.status = AwaitedResponseStatus.SATISFIED
         else:
-            awaited.status = AwaitedResponseStatus.AMBIGUOUS
+            if may_replace_awaited_status:
+                awaited.status = AwaitedResponseStatus.AMBIGUOUS
             self.session.flush()
             return CorrelationResult("INTERPRETATION_AMBIGUOUS", awaited.id)
         self.session.flush()
         return CorrelationResult("CORRELATED", awaited.id)
+
+    @staticmethod
+    def _is_noop_proposal(task: TaskInstance, proposal: AtomicProposal) -> bool:
+        """Do not create an owner decision for a value that is already current."""
+        if proposal.operation not in {"SET", "REPLACE"}:
+            return False
+
+        if proposal.field in {"duration", "duration_minutes"}:
+            def duration_value(value: object) -> int | None:
+                if type(value) is int:
+                    return value
+                if not isinstance(value, str):
+                    return None
+                match = re.fullmatch(
+                    r"\s*(\d+)\s*(?:minutes?|mins?|m)?\s*",
+                    value,
+                    flags=re.IGNORECASE,
+                )
+                return int(match.group(1)) if match is not None else None
+
+            proposed_value = duration_value(proposal.proposed_value)
+            old_value = duration_value(proposal.old_value)
+            return (
+                proposed_value == task.duration_minutes
+                and (old_value is None or old_value == task.duration_minutes)
+            )
+        if proposal.field == "location":
+            return proposal.old_value == task.location and proposal.proposed_value == task.location
+        if proposal.field == "scheduled_at":
+            if not isinstance(proposal.old_value, str) or not isinstance(
+                proposal.proposed_value, str
+            ):
+                return False
+            current = task.scheduled_at
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=UTC)
+            try:
+                old_value = ProposalService._parse_scheduled_at(proposal.old_value)
+                proposed_value = ProposalService._parse_scheduled_at(proposal.proposed_value)
+            except (DomainError, TypeError, ValueError):
+                return False
+            return old_value == current and proposed_value == current
+        return False
+
+    def _awaited_response_effect_ownership(
+        self,
+        revision: MessageRevision,
+        awaited: AwaitedResponse,
+        participant: TaskParticipant,
+        prior_revision_ids: list[int],
+    ) -> tuple[bool, bool]:
+        """Reconstruct semantic ownership from exact revision-backed state."""
+        source_revision = (
+            self.session.get(
+                MessageRevision,
+                participant.availability_source_revision_id,
+            )
+            if participant.availability_source_revision_id is not None
+            else None
+        )
+        lineage_availability = (
+            participant.availability_source_revision_id in prior_revision_ids
+        )
+        independent_availability = (
+            source_revision is not None
+            and source_revision.message_id != revision.message_id
+            and source_revision.awaited_response_id == awaited.id
+        )
+        lineage_proposal = self.session.scalar(
+            select(Proposal.id).where(
+                Proposal.source_message_revision_id.in_(prior_revision_ids),
+                Proposal.proposed_by_participant_id == participant.id,
+                Proposal.status != ProposalStatus.SUPERSEDED,
+            )
+        )
+        independent_proposal = self.session.scalar(
+            select(Proposal.id)
+            .join(
+                MessageRevision,
+                MessageRevision.id == Proposal.source_message_revision_id,
+            )
+            .where(
+                MessageRevision.message_id != revision.message_id,
+                MessageRevision.awaited_response_id == awaited.id,
+                Proposal.proposed_by_participant_id == participant.id,
+                Proposal.status != ProposalStatus.SUPERSEDED,
+            )
+        )
+        return (
+            lineage_availability or lineage_proposal is not None,
+            independent_availability or independent_proposal is not None,
+        )
+
+    def _availability_target(
+        self,
+        revision: MessageRevision,
+        task: TaskInstance,
+        classification: Classification,
+    ) -> TaskParticipant:
+        message = self.session.get(Message, revision.message_id)
+        sender = (
+            self.session.get(Identity, message.sender_identity_id)
+            if message is not None
+            else None
+        )
+        if sender is None:
+            raise DomainError("availability sender identity is unavailable")
+        if classification.evidence is AvailabilityEvidence.FIRST_PARTY:
+            if classification.subject_task_participant_id is not None:
+                raise DomainError("first-party availability cannot select another subject")
+            target = self.session.scalar(
+                select(TaskParticipant).where(
+                    TaskParticipant.task_instance_id == task.id,
+                    TaskParticipant.person_id == sender.person_id,
+                )
+            )
+            if target is None:
+                raise DomainError("first-party availability sender is not a task participant")
+            return target
+        subject_id = classification.subject_task_participant_id
+        if subject_id is None:
+            raise DomainError("third-party availability requires an exact subject")
+        target = self.session.get(TaskParticipant, subject_id)
+        if target is None or target.task_instance_id != task.id:
+            raise DomainError("availability subject must belong to the same task")
+        if target.person_id == sender.person_id:
+            raise DomainError("third-party availability subject must be another person")
+        return target
 
     def _reconcile_previous_effects(
         self,
         revision: MessageRevision,
         participant: TaskParticipant,
         classification: Classification,
+        availability_target: TaskParticipant | None,
+        prior_revision_ids: list[int],
     ) -> tuple[AtomicProposal, ...]:
         """Diff semantic effects owned by earlier revisions of the same message."""
-        prior_revision_ids = list(
-            self.session.scalars(
-                select(MessageRevision.id).where(
-                    MessageRevision.message_id == revision.message_id,
-                    MessageRevision.id != revision.id,
-                )
-            )
-        )
         if not prior_revision_ids:
             return classification.proposals
 
-        if (
-            participant.availability_source_revision_id in prior_revision_ids
-            and classification.kind != "AVAILABILITY"
-        ):
-            participant.availability_status = AvailabilityStatus.UNKNOWN
-            participant.availability_evidence = None
-            participant.availability_source_revision_id = None
-            participant.updated_at = utc_now()
+        prior_effect_participants = list(
+            self.session.scalars(
+                select(TaskParticipant).where(
+                    TaskParticipant.task_instance_id == participant.task_instance_id,
+                    TaskParticipant.availability_source_revision_id.in_(prior_revision_ids),
+                )
+            )
+        )
+        for prior_participant in prior_effect_participants:
+            if (
+                classification.kind == "AVAILABILITY"
+                and availability_target is not None
+                and prior_participant.id == availability_target.id
+            ):
+                continue
+            prior_participant.availability_status = AvailabilityStatus.UNKNOWN
+            prior_participant.availability_evidence = None
+            prior_participant.availability_source_revision_id = None
+            prior_participant.updated_at = utc_now()
             self.session.add(
                 TaskEvent(
-                    task_instance_id=participant.task_instance_id,
-                    task_participant_id=participant.id,
+                    task_instance_id=prior_participant.task_instance_id,
+                    task_participant_id=prior_participant.id,
                     source_message_revision_id=revision.id,
                     event_type="AVAILABILITY_RETRACTED_BY_EDIT",
                     payload_json={},
@@ -540,6 +986,8 @@ class CorrelationOrchestrator:
         decision_type: str,
         context: dict[str, object],
         candidates: list[AwaitedResponse],
+        *,
+        task_instance_id: int | None = None,
     ) -> DecisionRequest:
         existing = self.session.scalar(
             select(DecisionRequest).where(
@@ -554,6 +1002,7 @@ class CorrelationOrchestrator:
             subject_kind="message_revision",
             subject_id=revision.id,
             context=context,
+            task_instance_id=task_instance_id,
             parent_terminal_policy=ParentTerminalPolicy.SURVIVE,
         )
         self.session.add_all(
@@ -566,20 +1015,28 @@ class CorrelationOrchestrator:
             ]
         )
         if self.owner_chat_id is not None and candidates:
-            lines = ["Choose the response this message belongs to:"]
-            for candidate in candidates:
+            prompt_candidates: list[tuple[int, str, str, int, int, str]] = []
+            for candidate in sorted(candidates, key=lambda value: value.id):
                 participant = self.session.get(TaskParticipant, candidate.task_participant_id)
                 assert participant is not None
                 task = self.session.get(TaskInstance, participant.task_instance_id)
                 assert task is not None
-                lines.append(
-                    f"- {candidate.id}: {task.topic_key} at {task.scheduled_at.isoformat()}, "
-                    f"participant {participant.person_id}, conversation {participant.conversation_id}, "
-                    f"expected {candidate.expected_response_type}; reply `select {candidate.id}`"
+                scheduled_at = task.scheduled_at.replace(
+                    tzinfo=task.scheduled_at.tzinfo or UTC
+                ).astimezone(UTC).isoformat()
+                prompt_candidates.append(
+                    (
+                        candidate.id,
+                        task.topic_key,
+                        scheduled_at,
+                        participant.person_id,
+                        participant.conversation_id,
+                        candidate.expected_response_type,
+                    )
                 )
             prompt = OutboxService(self.session).create_owner(
                 telegram_chat_id=self.owner_chat_id,
-                final_text="\n".join(lines),
+                final_text=correlation_ambiguity_prompt(prompt_candidates),
                 message_kind=MessageKind.NOTIFICATION,
                 idempotency_key=f"decision:{decision.id}:owner-prompt",
                 task_instance_id=decision.task_instance_id,

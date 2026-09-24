@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import (
@@ -29,7 +29,7 @@ def enum_type(enum_cls: type[StrEnum], name: str) -> SAEnum:
 
 
 def now() -> datetime:
-    return datetime.now().astimezone()
+    return datetime.now(UTC)
 
 
 class ArchivedMixin:
@@ -82,6 +82,45 @@ class ConversationParticipant(Base):
         CheckConstraint(
             "(is_current = 1 AND left_at IS NULL) OR (is_current = 0 AND left_at IS NOT NULL)",
             name="ck_conversation_participant_current_left_at",
+        ),
+    )
+
+
+class BeeperSyncCheckpoint(Base):
+    """Durable progress for Beeper's global chat feed or one conversation feed."""
+
+    __tablename__ = "beeper_sync_checkpoint"
+    checkpoint_key: Mapped[str] = mapped_column(String(500), primary_key=True)
+    scope: Mapped[str] = mapped_column(String(30))
+    conversation_id: Mapped[int | None] = mapped_column(
+        ForeignKey("conversation.id", ondelete="RESTRICT"), unique=True
+    )
+    newest_cursor: Mapped[str | None] = mapped_column(Text)
+    backfill_cursor: Mapped[str | None] = mapped_column(Text)
+    bootstrap_cutoff_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    bootstrap_complete: Mapped[bool] = mapped_column(Boolean, default=False)
+    reconciliation_cursor: Mapped[str | None] = mapped_column(Text)
+    reconciliation_cutoff_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_reconciled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    provider_activity_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    __table_args__ = (
+        CheckConstraint(
+            "(scope = 'CHAT_FEED' AND checkpoint_key = 'chat-feed' AND conversation_id IS NULL) OR "
+            "(scope = 'CONVERSATION' AND checkpoint_key <> 'chat-feed' AND conversation_id IS NOT NULL)",
+            name="ck_beeper_sync_checkpoint_scope",
+        ),
+        CheckConstraint(
+            "(reconciliation_cursor IS NULL AND reconciliation_cutoff_at IS NULL) OR "
+            "(reconciliation_cursor IS NOT NULL AND reconciliation_cutoff_at IS NOT NULL)",
+            name="ck_beeper_sync_reconciliation_pair",
+        ),
+        Index(
+            "ix_beeper_sync_checkpoint_reconcile",
+            "scope",
+            "bootstrap_complete",
+            "last_reconciled_at",
         ),
     )
 
@@ -557,8 +596,8 @@ class TelegramUpdate(Base):
     __tablename__ = "telegram_update"
     id: Mapped[int] = mapped_column(primary_key=True)
     telegram_update_id: Mapped[int] = mapped_column(unique=True)
-    sender_user_id: Mapped[int] = mapped_column()
-    chat_id: Mapped[int] = mapped_column()
+    sender_user_id: Mapped[int | None] = mapped_column()
+    chat_id: Mapped[int | None] = mapped_column()
     payload_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     status: Mapped[TelegramUpdateStatus] = mapped_column(
